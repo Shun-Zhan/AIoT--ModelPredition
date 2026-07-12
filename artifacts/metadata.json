@@ -1,0 +1,36 @@
+{
+  "settings": {
+    "sample_minutes": 5,
+    "live_window": 288,
+    "forecast_steps": 12,
+    "et0_window_hours": 24,
+    "short_gap_steps": 3,
+    "observed_retrain_days": 14,
+    "latitude_deg": 31.1979,
+    "elevation_m": 3.0,
+    "timezone": "Asia/Shanghai",
+    "soil_capacity_mm": 120.0,
+    "initial_soil_fraction": 0.65,
+    "crop_coefficient": 0.85,
+    "proxy_irrigation_trigger_percent": 30.0,
+    "proxy_irrigation_target_percent": 75.0,
+    "database_path": "runtime/forecast.sqlite3",
+    "artifact_dir": "artifacts"
+  },
+  "et0": {
+    "mae": 0.015197984874248505,
+    "rmse": 0.02226615233800721,
+    "r2": 0.9772725701332092,
+    "baseline_mae": 0.030134977772831917,
+    "baseline_rmse": 0.04452295801276363,
+    "usable": true
+  },
+  "soil": {
+    "mae": 0.07680173218250275,
+    "rmse": 1.1257249297879486,
+    "r2": 0.9918294548988342,
+    "baseline_mae": 0.11563372076111841,
+    "baseline_rmse": 1.1696854728600772,
+    "usable": true
+  }
+}
