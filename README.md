@@ -41,6 +41,30 @@ curl -X POST http://127.0.0.1:8000/v1/snapshots \
 
 完整预测可通过 `GET /v1/forecast/latest`读取。服务重启后从 `runtime/forecast.sqlite3`恢复历史窗口。
 
+## 接收 ESP32 TCP 数据并提交预测服务
+
+烧录 `../all_sensors/all_sensors.ino` 后，ESP32 默认创建 `ESP32-S3-IOT`
+热点，并在 `192.168.4.1:3333` 提供一行一条的 JSON 采集数据。电脑连接该热点后，
+在一个终端启动本项目的预测服务：
+
+```bash
+dual-forecast serve --host 127.0.0.1 --port 8000
+```
+
+在另一个终端启动 TCP 接收桥接程序：
+
+```bash
+dual-forecast receive-esp32
+```
+
+桥接程序会将 ESP32 的下划线 JSON 字段转换为 `SensorSnapshot` 的字段名，并 POST 到
+`/v1/snapshots`，由服务写入历史窗口和调用预测模型。默认每 300 秒提交一次，匹配模型的
+五分钟时间步；调试时可用 `--min-interval-seconds 0` 每条都提交。
+
+当前 ESP32 尚未接入气压传感器，`AirPressure` 会传入 0。桥接程序会临时改用 1013 hPa，
+避免 0 hPa 进入蒸散预测；可通过 `--fallback-air-pressure-hpa` 修改该值。接入后只需在
+ESP32 总程序中为 `snapshot.AirPressure` 赋真实 hPa 值，桥接程序会自动使用真实值。
+
 ## 使用真实土壤数据重训
 
 SQLite 中有效土壤观测跨度达到 14 天后运行：

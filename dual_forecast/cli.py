@@ -9,6 +9,7 @@ import pandas as pd
 import uvicorn
 
 from .config import SETTINGS
+from .esp32_receiver import add_receiver_parser
 from .history import add_proxy_soil_moisture, load_hongqiao_zip, split_chronologically
 from .storage import Store
 from .training import prepare_soil_frame, train_lstm, train_nbeats, write_metadata
@@ -117,6 +118,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.set_defaults(func=serve)
+    add_receiver_parser(sub)
     return root
 
 
