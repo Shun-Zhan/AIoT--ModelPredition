@@ -1,9 +1,3 @@
-fastapi>=0.115,<0.116
-uvicorn[standard]>=0.30,<0.35
-numpy>=2.0,<3
-pandas>=2.2,<3
-scikit-learn>=1.5,<2
-torch>=2.4,<3
-pydantic>=2.8,<3
-pytest>=8,<9
-httpx>=0.27,<0.29
+# Reproducible dependency entry point for users who clone this repository.
+# The package-level compatible version ranges remain in pyproject.toml.
+-r requirements.lock

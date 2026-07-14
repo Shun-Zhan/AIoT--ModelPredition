@@ -1,0 +1,49 @@
+# Exact dependency set verified on 2026-07-15 (Python 3.14.4, macOS arm64).
+# Install through requirements.txt; do not add the editable local package here.
+annotated-types==0.7.0
+anyio==4.14.2
+certifi==2026.6.17
+click==8.4.2
+fastapi==0.115.14
+filelock==3.29.7
+fsspec==2026.6.0
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.18
+iniconfig==2.3.0
+Jinja2==3.1.6
+joblib==1.5.3
+MarkupSafe==3.0.3
+mpmath==1.3.0
+narwhals==2.24.0
+networkx==3.6.1
+numpy==2.5.1
+packaging==26.2
+pandas==2.3.3
+pluggy==1.6.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+Pygments==2.20.0
+pytest==8.4.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+pytz==2026.2
+PyYAML==6.0.3
+scikit-learn==1.9.0
+scipy==1.18.0
+setuptools==83.0.0
+six==1.17.0
+starlette==0.46.2
+sympy==1.14.0
+threadpoolctl==3.6.0
+torch==2.13.0
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+tzdata==2026.3
+uvicorn==0.34.3
+# uvloop is an optional uvicorn accelerator and has no Windows build.
+uvloop==0.22.1 ; platform_system != "Windows"
+watchfiles==1.2.0
+websockets==16.1

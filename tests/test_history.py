@@ -1,12 +1,21 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from dual_forecast.config import SETTINGS
 from dual_forecast.history import add_proxy_soil_moisture, load_hongqiao_zip, split_chronologically
 
 
 ZIP = Path("虹桥2018-2024逐小时气象数据.zip")
+
+# The weather archive is deliberately not versioned because it is source data,
+# not application code. A clone without that optional archive must still be
+# able to run the self-contained unit and integration tests.
+pytestmark = pytest.mark.skipif(
+    not ZIP.is_file(),
+    reason="requires the optional 虹桥2018-2024逐小时气象数据.zip training archive",
+)
 
 
 def test_load_all_hongqiao_years():
