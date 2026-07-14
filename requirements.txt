@@ -1,3 +1,4 @@
-# Reproducible dependency entry point for users who clone this repository.
-# The package-level compatible version ranges remain in pyproject.toml.
--r requirements.lock
+# Cross-platform installation entry point.
+# Dependency ranges live in pyproject.toml so pip can select the correct wheel
+# for the user's operating system and Python version (Windows/macOS/Linux).
+-e .[test]

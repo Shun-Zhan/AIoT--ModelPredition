@@ -7,7 +7,8 @@
 仓库已包含可用的模型权重 `artifacts/`，因此新电脑不需要训练即可接收 ESP32 数据并预测。
 不要提交 `.venv/` 或 `runtime/`：前者可由依赖文件重建，后者是本机采集记录。
 
-前提：Python 3.10 或更高版本，并能访问 PyPI 下载依赖。
+前提：Python 3.10 或更高版本，并能访问 PyPI 下载依赖。推荐 Python 3.11 或 3.12；
+依赖会根据 Windows、macOS 或 Linux 自动选择兼容的安装包。
 
 macOS / Linux 推荐直接执行：
 
@@ -18,7 +19,7 @@ make setup
 make test
 ```
 
-`make setup` 会创建 `.venv`，按 `requirements.lock` 安装已经验证的精确版本，并安装本项目。之后开两个终端：
+`make setup` 会创建 `.venv`，安装本项目和测试依赖。之后开两个终端：
 
 ```bash
 # 终端 1：预测服务
@@ -34,11 +35,10 @@ make receive
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m pip install --no-build-isolation --no-deps -e .
 python -m pytest -q
 ```
 
-`requirements.lock` 是当前测试通过的精确依赖集合；升级依赖时应先完整测试，再同步更新它。
+依赖范围统一定义在 `pyproject.toml`，安装时由 pip 为当前系统和 Python 版本选择兼容版本。
 仓库未提交原始气象 ZIP，因此首次 `make test` 会跳过两项依赖该 ZIP 的训练数据测试；其余
 接口、ESP32 桥接和预测流程测试仍会完整执行。把 `虹桥2018-2024逐小时气象数据.zip` 放到
 仓库根目录后再运行 `make test`，即可额外执行这两项数据处理测试。

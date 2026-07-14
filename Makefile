@@ -8,11 +8,10 @@ VENV_FORECAST := $(VENV)/bin/dual-forecast
 $(VENV_PYTHON):
 	$(PYTHON) -m venv $(VENV)
 
-# Create the virtual environment, install the verified lock file, then install
-# this repository as an editable package. Run this once after cloning.
+# Create the virtual environment and install this repository with its runtime
+# and test dependencies. Pip selects compatible Windows/macOS/Linux wheels.
 setup: $(VENV_PYTHON)
 	$(VENV_PYTHON) -m pip install -r requirements.txt
-	$(VENV_PYTHON) -m pip install --no-build-isolation --no-deps -e .
 
 test: setup
 	$(VENV_PYTHON) -m pytest -q
