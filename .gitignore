@@ -21,3 +21,7 @@ data/
 .idea/
 .vscode/
 
+# Local secrets
+.env
+.env.*
+!.env.example

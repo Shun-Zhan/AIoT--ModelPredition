@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, time, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .schemas import ForecastResponse, SensorSnapshot
+from .schemas import DecisionResult, ForecastResponse, IrrigationAction, SensorSnapshot
 
 
 class Store:
@@ -40,6 +41,21 @@ class Store:
             CREATE TABLE IF NOT EXISTS forecasts (
               generated_at TEXT PRIMARY KEY, payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS decisions (
+              request_id TEXT PRIMARY KEY, evaluated_at TEXT NOT NULL, trigger TEXT NOT NULL,
+              status TEXT NOT NULL, proposed_action TEXT, final_action TEXT NOT NULL,
+              duration_seconds INTEGER, reason_code TEXT NOT NULL, executed INTEGER NOT NULL,
+              latency_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER,
+              safety_reasons_json TEXT NOT NULL, context_json TEXT NOT NULL,
+              raw_model_output TEXT, result_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_decisions_evaluated_at ON decisions(evaluated_at);
+            CREATE TABLE IF NOT EXISTS actuator_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL,
+              request_id TEXT NOT NULL, action TEXT NOT NULL, duration_seconds INTEGER,
+              mode TEXT NOT NULL, details_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_actuator_events_time ON actuator_events(occurred_at);
             """)
 
     def insert_snapshot(self, snapshot: SensorSnapshot, received_at: datetime, warnings: list[str]) -> bool:
@@ -89,3 +105,90 @@ class Store:
             row = conn.execute("SELECT payload_json FROM forecasts ORDER BY generated_at DESC LIMIT 1").fetchone()
         return ForecastResponse.model_validate_json(row[0]) if row else None
 
+    def decision_exists(self, request_id: str) -> bool:
+        with self.connection() as conn:
+            row = conn.execute("SELECT 1 FROM decisions WHERE request_id=?", (request_id,)).fetchone()
+        return row is not None
+
+    def get_decision(self, request_id: str) -> DecisionResult | None:
+        with self.connection() as conn:
+            row = conn.execute("SELECT result_json FROM decisions WHERE request_id=?", (request_id,)).fetchone()
+        return DecisionResult.model_validate_json(row[0]) if row else None
+
+    def latest_decision(self) -> DecisionResult | None:
+        with self.connection() as conn:
+            row = conn.execute("SELECT result_json FROM decisions ORDER BY evaluated_at DESC LIMIT 1").fetchone()
+        return DecisionResult.model_validate_json(row[0]) if row else None
+
+    def save_decision(self, result: DecisionResult, context: dict, raw_model_output: str | None) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO decisions (
+                  request_id, evaluated_at, trigger, status, proposed_action, final_action,
+                  duration_seconds, reason_code, executed, latency_ms, prompt_tokens,
+                  completion_tokens, safety_reasons_json, context_json, raw_model_output,
+                  result_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    result.requestId,
+                    result.evaluatedAt.isoformat(),
+                    result.trigger,
+                    result.status,
+                    result.proposedAction.value if result.proposedAction else None,
+                    result.finalAction.value,
+                    result.durationSeconds,
+                    result.reasonCode,
+                    int(result.executed),
+                    result.latencyMs,
+                    result.promptTokens,
+                    result.completionTokens,
+                    json.dumps(result.safetyReasons, ensure_ascii=False),
+                    json.dumps(context, ensure_ascii=False),
+                    raw_model_output,
+                    result.model_dump_json(),
+                ),
+            )
+
+    def record_actuator_event(
+        self,
+        occurred_at: datetime,
+        request_id: str,
+        action: IrrigationAction,
+        duration_seconds: int | None,
+        mode: str,
+        details: dict | None = None,
+    ) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "INSERT INTO actuator_events (occurred_at,request_id,action,duration_seconds,mode,details_json) VALUES (?,?,?,?,?,?)",
+                (
+                    occurred_at.isoformat(),
+                    request_id,
+                    action.value,
+                    duration_seconds,
+                    mode,
+                    json.dumps(details or {}, ensure_ascii=False),
+                ),
+            )
+
+    def last_watering_start(self) -> datetime | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT occurred_at FROM actuator_events WHERE action=? ORDER BY occurred_at DESC LIMIT 1",
+                (IrrigationAction.START_WATERING.value,),
+            ).fetchone()
+        return datetime.fromisoformat(row[0]) if row else None
+
+    def daily_watering_seconds(self, now: datetime, timezone_name: str = "UTC") -> int:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        local_now = now.astimezone(ZoneInfo(timezone_name))
+        local_start = datetime.combine(local_now.date(), time.min, tzinfo=local_now.tzinfo)
+        start = local_start.astimezone(timezone.utc)
+        with self.connection() as conn:
+            row = conn.execute(
+                """SELECT COALESCE(SUM(duration_seconds), 0) total
+                   FROM actuator_events WHERE action=? AND occurred_at>=?""",
+                (IrrigationAction.START_WATERING.value, start.isoformat()),
+            ).fetchone()
+        return int(row["total"] or 0)

@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -22,6 +30,17 @@ class Settings:
     proxy_irrigation_target_percent: float = 75.0
     database_path: Path = Path("runtime/forecast.sqlite3")
     artifact_dir: Path = Path("artifacts")
+    llm_enabled: bool = _env_bool("AIOT_LLM_ENABLED", False)
+    gateway_base_url: str = os.getenv("VEI_BASE_URL", "https://ai-gateway.vei.volces.com/v1")
+    gateway_model: str = os.getenv("VEI_MODEL", "doubao-1.5-thinking-pro")
+    gateway_timeout_seconds: float = float(os.getenv("VEI_TIMEOUT_SECONDS", "60"))
+    actuator_mode: str = os.getenv("AIOT_ACTUATOR_MODE", "simulated")
+    decision_interval_minutes: int = 15
+    max_watering_seconds: int = 60
+    watering_cooldown_minutes: int = 15
+    max_daily_watering_seconds: int = 600
+    irrigation_trigger_percent: float = 30.0
+    irrigation_target_percent: float = 75.0
 
     def to_dict(self) -> dict:
         data = asdict(self)

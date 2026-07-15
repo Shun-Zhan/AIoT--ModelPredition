@@ -1,6 +1,10 @@
-# AIoT 双时序预测服务
+# AIoT 双时序预测与灌溉决策服务
 
-本项目在电脑端接收 `SensorSnapshot`，使用 N-BEATS 预测下一小时 ET₀，并使用 LSTM 预测未来 12 个五分钟土壤湿度点。传感器通信和灌溉控制不在本模块范围内。
+本项目在电脑端接收 `SensorSnapshot`，使用 N-BEATS 预测下一小时 ET₀，并使用 LSTM 预测未来 12 个五分钟土壤湿度点。ESP32 传感器采集固件和真实水泵 GPIO 控制不在本模块范围内。
+
+预测完成后，服务可以把当前传感器状态、近一小时趋势和预测序列发送给火山引擎边缘大模型网关，获取结构化灌溉决策。所有模型动作都必须通过本地安全规则；当前版本仅提供模拟执行器，不直接驱动真实水泵。
+
+> 基于火山引擎边缘智能的边缘大模型网关提供服务。
 
 ## 克隆后直接运行
 
@@ -100,6 +104,88 @@ dual-forecast receive-esp32
 当前 ESP32 程序已支持 BMP280/BME280 气压传感器，正常时会发送真实的 `AirPressure`（hPa）。
 若传感器暂未接好而上传 0，桥接程序会临时改用 1013 hPa，避免 0 hPa 进入蒸散预测；可通过
 `--fallback-air-pressure-hpa` 修改该回退值。
+
+## 火山引擎大模型灌溉决策
+
+边缘大模型网关使用 OpenAI 兼容接口。网关密钥只允许通过环境变量提供，不能写入源码、
+`.env.example`、日志或 SQLite。曾经粘贴到聊天、截图或公开仓库中的密钥必须先在控制台重置。
+
+```bash
+export VEI_API_KEY='替换为重置后的新密钥'
+export VEI_MODEL='doubao-1.5-thinking-pro'
+export VEI_BASE_URL='https://ai-gateway.vei.volces.com/v1'
+export VEI_TIMEOUT_SECONDS=60
+export AIOT_LLM_ENABLED=1
+export AIOT_ACTUATOR_MODE=simulated
+
+dual-forecast serve --host 127.0.0.1 --port 8000
+```
+
+`AIOT_LLM_ENABLED` 默认是 `0`，因此仅设置密钥不会意外发起云端调用。当前唯一受支持的执行器
+模式是 `simulated`；服务拒绝以未知模式启动。
+
+只有预测状态为 `ok` 时才会请求大模型。首次完整预测会立即评估，之后每 15 分钟评估一次；
+土壤湿度跨越 30% 或 75%、传感器健康状态变化时会额外触发。发送给模型的数据包括：
+
+- 当前气温、空气湿度、土壤温湿度、风速、太阳辐射、气压及传感器健康状态；
+- 最近一小时土壤湿度变化、平均气温和平均空气湿度；
+- 未来 12 个五分钟 ET₀ 与土壤湿度预测点；
+- 当前执行器状态和本地安全限制。
+
+模型只能返回以下 JSON，不接受 Markdown、代码围栏或额外字段：
+
+```json
+{
+  "schemaVersion": "1.0",
+  "action": "START_WATERING",
+  "durationSeconds": 30,
+  "reasonCode": "FORECAST_DRYING",
+  "reason": "土壤湿度较低且预测继续下降",
+  "confidence": 0.92
+}
+```
+
+动作只允许 `START_WATERING`、`STOP_WATERING`、`NO_OP`。启动浇水必须带 1～60 秒时长，
+其余动作的 `durationSeconds` 必须为 `null`。本地安全层还会强制执行 15 分钟冷却、每天最多
+600 秒、湿度达到 75% 不启动、传感器异常不启动。同一 `requestId` 只执行一次；网关超时、
+鉴权失败、限流、服务错误或非法输出一律降级为 `NO_OP`，若模拟泵正在运行则立即停止。
+
+### 没有 ESP32 时演示
+
+默认使用确定性的假网关，完全不消耗 Token：
+
+```bash
+dual-forecast decision-demo --scenario dry
+dual-forecast decision-demo --scenario wet
+dual-forecast decision-demo --scenario sensor-fault
+```
+
+在已经导出重置后的 `VEI_API_KEY` 时，可显式调用真实平台：
+
+```bash
+AIOT_LLM_ENABLED=1 dual-forecast decision-demo --scenario dry --live --no-execute
+```
+
+`--no-execute` 会完成请求、Schema 校验和安全审核，但不启动模拟执行器。
+
+### 决策接口
+
+```bash
+# 查看最近一次决策和最终执行结果
+curl http://127.0.0.1:8000/v1/decisions/latest
+
+# 使用最新完整预测手动评估；默认不执行
+curl -X POST 'http://127.0.0.1:8000/v1/decisions/evaluate'
+
+# 显式允许模拟执行
+curl -X POST 'http://127.0.0.1:8000/v1/decisions/evaluate?execute=true'
+```
+
+`/health` 会额外返回 `gatewayConfigured`、`llmEnabled` 和 `actuatorMode`。SQLite 审计记录包含
+脱敏决策上下文、模型原始输出、最终动作、拒绝原因、延迟和 Token 用量，但不会保存网关密钥。
+
+未来接入真实 ESP32 时沿用相同动作 JSON，并且必须由 ESP32 自身实现独立的浇水超时关断；
+不能依赖下一条云端 `STOP_WATERING` 才关闭水泵。
 
 ## 使用真实土壤数据重训
 

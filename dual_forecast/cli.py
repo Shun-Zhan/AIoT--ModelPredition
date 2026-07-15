@@ -2,16 +2,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 from dataclasses import asdict, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 import uvicorn
 
 from .config import SETTINGS
+from .decision import (
+    DecisionEngine,
+    DemoGateway,
+    SimulatedActuator,
+    VolcengineGatewayClient,
+    build_decision_context,
+)
 from .esp32_receiver import add_receiver_parser
 from .history import add_proxy_soil_moisture, load_hongqiao_zip, split_chronologically
 from .storage import Store
+from .schemas import ForecastPoint, ForecastResponse
 from .training import prepare_soil_frame, train_lstm, train_nbeats, write_metadata
 
 
@@ -87,6 +98,63 @@ def serve(args):
     uvicorn.run("dual_forecast.service:app", host=args.host, port=args.port, reload=False)
 
 
+def decision_demo(args):
+    now = datetime.now(timezone.utc)
+    moisture = {"dry": 25.0, "wet": 80.0, "sensor-fault": 25.0}[args.scenario]
+    index = pd.date_range(now - timedelta(hours=1), periods=13, freq="5min")
+    frame = pd.DataFrame(
+        {
+            "wind_ms": 2.0,
+            "air_temp_c": 25.0,
+            "rh_percent": 60.0,
+            "soil_temp_c": 22.0,
+            "soil_moisture_percent": [moisture + 1.0 - i / 12 for i in range(13)],
+            "solar_wm2": 400.0,
+            "pressure_kpa": 101.3,
+            "air_ok": 0 if args.scenario == "sensor-fault" else 1,
+            "soil_ok": 1,
+            "wind_ok": 1,
+        },
+        index=index,
+    )
+    points = [
+        ForecastPoint(
+            timestamp=now + timedelta(minutes=5 * (i + 1)),
+            et0Mm=0.01,
+            soilMoisturePercent=max(0.0, moisture - 0.2 * (i + 1)),
+        )
+        for i in range(12)
+    ]
+    forecast = ForecastResponse(
+        status="ok",
+        generatedAt=now,
+        requiredSamples=288,
+        availableSamples=288,
+        modelVersion="decision-demo",
+        soilTrainingData="demo",
+        forecast=points,
+    )
+    with tempfile.TemporaryDirectory(prefix="aiot-decision-demo-") as directory:
+        settings = replace(
+            SETTINGS,
+            database_path=Path(directory) / "demo.sqlite3",
+            llm_enabled=True,
+            actuator_mode="simulated",
+        )
+        store = Store(settings.database_path)
+        actuator = SimulatedActuator()
+        if args.live:
+            if not os.getenv("VEI_API_KEY"):
+                raise SystemExit("VEI_API_KEY is required with --live")
+            gateway = VolcengineGatewayClient(settings)
+        else:
+            gateway = DemoGateway(args.scenario)
+        engine = DecisionEngine(settings, store, gateway=gateway, actuator=actuator)
+        context = build_decision_context(frame, forecast, actuator, settings, now=now)
+        result = engine.evaluate(context, trigger="demo", execute=not args.no_execute)
+        print(result.model_dump_json(indent=2))
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="dual-forecast")
     root.add_argument("--artifacts", default=str(SETTINGS.artifact_dir))
@@ -118,6 +186,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.set_defaults(func=serve)
+    p = sub.add_parser("decision-demo", help="exercise the irrigation decision loop without an ESP32")
+    p.add_argument("--scenario", choices=("dry", "wet", "sensor-fault"), default="dry")
+    p.add_argument("--live", action="store_true", help="call the configured Volcengine gateway")
+    p.add_argument("--no-execute", action="store_true", help="validate the decision without running the simulator")
+    p.set_defaults(func=decision_demo)
     add_receiver_parser(sub)
     return root
 

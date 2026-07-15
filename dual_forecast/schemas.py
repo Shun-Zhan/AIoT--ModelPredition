@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -64,6 +66,65 @@ class ForecastPoint(BaseModel):
     soilMoisturePercent: float
 
 
+class IrrigationAction(str, Enum):
+    START_WATERING = "START_WATERING"
+    STOP_WATERING = "STOP_WATERING"
+    NO_OP = "NO_OP"
+
+
+class ModelIrrigationDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schemaVersion: Literal["1.0"]
+    action: IrrigationAction
+    durationSeconds: int | None = Field(default=None, ge=1, le=60)
+    reasonCode: str = Field(min_length=1, max_length=64, pattern=r"^[A-Z0-9_]+$")
+    reason: str = Field(min_length=1, max_length=200)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_duration(self):
+        if self.action == IrrigationAction.START_WATERING and self.durationSeconds is None:
+            raise ValueError("START_WATERING requires durationSeconds")
+        if self.action != IrrigationAction.START_WATERING and self.durationSeconds is not None:
+            raise ValueError("durationSeconds must be null unless action is START_WATERING")
+        return self
+
+
+class DecisionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: str
+    evaluatedAt: datetime
+    trigger: str
+    status: str
+    proposedAction: IrrigationAction | None = None
+    finalAction: IrrigationAction
+    durationSeconds: int | None = None
+    reasonCode: str
+    reason: str
+    confidence: float | None = None
+    safetyReasons: list[str] = []
+    executed: bool = False
+    actuatorMode: str
+    latencyMs: int | None = None
+    promptTokens: int | None = None
+    completionTokens: int | None = None
+
+
+class DecisionContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schemaVersion: Literal["1.0"] = "1.0"
+    requestId: str
+    generatedAt: datetime
+    current: dict[str, Any]
+    trends: dict[str, Any]
+    forecast: dict[str, Any]
+    actuator: dict[str, Any]
+    constraints: dict[str, Any]
+
+
 class ForecastResponse(BaseModel):
     status: str
     generatedAt: datetime
@@ -73,3 +134,4 @@ class ForecastResponse(BaseModel):
     soilTrainingData: str | None = None
     warnings: list[str] = []
     forecast: list[ForecastPoint] = []
+    decision: DecisionResult | None = None
