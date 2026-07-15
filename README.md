@@ -2,6 +2,12 @@
 
 本项目在电脑端接收 `SensorSnapshot`，使用 N-BEATS 预测下一小时 ET₀，并使用 LSTM 预测未来 12 个五分钟土壤湿度点。传感器通信和灌溉控制不在本模块范围内。
 
+## 仓库结构
+
+- `firmware/esp32_s3_all_sensors/`：ESP32-S3 全传感器采集固件，Arduino IDE 可直接打开。
+- `dual_forecast/`：电脑端 TCP 接收、数据存储与预测模型服务。
+- `artifacts/`：已训练的模型权重及标准化器。
+
 ## 克隆后直接运行
 
 仓库已包含可用的模型权重 `artifacts/`，因此新电脑不需要训练即可接收 ESP32 数据并预测。
@@ -79,7 +85,7 @@ curl -X POST http://127.0.0.1:8000/v1/snapshots \
 
 ## 接收 ESP32 TCP 数据并提交预测服务
 
-烧录 `../all_sensors/all_sensors.ino` 后，ESP32 默认创建 `ESP32-S3-IOT`
+烧录 [`firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino`](firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino) 后，ESP32 默认创建 `ESP32-S3-IOT`
 热点，并在 `192.168.4.1:3333` 提供一行一条的 JSON 采集数据。电脑连接该热点后，
 在一个终端启动本项目的预测服务：
 
