@@ -80,15 +80,22 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 <script>
 const el = id => document.getElementById(id);
 const num = (v, digits=1) => v === null || v === undefined ? '--' : Number(v).toFixed(digits);
+let lastSnapshotAt = null;
 function setValue(id, value, unit, digits=1) { el(id).innerHTML = `${num(value,digits)} <span class="unit">${unit}</span>`; }
+function renderFreshness() {
+  if (!lastSnapshotAt) return;
+  const seconds = Math.max(0, Math.round((Date.now() - lastSnapshotAt.getTime()) / 1000));
+  el('connection').textContent = `实时数据：${seconds} 秒前`;
+  el('connection').className = seconds <= 5 ? 'ok' : (seconds <= 20 ? 'warn' : 'bad');
+}
 async function refresh() {
   try {
     const response = await fetch('/v1/dashboard/latest', {cache:'no-store'});
     const data = await response.json();
     const s = data.snapshot;
     if (!s) { el('connection').textContent = '等待 ESP32 数据'; return; }
-    el('connection').textContent = '电脑服务正常';
-    el('connection').className = 'ok';
+    lastSnapshotAt = new Date(s.receivedAt);
+    renderFreshness();
     setValue('airTemp', s.airOk ? s.air.temperatureC : null, '°C');
     setValue('airRh', s.airOk ? s.air.humidityPercent : null, '%RH');
     setValue('pressure', s.airPressureHpa, 'hPa', 0);
@@ -109,7 +116,7 @@ async function refresh() {
     el('connection').className = 'bad';
   }
 }
-refresh(); setInterval(refresh, 2000);
+refresh(); setInterval(refresh, 2000); setInterval(renderFreshness, 1000);
 </script>
 </body></html>"""
 

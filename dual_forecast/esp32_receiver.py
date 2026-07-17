@@ -94,6 +94,7 @@ def result_to_display_command(result: dict[str, Any]) -> str:
 def receive_esp32(args: argparse.Namespace) -> None:
     """Keep one TCP connection to ESP32 and forward sampled messages to FastAPI."""
     last_submit_at = 0.0
+    last_live_log_at = 0.0
     last_display_diagnostic: tuple[bool, int, bool] | None = None
 
     while True:
@@ -145,6 +146,10 @@ def receive_esp32(args: argparse.Namespace) -> None:
                         except (urllib.error.URLError, urllib.error.HTTPError) as exc:
                             print(f"Live dashboard unavailable: {exc}")
                             continue
+
+                        if now - last_live_log_at >= 10:
+                            print("Live dashboard updated from ESP32 telemetry.")
+                            last_live_log_at = now
 
                         if now - last_submit_at < args.min_interval_seconds:
                             continue

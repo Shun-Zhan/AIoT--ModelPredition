@@ -138,6 +138,28 @@ dual-forecast receive-esp32 --esp-host <ESP32_IP>
 Test-NetConnection 192.168.137.50 -Port 3333
 ```
 
+#### 一键启动（推荐）
+
+先在 Windows 上 `git pull` 获取最新代码。之后直接双击仓库根目录的 `start_dashboard.cmd`，或在
+PowerShell 中运行：
+
+```powershell
+cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
+.\start_dashboard.cmd
+```
+
+脚本会在首次运行时自动创建 `.venv` 并安装依赖，随后后台启动预测服务与 ESP32 接收器，最后以
+没有地址栏和标签页的 Edge 全屏窗口打开 dashboard。按 `Esc` 可退出全屏；关闭 Edge 不会停止后台
+服务。需要停止后台服务时双击 `stop_dashboard.cmd`，或运行：
+
+```powershell
+.\stop_dashboard.cmd
+```
+
+日志保存在 `runtime\logs\`。
+
+#### 手动启动
+
 看到 `TcpTestSucceeded : True` 后，打开两个 PowerShell 窗口。下面命令不依赖 `source`，也不会
 误用 Anaconda 或全局 Python。
 
@@ -168,7 +190,8 @@ http://127.0.0.1:8000/dashboard
 ```
 
 网页会实时显示传感器值；预测模型刚开始会显示 `warming_up`，因为需要累积 `288` 个五分钟样本
-（约 24 小时）才会生成完整预测。实时显示不会改变预测模型的五分钟采样节奏。
+（约 24 小时）才会生成完整预测。实时显示不会改变预测模型的五分钟采样节奏。网页右上角会显示
+“实时数据：N 秒前”：绿色且不超过 5 秒表示实时链路正常；超过 20 秒变红表示 ESP32 接收链路中断。
 
 当前 ESP32 程序已支持 BMP280/BME280 气压传感器，正常时会发送真实的 `AirPressure`（hPa）。
 若传感器暂未接好而上传 0，桥接程序会临时改用 1013 hPa，避免 0 hPa 进入蒸散预测；可通过
