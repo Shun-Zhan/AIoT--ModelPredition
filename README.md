@@ -129,6 +129,47 @@ http://127.0.0.1:8000/dashboard
 dual-forecast receive-esp32 --esp-host <ESP32_IP>
 ```
 
+### Windows：直接复制运行
+
+确认 Windows 移动热点已开启，且 ESP32 已连接到它。当前 Windows 热点固定地址配置下，ESP32
+地址为 `192.168.137.50`。先在 **PowerShell** 测试 TCP 是否可达：
+
+```powershell
+Test-NetConnection 192.168.137.50 -Port 3333
+```
+
+看到 `TcpTestSucceeded : True` 后，打开两个 PowerShell 窗口。下面命令不依赖 `source`，也不会
+误用 Anaconda 或全局 Python。
+
+第一个窗口启动预测服务和网页：
+
+```powershell
+cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
+
+if (!(Test-Path .venv)) {
+  py -m venv .venv
+}
+
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\dual-forecast.exe serve --host 127.0.0.1 --port 8000
+```
+
+第二个窗口接收 ESP32 数据：
+
+```powershell
+cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
+.\.venv\Scripts\dual-forecast.exe receive-esp32 --esp-host 192.168.137.50
+```
+
+最后在 Windows 浏览器打开：
+
+```text
+http://127.0.0.1:8000/dashboard
+```
+
+网页会实时显示传感器值；预测模型刚开始会显示 `warming_up`，因为需要累积 `288` 个五分钟样本
+（约 24 小时）才会生成完整预测。实时显示不会改变预测模型的五分钟采样节奏。
+
 当前 ESP32 程序已支持 BMP280/BME280 气压传感器，正常时会发送真实的 `AirPressure`（hPa）。
 若传感器暂未接好而上传 0，桥接程序会临时改用 1013 hPa，避免 0 hPa 进入蒸散预测；可通过
 `--fallback-air-pressure-hpa` 修改该回退值。
