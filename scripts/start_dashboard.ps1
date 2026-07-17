@@ -44,8 +44,18 @@ if (-not (Test-Path $venvPython)) {
     if ($LASTEXITCODE -ne 0) { throw "Failed to create .venv. Install Python 3.10 or later and ensure 'py' works." }
 }
 
-& $venvPython -c "import serial" 2>$null
-$serialDependencyReady = $LASTEXITCODE -eq 0
+# A missing pyserial is expected on the first run.  Check it without raising a
+# Python traceback (PowerShell 7 may otherwise treat a non-zero native exit as
+# a terminating NativeCommandError before the installer below can run).
+$nativeErrorPreference = Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+$previousNativeErrorPreference = if ($nativeErrorPreference) { $nativeErrorPreference.Value } else { $null }
+if ($nativeErrorPreference) { $PSNativeCommandUseErrorActionPreference = $false }
+try {
+    & $venvPython -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('serial') else 1)" 2>$null
+    $serialDependencyReady = $LASTEXITCODE -eq 0
+} finally {
+    if ($nativeErrorPreference) { $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference }
+}
 if (-not (Test-Path $forecastCli) -or -not $serialDependencyReady) {
     Write-Host "Installing project dependencies (first run or updated dependencies)..."
     & $venvPython -m pip install --upgrade pip

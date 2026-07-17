@@ -196,6 +196,31 @@ http://127.0.0.1:8000/dashboard
 若传感器暂未接好而上传 0，桥接程序会临时改用 1013 hPa，避免 0 hPa 进入蒸散预测；可通过
 `--fallback-air-pressure-hpa` 修改该回退值。
 
+### macOS：一键启动
+
+保持 ESP32 的 USB 线连接，并先关闭 Arduino IDE 的串口监视器。在仓库根目录运行：
+
+```bash
+./start_dashboard.sh
+```
+
+脚本会自动识别唯一的 ESP32 串口、创建或补齐 `.venv`、启动预测服务与串口接收器，并用 Chrome/Edge
+应用窗口打开实时 dashboard。若有多个串口，明确指定当前烧录端口：
+
+```bash
+./start_dashboard.sh --serial-port /dev/cu.wchusbserial10
+```
+
+浏览器地址固定为 `http://127.0.0.1:8000/dashboard`。停止后台服务：
+
+```bash
+./stop_dashboard.sh
+```
+
+实时接收器日志在 `runtime/logs/esp32-receiver.out.log`；正常运行时约每 10 秒会出现
+`Live dashboard updated from ESP32 telemetry.`。若显示“串口已占用”，关闭 Arduino 串口监视器或先运行
+`./stop_dashboard.sh`。
+
 ## 使用真实土壤数据重训
 
 SQLite 中有效土壤观测跨度达到 14 天后运行：
