@@ -38,6 +38,17 @@ function Start-ManagedProcess($name, [string[]]$arguments, $existingId) {
     return $process.Id
 }
 
+function Test-FreshLiveTelemetry {
+    try {
+        $latest = Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/dashboard/latest" -TimeoutSec 2
+        if (-not $latest.snapshot) { return $false }
+        $receivedAt = [DateTimeOffset]::Parse([string]$latest.snapshot.receivedAt)
+        return (([DateTimeOffset]::UtcNow - $receivedAt).TotalSeconds -le 15)
+    } catch {
+        return $false
+    }
+}
+
 if (-not (Test-Path $venvPython)) {
     Write-Host "Creating Python virtual environment..."
     & py -m venv (Join-Path $projectRoot ".venv")
@@ -85,6 +96,20 @@ Start-Sleep -Seconds 2
 $receiverId = Start-ManagedProcess "esp32-receiver" @("receive-esp32-serial", "--serial-port", $EspSerialPort) $saved.receiverPid
 
 @{ servicePid = $serviceId; receiverPid = $receiverId } | ConvertTo-Json | Set-Content -Encoding utf8 $pidFile
+
+$liveReady = $false
+for ($i = 0; $i -lt 15; $i++) {
+    if (Test-FreshLiveTelemetry) {
+        $liveReady = $true
+        break
+    }
+    Start-Sleep -Seconds 1
+}
+if ($liveReady) {
+    Write-Host "Live ESP32 telemetry confirmed."
+} else {
+    Write-Warning "Dashboard has not received fresh ESP32 telemetry yet. Check $logDir\esp32-receiver.out.log and close Arduino Serial Monitor if the port is busy."
+}
 
 $browserCandidates = @(
     (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"),

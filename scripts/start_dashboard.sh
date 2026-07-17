@@ -59,6 +59,21 @@ start_process() {
   printf '%s\n' "$new_pid"
 }
 
+has_fresh_live_telemetry() {
+  local payload
+  payload="$(curl --silent --fail http://127.0.0.1:8000/v1/dashboard/latest 2>/dev/null || true)"
+  [[ -n "$payload" ]] || return 1
+  "$venv_python" -c '
+import json, sys
+from datetime import datetime, timezone
+snapshot = json.loads(sys.stdin.read()).get("snapshot")
+if not snapshot:
+    raise SystemExit(1)
+received = datetime.fromisoformat(snapshot["receivedAt"].replace("Z", "+00:00"))
+raise SystemExit(0 if (datetime.now(timezone.utc) - received).total_seconds() <= 15 else 1)
+' <<<"$payload"
+}
+
 if [[ ! -x "$venv_python" ]]; then
   echo "Creating Python virtual environment..."
   python3 -m venv "$project_root/.venv"
@@ -112,6 +127,21 @@ receiver_pid="$(start_process esp32-receiver "$previous_receiver_pid" receive-es
 
 printf '{\n  "servicePid": %s,\n  "receiverPid": %s,\n  "serialPort": "%s"\n}\n' \
   "$service_pid" "$receiver_pid" "$serial_port" >"$pid_file"
+
+live_ready=false
+for _ in {1..15}; do
+  if has_fresh_live_telemetry; then
+    live_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$live_ready" == true ]]; then
+  echo "Live ESP32 telemetry confirmed."
+else
+  echo "Warning: dashboard has not received fresh ESP32 telemetry yet." >&2
+  echo "Check $log_dir/esp32-receiver.out.log and close Arduino Serial Monitor if the port is busy." >&2
+fi
 
 if [[ "$open_browser" == true ]]; then
   if open -Ra "Google Chrome" >/dev/null 2>&1; then
