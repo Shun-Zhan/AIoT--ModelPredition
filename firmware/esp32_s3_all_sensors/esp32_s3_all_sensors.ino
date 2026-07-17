@@ -24,6 +24,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 
 // -------------------- Common --------------------
 
@@ -32,17 +33,46 @@ static const uint32_t READ_INTERVAL_MS = 2000;
 
 // -------------------- Wi-Fi TCP telemetry --------------------
 
-// Default: the ESP32-S3 creates its own Wi-Fi hotspot for direct PC access.
-// To use an existing router instead, set WIFI_USE_SOFT_AP to false and fill
-// in the ROUTER_SSID and ROUTER_PASSWORD values.
-static const bool WIFI_USE_SOFT_AP = true;
+// Set false to let the ESP32-S3 join the computer's shared/mobile-hotspot
+// Wi-Fi. Fill in ROUTER_SSID and ROUTER_PASSWORD before compiling.
+// Keep true only for the standalone ESP32 hotspot mode.
+static const bool WIFI_USE_SOFT_AP = false;
 static const char *WIFI_AP_SSID = "ESP32-S3-IOT";
 static const char *WIFI_AP_PASSWORD = "12345678";
+#if __has_include("wifi_credentials.h")
+#include "wifi_credentials.h"
+#else
 static const char *ROUTER_SSID = "YOUR_WIFI_SSID";
 static const char *ROUTER_PASSWORD = "YOUR_WIFI_PASSWORD";
+#endif
+static const char *MDNS_HOSTNAME = "esp32-sensors";
 static const uint16_t TCP_PORT = 3333;
+// Windows Mobile Hotspot normally uses 192.168.137.1 as its gateway. This
+// avoids waiting for a DHCP lease when the hotspot's DHCP service is slow.
+static const bool USE_WINDOWS_HOTSPOT_STATIC_IP = true;
+static IPAddress WINDOWS_HOTSPOT_IP(192, 168, 137, 50);
+static IPAddress WINDOWS_HOTSPOT_GATEWAY(192, 168, 137, 1);
+static IPAddress WINDOWS_HOTSPOT_SUBNET(255, 255, 255, 0);
+static IPAddress WINDOWS_HOTSPOT_DNS(192, 168, 137, 1);
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
+static const uint32_t WIFI_STATUS_PRINT_INTERVAL_MS = 10000;
+
+// -------------------- M-series UART display --------------------
+
+// Set true only after the display is wired through a safe 3.3 V <-> 5 V UART
+// level shifter. The screen itself needs a separate power supply.
+// The previous UART screen is not used in the current hardware revision.
+// Keep its pins idle until a replacement display solution is selected.
+static const bool DISPLAY_ENABLED = false;
+// ESP32 RX <- display TX and ESP32 TX -> display RX. GPIO11/12 do not overlap
+// with the existing I2C, ADC or RS485 assignments.
+static const uint8_t DISPLAY_UART_RX_PIN = 11;
+static const uint8_t DISPLAY_UART_TX_PIN = 12;
+// The replacement M070 VisualTFT project staged on the TF card uses 19200
+// baud. Keep this in sync with the project loaded on the screen itself.
+static const uint32_t DISPLAY_BAUD = 19200;
+static const uint32_t DISPLAY_HANDSHAKE_INTERVAL_MS = 3000;
 
 // -------------------- Analog wind speed --------------------
 
@@ -64,8 +94,8 @@ enum AirSensorType {
   AIR_SENSOR_DHT11,
 };
 
-// Change this line to AIR_SENSOR_AHT20 when the AHT20 is replaced.
-static const AirSensorType AIR_SENSOR_TYPE = AIR_SENSOR_DHT11;
+// AHT20 is the active air temperature/humidity sensor.
+static const AirSensorType AIR_SENSOR_TYPE = AIR_SENSOR_AHT20;
 
 // Change these to match your wiring. They intentionally avoid the RS485 pins.
 // AHT20 uses the ESP32-S3's second I2C controller on separate pins.
@@ -129,12 +159,32 @@ static const uint32_t MODBUS_GAP_MS = 300;
 
 HardwareSerial SoilSerial(1);
 HardwareSerial SolarSerial(2);
+// UART0 is used for the optional M-series screen. Keep the USB serial monitor
+// on native USB CDC when DISPLAY_ENABLED is true; a USB-to-UART monitor on
+// UART0 will otherwise lose application logs and share bytes with the screen.
+HardwareSerial DisplaySerial(0);
 TwoWire AhtWire(1);
 WiFiServer TcpServer(TCP_PORT);
 WiFiClient TcpClient;
 
 bool wifiReady = false;
 uint32_t lastWifiRetryMs = 0;
+
+struct DisplayForecast {
+  bool received;
+  char status[32];
+  uint16_t availableSamples;
+  uint16_t requiredSamples;
+  float nextHourEt0Mm;
+  float soilMoistureInOneHour;
+};
+
+DisplayForecast displayForecast = {};
+bool displayInitialized = false;
+uint32_t displayRxBytes = 0;
+uint32_t displayHandshakeReplies = 0;
+uint32_t lastDisplayHandshakeMs = 0;
+bool displayHandshakeConfirmed = false;
 
 struct AirData {
   float temperatureC;
@@ -716,6 +766,252 @@ bool readWindSpeed(uint8_t adcPin, float &sensorVoltage, float &windSpeedMs) {
   return true;
 }
 
+// -------------------- M-series UART display protocol --------------------
+// The M-series direct-draw protocol uses 0xEE as the frame head and
+// 0xFF 0xFC 0xFF 0xFF as its frame tail (CRC disabled, matching the vendor
+// MCU example). This lets the ESP32 draw a dashboard without a VisualTFT
+// project-specific screen/control ID.
+
+void displayWriteU16(uint16_t value) {
+  DisplaySerial.write(highByte(value));
+  DisplaySerial.write(lowByte(value));
+}
+
+void displayBeginCommand(uint8_t command) {
+  DisplaySerial.write(0xEE);
+  DisplaySerial.write(command);
+}
+
+void displayEndCommand() {
+  const uint8_t tail[] = {0xFF, 0xFC, 0xFF, 0xFF};
+  DisplaySerial.write(tail, sizeof(tail));
+}
+
+void displaySetForeground(uint16_t rgb565) {
+  displayBeginCommand(0x41);
+  displayWriteU16(rgb565);
+  displayEndCommand();
+}
+
+void displaySetBackground(uint16_t rgb565) {
+  displayBeginCommand(0x42);
+  displayWriteU16(rgb565);
+  displayEndCommand();
+}
+
+void displayClear() {
+  displayBeginCommand(0x01);
+  displayEndCommand();
+}
+
+void displayFillRectangle(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+  displayBeginCommand(0x55);
+  displayWriteU16(x0);
+  displayWriteU16(y0);
+  displayWriteU16(x1);
+  displayWriteU16(y1);
+  displayEndCommand();
+}
+
+void displayClearTextArea(uint16_t x, uint16_t y, uint16_t width) {
+  displaySetForeground(0x0000);
+  displayFillRectangle(x, y, x + width, y + 38);
+}
+
+void displayText(uint16_t x, uint16_t y, const char *text) {
+  // Font index 4 is used by the vendor's direct-draw sample. ASCII labels keep
+  // this first dashboard independent from the screen's Chinese font encoding.
+  displayBeginCommand(0x20);
+  displayWriteU16(x);
+  displayWriteU16(y);
+  DisplaySerial.write(0);  // opaque background
+  DisplaySerial.write(4);  // built-in font index
+  DisplaySerial.write(reinterpret_cast<const uint8_t *>(text), strlen(text));
+  displayEndCommand();
+}
+
+void displaySendHandshake() {
+  // Official M-series handshake request. A compatible screen replies with a
+  // frame whose command byte is 0x55.
+  displayBeginCommand(0x04);
+  displayEndCommand();
+}
+
+void serviceDisplayProtocol() {
+  if (!DISPLAY_ENABLED) {
+    return;
+  }
+
+  static uint8_t frame[64] = {};
+  static size_t frameLength = 0;
+  while (DisplaySerial.available()) {
+    const int value = DisplaySerial.read();
+    if (value < 0) {
+      break;
+    }
+
+    const uint8_t byte = static_cast<uint8_t>(value);
+    ++displayRxBytes;
+    if (frameLength == 0 && byte != 0xEE) {
+      continue;
+    }
+
+    if (frameLength < sizeof(frame)) {
+      frame[frameLength++] = byte;
+    } else {
+      frameLength = 0;
+      continue;
+    }
+
+    if (frameLength >= 5 &&
+        frame[frameLength - 4] == 0xFF &&
+        frame[frameLength - 3] == 0xFC &&
+        frame[frameLength - 2] == 0xFF &&
+        frame[frameLength - 1] == 0xFF) {
+      if (frameLength >= 2 && frame[1] == 0x55) {
+        displayHandshakeConfirmed = true;
+        ++displayHandshakeReplies;
+      }
+      frameLength = 0;
+    }
+  }
+
+  if (millis() - lastDisplayHandshakeMs >= DISPLAY_HANDSHAKE_INTERVAL_MS) {
+    lastDisplayHandshakeMs = millis();
+    displaySendHandshake();
+  }
+}
+
+void displayPrintValue(uint16_t x, uint16_t y, const char *label, bool valid,
+                       const char *format, float value) {
+  char line[64];
+  displayClearTextArea(x, y, 340);
+  if (valid) {
+    const int labelLength = snprintf(line, sizeof(line), "%s: ", label);
+    snprintf(line + labelLength, sizeof(line) - labelLength, format, value);
+    displaySetForeground(0xFFFF);
+  } else {
+    snprintf(line, sizeof(line), "%s: --", label);
+    displaySetForeground(0xF800);
+  }
+  displayText(x, y, line);
+}
+
+void updateDisplay(const SensorSnapshot &snapshot) {
+  if (!DISPLAY_ENABLED) {
+    return;
+  }
+
+  const uint16_t background = 0x0000;
+  const uint16_t titleColor = 0x07FF;
+  const uint16_t healthyColor = 0x07E0;
+  const uint16_t waitingColor = 0xFFE0;
+  const uint16_t errorColor = 0xF800;
+
+  const bool windOk = snapshot.wind1Ok || snapshot.wind2Ok;
+  float windSpeed = 0.0f;
+  uint8_t windCount = 0;
+  if (snapshot.wind1Ok) {
+    windSpeed += snapshot.wind1SpeedMs;
+    ++windCount;
+  }
+  if (snapshot.wind2Ok) {
+    windSpeed += snapshot.wind2SpeedMs;
+    ++windCount;
+  }
+  if (windCount > 0) {
+    windSpeed /= windCount;
+  }
+
+  const bool solarOk = snapshot.solar1Ok || snapshot.solar2Ok;
+  float solarRadiation = 0.0f;
+  uint8_t solarCount = 0;
+  if (snapshot.solar1Ok) {
+    solarRadiation += snapshot.solarRadiation1Wm2;
+    ++solarCount;
+  }
+  if (snapshot.solar2Ok) {
+    solarRadiation += snapshot.solarRadiation2Wm2;
+    ++solarCount;
+  }
+  if (solarCount > 0) {
+    solarRadiation /= solarCount;
+  }
+
+  if (!displayInitialized) {
+    displaySetBackground(background);
+    displayClear();
+    displaySetForeground(titleColor);
+    displayText(30, 24, "AIOT FARM DASHBOARD");
+    displaySetForeground(0xFFFF);
+    displayText(30, 410, "SENSOR STATUS: red means read failed");
+    displayInitialized = true;
+  }
+
+  displayPrintValue(30, 90, "AIR TEMP", snapshot.airOk, "%.1f C", snapshot.air.temperatureC);
+  displayPrintValue(400, 90, "AIR RH", snapshot.airOk, "%.1f %%", snapshot.air.humidityPercent);
+  displayPrintValue(30, 145, "PRESSURE", snapshot.AirPressure > 0, "%.0f hPa",
+                    static_cast<float>(snapshot.AirPressure));
+  displayPrintValue(400, 145, "WIND AVG", windOk, "%.2f m/s", windSpeed);
+  displayPrintValue(30, 200, "SOIL TEMP", snapshot.soilOk, "%.1f C", snapshot.soil.temperatureC);
+  displayPrintValue(400, 200, "SOIL MOIST", snapshot.soilOk, "%.1f %%", snapshot.soil.moisturePercent);
+  displayPrintValue(30, 255, "SOLAR AVG", solarOk, "%.0f W/m2", solarRadiation);
+
+  char modelLine[96];
+  displayClearTextArea(30, 330, 720);
+  if (!displayForecast.received) {
+    displaySetForeground(waitingColor);
+    displayText(30, 330, "MODEL: waiting for PC connection");
+  } else if (strcmp(displayForecast.status, "ok") == 0) {
+    displaySetForeground(healthyColor);
+    snprintf(modelLine, sizeof(modelLine), "PRED 1H: ET0 %.3f mm  SOIL %.1f %%",
+             displayForecast.nextHourEt0Mm, displayForecast.soilMoistureInOneHour);
+    displayText(30, 330, modelLine);
+  } else {
+    displaySetForeground(errorColor);
+    snprintf(modelLine, sizeof(modelLine), "MODEL: %s  %u/%u", displayForecast.status,
+             displayForecast.availableSamples, displayForecast.requiredSamples);
+    displayText(30, 330, modelLine);
+  }
+
+  displayClearTextArea(30, 375, 720);
+  if (displayHandshakeConfirmed) {
+    displaySetForeground(healthyColor);
+    snprintf(modelLine, sizeof(modelLine), "HMI LINK: M protocol OK (%lu replies)",
+             static_cast<unsigned long>(displayHandshakeReplies));
+  } else {
+    displaySetForeground(waitingColor);
+    snprintf(modelLine, sizeof(modelLine), "HMI LINK: waiting for TXD reply (%lu bytes)",
+             static_cast<unsigned long>(displayRxBytes));
+  }
+  displayText(30, 375, modelLine);
+
+}
+
+void handleDisplayCommand(const char *line) {
+  if (strncmp(line, "DISPLAY ", 8) != 0) {
+    return;
+  }
+
+  DisplayForecast incoming = {};
+  const int parsed = sscanf(line,
+                            "DISPLAY status=%31s samples=%hu/%hu et0=%f soil=%f",
+                            incoming.status,
+                            &incoming.availableSamples,
+                            &incoming.requiredSamples,
+                            &incoming.nextHourEt0Mm,
+                            &incoming.soilMoistureInOneHour);
+  if (parsed != 5) {
+    Serial.printf("[DISPLAY] Ignored malformed model message: %s\n", line);
+    return;
+  }
+
+  incoming.received = true;
+  displayForecast = incoming;
+  Serial.printf("[DISPLAY] Model status=%s samples=%u/%u\n", displayForecast.status,
+                displayForecast.availableSamples, displayForecast.requiredSamples);
+}
+
 void setupRs485DirectionPin(int pin) {
   if (pin >= 0) {
     pinMode(pin, OUTPUT);
@@ -738,6 +1034,21 @@ void printWifiInfo() {
   Serial.println("--------------------------------");
 }
 
+void printNearbyWifi() {
+  Serial.println("Wi-Fi scan after connection failure:");
+  const int count = WiFi.scanNetworks(false, true);
+  if (count <= 0) {
+    Serial.println("  no visible networks");
+  } else {
+    for (int i = 0; i < count; ++i) {
+      Serial.printf("  %s  RSSI=%d dBm  channel=%d  security=%d\n",
+                    WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
+                    static_cast<int>(WiFi.encryptionType(i)));
+    }
+  }
+  WiFi.scanDelete();
+}
+
 bool startWifi() {
   WiFi.mode(WIFI_USE_SOFT_AP ? WIFI_AP : WIFI_STA);
 
@@ -747,6 +1058,22 @@ bool startWifi() {
       return false;
     }
   } else {
+    // Windows Mobile Hotspot can be sensitive to the station's power-save
+    // transition during the WPA2 handshake. Keep the radio awake and clear
+    // the previous association before starting a fresh connection attempt.
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    WiFi.disconnect(false);
+    delay(200);
+    if (USE_WINDOWS_HOTSPOT_STATIC_IP) {
+      if (!WiFi.config(WINDOWS_HOTSPOT_IP, WINDOWS_HOTSPOT_GATEWAY,
+                       WINDOWS_HOTSPOT_SUBNET, WINDOWS_HOTSPOT_DNS)) {
+        Serial.println("Static Windows hotspot IP configuration failed.");
+      } else {
+        Serial.printf("Static IP configured: %s\n",
+                      WINDOWS_HOTSPOT_IP.toString().c_str());
+      }
+    }
     WiFi.begin(ROUTER_SSID, ROUTER_PASSWORD);
     Serial.print("Connecting to router Wi-Fi");
 
@@ -759,8 +1086,21 @@ bool startWifi() {
     Serial.println();
 
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("Router Wi-Fi connection timeout.");
+      Serial.printf("Router Wi-Fi connection timeout (status=%d).\n",
+                    static_cast<int>(WiFi.status()));
+      Serial.printf("Associated SSID: %s, BSSID: %s, local IP: %s\n",
+                    WiFi.SSID().c_str(), WiFi.BSSIDstr().c_str(),
+                    WiFi.localIP().toString().c_str());
+      WiFi.printDiag(Serial);
+      printNearbyWifi();
       return false;
+    }
+
+    if (MDNS.begin(MDNS_HOSTNAME)) {
+      MDNS.addService("iot-sensor", "tcp", TCP_PORT);
+      Serial.printf("mDNS host: %s.local\n", MDNS_HOSTNAME);
+    } else {
+      Serial.println("mDNS start failed; use the printed IP address.");
     }
   }
 
@@ -796,22 +1136,36 @@ void forwardTcpToUsbSerial() {
     return;
   }
 
-  uint8_t buffer[64];
-  const int bytesToRead = min(TcpClient.available(), static_cast<int>(sizeof(buffer)));
-  if (bytesToRead <= 0) {
-    return;
-  }
+  static char line[192] = {};
+  static size_t lineLength = 0;
+  while (TcpClient.available()) {
+    const int value = TcpClient.read();
+    if (value < 0) {
+      break;
+    }
 
-  const size_t bytesRead = TcpClient.read(buffer, bytesToRead);
-  if (bytesRead > 0) {
-    Serial.print("[TCP RX] ");
-    Serial.write(buffer, bytesRead);
-    Serial.println();
+    if (value == '\n') {
+      line[lineLength] = '\0';
+      if (lineLength > 0) {
+        Serial.printf("[TCP RX] %s\n", line);
+        handleDisplayCommand(line);
+      }
+      lineLength = 0;
+      continue;
+    }
+
+    if (value != '\r' && lineLength < sizeof(line) - 1) {
+      line[lineLength++] = static_cast<char>(value);
+    } else if (lineLength >= sizeof(line) - 1) {
+      lineLength = 0;
+    }
   }
 }
 
 void forwardUsbSerialToTcp() {
-  if (!TcpClient || !TcpClient.connected()) {
+  // UART0 is the display port when enabled. Do not forward screen reply bytes
+  // as if they were user input from the USB serial monitor.
+  if (DISPLAY_ENABLED || !TcpClient || !TcpClient.connected()) {
     return;
   }
 
@@ -827,12 +1181,21 @@ void forwardUsbSerialToTcp() {
 }
 
 void serviceWifi() {
+  static uint32_t lastStatusPrintMs = 0;
+
   if (!wifiReady) {
     if (millis() - lastWifiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
       lastWifiRetryMs = millis();
       startWifi();
     }
     return;
+  }
+
+  if (millis() - lastStatusPrintMs >= WIFI_STATUS_PRINT_INTERVAL_MS) {
+    lastStatusPrintMs = millis();
+    Serial.printf("[Wi-Fi] connected SSID=%s IP=%s RSSI=%d dBm\n",
+                  WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
+                  WiFi.RSSI());
   }
 
   if (!WIFI_USE_SOFT_AP && WiFi.status() != WL_CONNECTED) {
@@ -846,6 +1209,7 @@ void serviceWifi() {
   acceptTcpClient();
   forwardTcpToUsbSerial();
   forwardUsbSerialToTcp();
+  serviceDisplayProtocol();
 
   if (TcpClient && !TcpClient.connected()) {
     TcpClient.stop();
@@ -876,7 +1240,7 @@ void sendTelemetry(const SensorSnapshot &snapshot) {
     averageWindSpeedMs /= validWindCount;
   }
 
-  char packet[768];
+  char packet[896];
   const int written = snprintf(
       packet,
       sizeof(packet),
@@ -886,7 +1250,8 @@ void sendTelemetry(const SensorSnapshot &snapshot) {
       "\"air_pressure_hpa\":%u,"
       "\"air\":{\"ok\":%s,\"temperature_c\":%.2f,\"humidity_pct\":%.2f},"
       "\"soil\":{\"ok\":%s,\"temperature_c\":%.1f,\"moisture_pct\":%.1f},"
-      "\"solar\":{\"sensor_1\":{\"ok\":%s,\"radiation_w_m2\":%u},\"sensor_2\":{\"ok\":%s,\"radiation_w_m2\":%u}}}\n",
+      "\"solar\":{\"sensor_1\":{\"ok\":%s,\"radiation_w_m2\":%u},\"sensor_2\":{\"ok\":%s,\"radiation_w_m2\":%u}},"
+      "\"display\":{\"enabled\":%s,\"rx_bytes\":%lu,\"handshake_ok\":%s}}\n",
       static_cast<unsigned long>(snapshot.uptimeMs),
       validWindCount > 0 ? "true" : "false",
       averageWindVoltage,
@@ -907,7 +1272,10 @@ void sendTelemetry(const SensorSnapshot &snapshot) {
       snapshot.solar1Ok ? "true" : "false",
       snapshot.solarRadiation1Wm2,
       snapshot.solar2Ok ? "true" : "false",
-      snapshot.solarRadiation2Wm2);
+      snapshot.solarRadiation2Wm2,
+      DISPLAY_ENABLED ? "true" : "false",
+      static_cast<unsigned long>(displayRxBytes),
+      displayHandshakeConfirmed ? "true" : "false");
 
   if (written <= 0 || written >= static_cast<int>(sizeof(packet))) {
     Serial.println("[TCP] Telemetry packet creation failed.");
@@ -939,6 +1307,12 @@ void setup() {
 
   SoilSerial.begin(SOIL_BAUD, SERIAL_8N1, SOIL_RS485_RX_PIN, SOIL_RS485_TX_PIN);
   SolarSerial.begin(SOLAR_BAUD, SERIAL_8N1, SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN);
+  if (DISPLAY_ENABLED) {
+    DisplaySerial.begin(DISPLAY_BAUD, SERIAL_8N1, DISPLAY_UART_RX_PIN, DISPLAY_UART_TX_PIN);
+    Serial.printf("M-series display: UART RX=GPIO%d TX=GPIO%d baud=%lu\n",
+                  DISPLAY_UART_RX_PIN, DISPLAY_UART_TX_PIN,
+                  static_cast<unsigned long>(DISPLAY_BAUD));
+  }
 
   Serial.println();
   Serial.println("Combined IOT sensor reader started");
@@ -1067,6 +1441,7 @@ void loop() {
     Serial.println("Solar radiation sensor 2 read failed.");
   }
 
+  updateDisplay(snapshot);
   sendTelemetry(snapshot);
   Serial.println("=================================");
 }

@@ -47,3 +47,16 @@ def test_duplicate_is_reported(tmp_path):
     body = client.post("/v1/snapshots", json=payload()).json()
     assert any("duplicate" in item for item in body["warnings"])
 
+
+def test_dashboard_exposes_latest_snapshot(tmp_path):
+    settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
+    client = TestClient(create_app(settings))
+    client.post("/v1/snapshots", json=payload())
+
+    page = client.get("/dashboard")
+    assert page.status_code == 200
+    assert "AIoT 农场监控" in page.text
+
+    latest = client.get("/v1/dashboard/latest")
+    assert latest.status_code == 200
+    assert latest.json()["snapshot"]["air"]["temperatureC"] == 24.0

@@ -85,9 +85,20 @@ curl -X POST http://127.0.0.1:8000/v1/snapshots \
 
 ## 接收 ESP32 TCP 数据并提交预测服务
 
-烧录 [`firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino`](firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino) 后，ESP32 默认创建 `ESP32-S3-IOT`
-热点，并在 `192.168.4.1:3333` 提供一行一条的 JSON 采集数据。电脑连接该热点后，
-在一个终端启动本项目的预测服务：
+烧录 [`firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino`](firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino) 后，当前固件默认作为
+Windows 移动热点的 Wi-Fi 客户端，并在 TCP 3333 端口提供一行一条的 JSON 采集数据。Windows
+移动热点请设置为 **2.4 GHz**，固件中的 `WIFI_USE_SOFT_AP` 保持为 `false`。
+复制 `firmware/esp32_s3_all_sensors/wifi_credentials.h.example` 为
+`wifi_credentials.h`，填写热点名和密码。真实凭据文件仅保存在本机，不会推送到 GitHub。
+
+Windows 移动热点通常使用 `192.168.137.1` 作为网关；固件默认使用固定地址
+`192.168.137.50`，避免部分 Windows 热点未及时分配 DHCP 地址的问题。ESP32 成功连接后
+会打印该地址，同时注册为 `esp32-sensors.local`。
+
+如需恢复 ESP32 自己创建热点的直连模式，将 `WIFI_USE_SOFT_AP` 改为 `true`；地址为
+`192.168.4.1:3333`。
+
+在电脑上启动本项目的预测服务：
 
 ```bash
 dual-forecast serve --host 127.0.0.1 --port 8000
@@ -96,12 +107,25 @@ dual-forecast serve --host 127.0.0.1 --port 8000
 在另一个终端启动 TCP 接收桥接程序：
 
 ```bash
-dual-forecast receive-esp32
+dual-forecast receive-esp32 --esp-host 192.168.137.50
 ```
 
 桥接程序会将 ESP32 的下划线 JSON 字段转换为 `SensorSnapshot` 的字段名，并 POST 到
 `/v1/snapshots`，由服务写入历史窗口和调用预测模型。默认每 300 秒提交一次，匹配模型的
 五分钟时间步；调试时可用 `--min-interval-seconds 0` 每条都提交。
+
+启动后用浏览器打开电脑端实时画面：
+
+```text
+http://127.0.0.1:8000/dashboard
+```
+
+画面会每 2 秒刷新空气温湿度、气压、风速、土壤数据、太阳辐射和预测模型状态。
+也可以使用 `esp32-sensors.local`；如果电脑无法解析 `.local`，使用 ESP32 串口输出的 IP：
+
+```bash
+dual-forecast receive-esp32 --esp-host <ESP32_IP>
+```
 
 当前 ESP32 程序已支持 BMP280/BME280 气压传感器，正常时会发送真实的 `AirPressure`（hPa）。
 若传感器暂未接好而上传 0，桥接程序会临时改用 1013 hPa，避免 0 hPa 进入蒸散预测；可通过

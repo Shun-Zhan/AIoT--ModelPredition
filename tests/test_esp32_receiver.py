@@ -1,4 +1,4 @@
-from dual_forecast.esp32_receiver import esp32_message_to_snapshot
+from dual_forecast.esp32_receiver import esp32_message_to_snapshot, result_to_display_command
 
 
 def test_esp32_message_maps_to_service_snapshot():
@@ -49,3 +49,25 @@ def test_zero_pressure_uses_configured_fallback():
     snapshot = esp32_message_to_snapshot(message, fallback_air_pressure_hpa=1013)
 
     assert snapshot["AirPressure"] == 1013
+
+
+def test_prediction_result_is_encoded_for_the_esp32_display():
+    result = {
+        "status": "ok",
+        "availableSamples": 288,
+        "requiredSamples": 288,
+        "forecast": [
+            {"et0Mm": 0.01, "soilMoisturePercent": 48.2},
+            {"et0Mm": 0.02, "soilMoisturePercent": 48.0},
+        ],
+    }
+
+    assert result_to_display_command(result) == (
+        "DISPLAY status=ok samples=288/288 et0=0.030 soil=48.0\n"
+    )
+
+
+def test_prediction_status_without_forecast_keeps_the_display_protocol_valid():
+    assert result_to_display_command(
+        {"status": "insufficient_data", "availableSamples": 239, "requiredSamples": 288}
+    ) == "DISPLAY status=insufficient_data samples=239/288 et0=0.000 soil=0.0\n"

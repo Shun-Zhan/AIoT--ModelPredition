@@ -73,6 +73,38 @@ class Store:
         frame["timestamp"] = pd.to_datetime(frame.pop("received_at"), utc=True)
         return frame.set_index("timestamp")
 
+    def latest_snapshot(self) -> dict | None:
+        """Return the newest received sample in a dashboard-friendly shape."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM snapshots ORDER BY received_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+
+        warnings = json.loads(row["warnings_json"] or "[]")
+        return {
+            "receivedAt": row["received_at"],
+            "uptimeMs": row["uptime_ms"],
+            "windOk": bool(row["wind_ok"]),
+            "windSpeedMs": row["wind_ms"],
+            "windVoltage": row["wind_voltage"],
+            "airOk": bool(row["air_ok"]),
+            "air": {
+                "temperatureC": row["air_temp_c"],
+                "humidityPercent": row["rh_percent"],
+            },
+            "airPressureHpa": round(float(row["pressure_kpa"]) * 10, 1),
+            "soilOk": bool(row["soil_ok"]),
+            "soil": {
+                "temperatureC": row["soil_temp_c"],
+                "moisturePercent": row["soil_moisture_percent"],
+            },
+            "solarOk": row["solar_wm2"] is not None,
+            "solarRadiationWm2": row["solar_wm2"],
+            "warnings": warnings,
+        }
+
     def observed_span_days(self) -> float:
         with self.connection() as conn:
             row = conn.execute("SELECT MIN(received_at) a, MAX(received_at) b FROM snapshots WHERE soil_ok=1").fetchone()
@@ -88,4 +120,3 @@ class Store:
         with self.connection() as conn:
             row = conn.execute("SELECT payload_json FROM forecasts ORDER BY generated_at DESC LIMIT 1").fetchone()
         return ForecastResponse.model_validate_json(row[0]) if row else None
-

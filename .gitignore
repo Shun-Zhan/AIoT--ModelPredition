@@ -21,3 +21,5 @@ data/
 .idea/
 .vscode/
 
+# Local Wi-Fi credentials for the ESP32 firmware
+firmware/esp32_s3_all_sensors/wifi_credentials.h

@@ -61,9 +61,24 @@ def submit_snapshot(api_url: str, snapshot: dict[str, Any]) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def result_to_display_command(result: dict[str, Any]) -> str:
+    """Encode a compact prediction update that the ESP32 can parse without JSON."""
+    status = str(result.get("status", "unknown"))
+    available = int(result.get("availableSamples", 0))
+    required = int(result.get("requiredSamples", 288))
+    forecast = result.get("forecast") or []
+    et0_mm = sum(float(point.get("et0Mm", 0.0)) for point in forecast)
+    soil_percent = float(forecast[-1].get("soilMoisturePercent", 0.0)) if forecast else 0.0
+    return (
+        f"DISPLAY status={status} samples={available}/{required} "
+        f"et0={et0_mm:.3f} soil={soil_percent:.1f}\n"
+    )
+
+
 def receive_esp32(args: argparse.Namespace) -> None:
     """Keep one TCP connection to ESP32 and forward sampled messages to FastAPI."""
     last_submit_at = 0.0
+    last_display_diagnostic: tuple[bool, int, bool] | None = None
 
     while True:
         try:
@@ -85,6 +100,21 @@ def receive_esp32(args: argparse.Namespace) -> None:
                             print(f"ESP32: {line}")
                             continue
 
+                        display = message.get("display")
+                        if isinstance(display, dict):
+                            diagnostic = (
+                                bool(display.get("enabled", False)),
+                                int(display.get("rx_bytes", 0)),
+                                bool(display.get("handshake_ok", False)),
+                            )
+                            if diagnostic != last_display_diagnostic:
+                                print(
+                                    "HMI diagnostic: "
+                                    f"enabled={diagnostic[0]}, rx_bytes={diagnostic[1]}, "
+                                    f"m_protocol_handshake={diagnostic[2]}"
+                                )
+                                last_display_diagnostic = diagnostic
+
                         now = time.monotonic()
                         if now - last_submit_at < args.min_interval_seconds:
                             continue
@@ -104,6 +134,7 @@ def receive_esp32(args: argparse.Namespace) -> None:
                             continue
 
                         last_submit_at = now
+                        connection.sendall(result_to_display_command(result).encode("ascii"))
                         if raw_pressure_hpa <= 0:
                             print(
                                 "AirPressure is 0; using fallback "
@@ -124,7 +155,11 @@ def add_receiver_parser(subparsers: argparse._SubParsersAction) -> None:
         "receive-esp32",
         help="receive ESP32 TCP telemetry and submit it to the local prediction service",
     )
-    parser.add_argument("--esp-host", default="192.168.4.1", help="ESP32 TCP server address")
+    parser.add_argument(
+        "--esp-host",
+        default="esp32-sensors.local",
+        help="ESP32 TCP server address; Station mode uses esp32-sensors.local by default",
+    )
     parser.add_argument("--esp-port", type=int, default=3333, help="ESP32 TCP server port")
     parser.add_argument(
         "--api-url",
