@@ -1,4 +1,8 @@
-from dual_forecast.esp32_receiver import esp32_message_to_snapshot, result_to_display_command
+from dual_forecast.esp32_receiver import (
+    esp32_message_to_snapshot,
+    result_to_display_command,
+    snapshot_is_complete_for_prediction,
+)
 
 
 def test_esp32_message_maps_to_service_snapshot():
@@ -49,6 +53,21 @@ def test_zero_pressure_uses_configured_fallback():
     snapshot = esp32_message_to_snapshot(message, fallback_air_pressure_hpa=1013)
 
     assert snapshot["AirPressure"] == 1013
+
+
+def test_incomplete_packet_is_not_used_for_prediction():
+    snapshot = {
+        "windOk": True,
+        "airOk": True,
+        "soilOk": True,
+        "solar1Ok": True,
+        "solar2Ok": False,
+        "AirPressure": 1013,
+    }
+    assert snapshot_is_complete_for_prediction(snapshot)
+
+    snapshot["soilOk"] = False
+    assert not snapshot_is_complete_for_prediction(snapshot)
 
 
 def test_prediction_result_is_encoded_for_the_esp32_display():

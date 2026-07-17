@@ -48,6 +48,22 @@ def esp32_message_to_snapshot(
     }
 
 
+def snapshot_is_complete_for_prediction(snapshot: dict[str, Any]) -> bool:
+    """Accept only a complete environmental sample into the model time series.
+
+    The dashboard still receives every validly decoded packet, including a
+    transient failed sensor. Prediction history deliberately skips incomplete
+    packets, so the following complete ESP32 packet can be used immediately.
+    """
+    return bool(
+        snapshot.get("windOk")
+        and snapshot.get("airOk")
+        and snapshot.get("soilOk")
+        and (snapshot.get("solar1Ok") or snapshot.get("solar2Ok"))
+        and int(snapshot.get("AirPressure", 0)) > 0
+    )
+
+
 def submit_snapshot(api_url: str, snapshot: dict[str, Any]) -> dict[str, Any]:
     """Submit one normalized snapshot to the running prediction service."""
     payload = json.dumps(snapshot).encode("utf-8")
@@ -131,6 +147,10 @@ def receive_esp32(args: argparse.Namespace) -> None:
                             continue
 
                         if now - last_submit_at < args.min_interval_seconds:
+                            continue
+
+                        if not snapshot_is_complete_for_prediction(snapshot):
+                            print("Skipped incomplete ESP32 packet for prediction; waiting for next packet.")
                             continue
 
                         try:
