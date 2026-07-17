@@ -74,12 +74,13 @@ static const char *ROUTER_PASSWORD = "电脑热点密码";
 ```
 
 `wifi_credentials.h` 被 Git 忽略，不会将真实密码推送到仓库。Windows 移动热点通常使用
-`192.168.137.1` 作为网关；固件默认将 ESP32 固定为 `192.168.137.50`，避免 Windows 热点
-DHCP 未及时分配地址。ESP32 加入热点后，串口每 10 秒会输出连接状态，并尝试注册
+当前电脑热点使用 `10.98.128.1` 作为网关；固件默认将 ESP32 固定为 `10.98.128.50`，避免 Windows
+热点 DHCP 未及时分配地址。其他电脑请用 `ipconfig` 查看热点对应“本地连接*”的 IPv4 地址，并在
+本机 `wifi_credentials.h` 中相应修改网关和 ESP32 IP。ESP32 加入热点后，串口每 10 秒会输出连接状态，并尝试注册
 `esp32-sensors.local`。电脑端接收命令为：
 
 ```bash
-dual-forecast receive-esp32 --esp-host 192.168.137.50
+dual-forecast receive-esp32 --esp-host 10.98.128.50
 ```
 
 如果 `.local` 解析失败，使用串口打印的 IP 地址作为 `--esp-host`。

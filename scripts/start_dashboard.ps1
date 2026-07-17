@@ -11,7 +11,8 @@ $runtimeDir = Join-Path $projectRoot "runtime"
 $logDir = Join-Path $runtimeDir "logs"
 $pidFile = Join-Path $runtimeDir "dashboard-processes.json"
 $dashboardUrl = "http://127.0.0.1:8000/dashboard"
-$espHost = "192.168.137.50"
+# Must match WINDOWS_HOTSPOT_IP in firmware/.../wifi_credentials.h.
+$espHost = "10.98.128.50"
 
 function Test-ManagedProcessAlive($id) {
     if (-not $id) { return $false }

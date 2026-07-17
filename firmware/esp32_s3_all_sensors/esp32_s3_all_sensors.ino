@@ -44,16 +44,16 @@ static const char *WIFI_AP_PASSWORD = "12345678";
 #else
 static const char *ROUTER_SSID = "YOUR_WIFI_SSID";
 static const char *ROUTER_PASSWORD = "YOUR_WIFI_PASSWORD";
+// Change these to match the IPv4 address of Windows "Local Area
+// Connection*" shown by ipconfig, or set this to false to use DHCP.
+static const bool USE_WINDOWS_HOTSPOT_STATIC_IP = true;
+static IPAddress WINDOWS_HOTSPOT_IP(10, 98, 128, 50);
+static IPAddress WINDOWS_HOTSPOT_GATEWAY(10, 98, 128, 1);
+static IPAddress WINDOWS_HOTSPOT_SUBNET(255, 255, 255, 0);
+static IPAddress WINDOWS_HOTSPOT_DNS(10, 98, 128, 1);
 #endif
 static const char *MDNS_HOSTNAME = "esp32-sensors";
 static const uint16_t TCP_PORT = 3333;
-// Windows Mobile Hotspot normally uses 192.168.137.1 as its gateway. This
-// avoids waiting for a DHCP lease when the hotspot's DHCP service is slow.
-static const bool USE_WINDOWS_HOTSPOT_STATIC_IP = true;
-static IPAddress WINDOWS_HOTSPOT_IP(192, 168, 137, 50);
-static IPAddress WINDOWS_HOTSPOT_GATEWAY(192, 168, 137, 1);
-static IPAddress WINDOWS_HOTSPOT_SUBNET(255, 255, 255, 0);
-static IPAddress WINDOWS_HOTSPOT_DNS(192, 168, 137, 1);
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 static const uint32_t WIFI_STATUS_PRINT_INTERVAL_MS = 10000;
