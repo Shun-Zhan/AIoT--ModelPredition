@@ -158,6 +158,15 @@ cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
 
 日志保存在 `runtime\logs\`。
 
+若网页右上角显示“实时数据：超过 20 秒前”，用下面命令实时查看接收器日志：
+
+```powershell
+Get-Content .\runtime\logs\esp32-receiver.out.log -Tail 40 -Wait
+```
+
+正常时每约 10 秒会出现 `Live dashboard updated from ESP32 telemetry.`；若脚本提示 TCP 3333
+不可达，先运行 `Test-NetConnection 192.168.137.50 -Port 3333` 检查热点连通性。
+
 若电脑没有安装在默认位置的 Edge，脚本会自动尝试 Chrome；两者都未找到时会以普通浏览器打开。
 
 #### 手动启动

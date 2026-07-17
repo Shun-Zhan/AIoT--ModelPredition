@@ -26,7 +26,9 @@ function Start-ManagedProcess($name, [string[]]$arguments, $existingId) {
 
     $stdout = Join-Path $logDir "$name.out.log"
     $stderr = Join-Path $logDir "$name.err.log"
-    $process = Start-Process -FilePath $forecastCli -ArgumentList $arguments `
+    # Run Python in unbuffered mode so runtime\logs is useful immediately.
+    $pythonArguments = @("-u", "-m", "dual_forecast.cli") + $arguments
+    $process = Start-Process -FilePath $venvPython -ArgumentList $pythonArguments `
         -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $stdout `
         -RedirectStandardError $stderr -PassThru
     Write-Host "Started $name (PID $($process.Id))."
@@ -54,6 +56,10 @@ if (Test-Path $pidFile) {
 
 $serviceId = Start-ManagedProcess "forecast-service" @("serve", "--host", "127.0.0.1", "--port", "8000") $saved.servicePid
 Start-Sleep -Seconds 2
+$espReachable = Test-NetConnection -ComputerName $espHost -Port 3333 -InformationLevel Quiet
+if (-not $espReachable) {
+    Write-Warning "ESP32 TCP port $($espHost):3333 is not reachable yet. The receiver will keep retrying."
+}
 $receiverId = Start-ManagedProcess "esp32-receiver" @("receive-esp32", "--esp-host", $espHost) $saved.receiverPid
 
 @{ servicePid = $serviceId; receiverPid = $receiverId } | ConvertTo-Json | Set-Content -Encoding utf8 $pidFile
