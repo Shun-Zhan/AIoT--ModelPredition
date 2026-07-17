@@ -3,6 +3,10 @@
 Starts the local forecast service, ESP32 receiver, and full-screen dashboard.
 #>
 
+param(
+    [string]$EspSerialPort = ""
+)
+
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
@@ -11,8 +15,6 @@ $runtimeDir = Join-Path $projectRoot "runtime"
 $logDir = Join-Path $runtimeDir "logs"
 $pidFile = Join-Path $runtimeDir "dashboard-processes.json"
 $dashboardUrl = "http://127.0.0.1:8000/dashboard"
-# Must match WINDOWS_HOTSPOT_IP in firmware/.../wifi_credentials.h.
-$espHost = "10.98.128.50"
 
 function Test-ManagedProcessAlive($id) {
     if (-not $id) { return $false }
@@ -42,14 +44,27 @@ if (-not (Test-Path $venvPython)) {
     if ($LASTEXITCODE -ne 0) { throw "Failed to create .venv. Install Python 3.10 or later and ensure 'py' works." }
 }
 
-if (-not (Test-Path $forecastCli)) {
-    Write-Host "Installing project dependencies (first run only)..."
+& $venvPython -c "import serial" 2>$null
+$serialDependencyReady = $LASTEXITCODE -eq 0
+if (-not (Test-Path $forecastCli) -or -not $serialDependencyReady) {
+    Write-Host "Installing project dependencies (first run or updated dependencies)..."
     & $venvPython -m pip install --upgrade pip
     & $venvPython -m pip install -r (Join-Path $projectRoot "requirements.txt")
     if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed. See the error above." }
 }
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$serialPorts = @(Get-CimInstance Win32_SerialPort -ErrorAction SilentlyContinue)
+if (-not $EspSerialPort) {
+    $usbPorts = @($serialPorts | Where-Object { $_.PNPDeviceID -match "USB|VID_" })
+    if ($usbPorts.Count -eq 1) {
+        $EspSerialPort = $usbPorts[0].DeviceID
+        Write-Host "Detected ESP32 USB serial port: $EspSerialPort"
+    } else {
+        $available = ($serialPorts | ForEach-Object { "$($_.DeviceID) ($($_.Name))" }) -join "; "
+        throw "Cannot determine the ESP32 serial port. Run: .\start_dashboard.cmd -EspSerialPort COM3 . Available ports: $available"
+    }
+}
 $saved = @{}
 if (Test-Path $pidFile) {
     try { $saved = Get-Content $pidFile -Raw | ConvertFrom-Json } catch { $saved = @{} }
@@ -57,11 +72,7 @@ if (Test-Path $pidFile) {
 
 $serviceId = Start-ManagedProcess "forecast-service" @("serve", "--host", "127.0.0.1", "--port", "8000") $saved.servicePid
 Start-Sleep -Seconds 2
-$espReachable = Test-NetConnection -ComputerName $espHost -Port 3333 -InformationLevel Quiet
-if (-not $espReachable) {
-    Write-Warning "ESP32 TCP port $($espHost):3333 is not reachable yet. The receiver will keep retrying."
-}
-$receiverId = Start-ManagedProcess "esp32-receiver" @("receive-esp32", "--esp-host", $espHost) $saved.receiverPid
+$receiverId = Start-ManagedProcess "esp32-receiver" @("receive-esp32-serial", "--serial-port", $EspSerialPort) $saved.receiverPid
 
 @{ servicePid = $serviceId; receiverPid = $receiverId } | ConvertTo-Json | Set-Content -Encoding utf8 $pidFile
 
@@ -89,5 +100,5 @@ if (-not $dashboardOpened) {
     Start-Process $dashboardUrl
 }
 
-Write-Host "Dashboard opened. ESP32 target: $espHost"
+Write-Host "Dashboard opened. ESP32 USB serial port: $EspSerialPort"
 Write-Host "Logs: $logDir"

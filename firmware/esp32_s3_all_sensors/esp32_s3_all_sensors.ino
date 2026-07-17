@@ -31,11 +31,21 @@
 static const uint32_t PC_BAUD = 115200;
 static const uint32_t READ_INTERVAL_MS = 2000;
 
+// The USB cable used to upload this sketch can also carry telemetry to the
+// local computer.  Each sample is emitted as one line beginning with
+// "@TELEMETRY "; ordinary diagnostic logs use other prefixes and are ignored
+// by the computer-side serial receiver.
+static const bool USB_SERIAL_TELEMETRY_ENABLED = true;
+static const char *USB_TELEMETRY_PREFIX = "@TELEMETRY ";
+
 // -------------------- Wi-Fi TCP telemetry --------------------
 
 // Set false to let the ESP32-S3 join the computer's shared/mobile-hotspot
 // Wi-Fi. Fill in ROUTER_SSID and ROUTER_PASSWORD before compiling.
 // Keep true only for the standalone ESP32 hotspot mode.
+// USB serial telemetry is the default transport in this revision, so Wi-Fi
+// is disabled and no hotspot/network configuration is required.
+static const bool WIFI_TELEMETRY_ENABLED = false;
 static const bool WIFI_USE_SOFT_AP = false;
 static const char *WIFI_AP_SSID = "ESP32-S3-IOT";
 static const char *WIFI_AP_PASSWORD = "12345678";
@@ -1050,6 +1060,10 @@ void printNearbyWifi() {
 }
 
 bool startWifi() {
+  if (!WIFI_TELEMETRY_ENABLED) {
+    return false;
+  }
+
   WiFi.mode(WIFI_USE_SOFT_AP ? WIFI_AP : WIFI_STA);
 
   if (WIFI_USE_SOFT_AP) {
@@ -1181,6 +1195,10 @@ void forwardUsbSerialToTcp() {
 }
 
 void serviceWifi() {
+  if (!WIFI_TELEMETRY_ENABLED) {
+    return;
+  }
+
   static uint32_t lastStatusPrintMs = 0;
 
   if (!wifiReady) {
@@ -1218,10 +1236,6 @@ void serviceWifi() {
 }
 
 void sendTelemetry(const SensorSnapshot &snapshot) {
-  if (!TcpClient || !TcpClient.connected()) {
-    return;
-  }
-
   uint8_t validWindCount = 0;
   float averageWindVoltage = 0.0f;
   float averageWindSpeedMs = 0.0f;
@@ -1278,13 +1292,20 @@ void sendTelemetry(const SensorSnapshot &snapshot) {
       displayHandshakeConfirmed ? "true" : "false");
 
   if (written <= 0 || written >= static_cast<int>(sizeof(packet))) {
-    Serial.println("[TCP] Telemetry packet creation failed.");
+    Serial.println("[TELEMETRY] Packet creation failed.");
     return;
   }
 
-  TcpClient.write(reinterpret_cast<const uint8_t *>(packet), written);
-  Serial.print("[TCP TX] ");
-  Serial.print(packet);
+  if (USB_SERIAL_TELEMETRY_ENABLED) {
+    Serial.print(USB_TELEMETRY_PREFIX);
+    Serial.write(reinterpret_cast<const uint8_t *>(packet), written);
+  }
+
+  if (WIFI_TELEMETRY_ENABLED && TcpClient && TcpClient.connected()) {
+    TcpClient.write(reinterpret_cast<const uint8_t *>(packet), written);
+    Serial.print("[TCP TX] ");
+    Serial.print(packet);
+  }
 }
 
 void setup() {
@@ -1332,9 +1353,14 @@ void setup() {
                 SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN, SOLAR_BAUD,
                 SOLAR_1_ADDR, SOLAR_2_ADDR);
 
-  if (!startWifi()) {
-    Serial.println("Wi-Fi is unavailable; sensor collection will continue and Wi-Fi will retry.");
-    lastWifiRetryMs = millis();
+  if (WIFI_TELEMETRY_ENABLED) {
+    if (!startWifi()) {
+      Serial.println("Wi-Fi is unavailable; sensor collection will continue and Wi-Fi will retry.");
+      lastWifiRetryMs = millis();
+    }
+  } else {
+    Serial.printf("USB serial telemetry enabled at %lu baud. Wi-Fi transport disabled.\n",
+                  static_cast<unsigned long>(PC_BAUD));
   }
 
   printI2cScan(Wire, "BMP280 bus");

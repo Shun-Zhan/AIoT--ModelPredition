@@ -8,6 +8,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -91,11 +92,86 @@ def result_to_display_command(result: dict[str, Any]) -> str:
     )
 
 
+@dataclass
+class _ReceiverState:
+    last_submit_at: float = 0.0
+    last_live_log_at: float = 0.0
+    last_display_diagnostic: tuple[bool, int, bool] | None = None
+
+
+def _handle_telemetry_message(
+    message: dict[str, Any],
+    args: argparse.Namespace,
+    state: _ReceiverState,
+    *,
+    send_display_command: Any | None = None,
+) -> None:
+    """Forward one decoded ESP32 message to the dashboard and prediction API."""
+    display = message.get("display")
+    if isinstance(display, dict):
+        diagnostic = (
+            bool(display.get("enabled", False)),
+            int(display.get("rx_bytes", 0)),
+            bool(display.get("handshake_ok", False)),
+        )
+        if diagnostic != state.last_display_diagnostic:
+            print(
+                "HMI diagnostic: "
+                f"enabled={diagnostic[0]}, rx_bytes={diagnostic[1]}, "
+                f"m_protocol_handshake={diagnostic[2]}"
+            )
+            state.last_display_diagnostic = diagnostic
+
+    now = time.monotonic()
+    try:
+        raw_pressure_hpa = int(message.get("air_pressure_hpa", 0))
+        snapshot = esp32_message_to_snapshot(
+            message,
+            fallback_air_pressure_hpa=args.fallback_air_pressure_hpa,
+        )
+        submit_snapshot(args.live_api_url, snapshot)
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"Ignored malformed ESP32 telemetry: {exc}")
+        return
+    except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+        print(f"Live dashboard unavailable: {exc}")
+        return
+
+    if now - state.last_live_log_at >= 10:
+        print("Live dashboard updated from ESP32 telemetry.")
+        state.last_live_log_at = now
+
+    if now - state.last_submit_at < args.min_interval_seconds:
+        return
+
+    if not snapshot_is_complete_for_prediction(snapshot):
+        print("Skipped incomplete ESP32 packet for prediction; waiting for next packet.")
+        return
+
+    try:
+        result = submit_snapshot(args.api_url, snapshot)
+    except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+        print(f"Prediction service unavailable: {exc}")
+        return
+
+    state.last_submit_at = now
+    if send_display_command is not None:
+        send_display_command(result_to_display_command(result).encode("ascii"))
+    if raw_pressure_hpa <= 0:
+        print(
+            "AirPressure is 0; using fallback "
+            f"{args.fallback_air_pressure_hpa} hPa until the sensor is installed."
+        )
+    print(
+        "Submitted snapshot: "
+        f"status={result.get('status')}, "
+        f"samples={result.get('availableSamples')}/{result.get('requiredSamples')}"
+    )
+
+
 def receive_esp32(args: argparse.Namespace) -> None:
     """Keep one TCP connection to ESP32 and forward sampled messages to FastAPI."""
-    last_submit_at = 0.0
-    last_live_log_at = 0.0
-    last_display_diagnostic: tuple[bool, int, bool] | None = None
+    state = _ReceiverState()
 
     while True:
         try:
@@ -117,81 +193,50 @@ def receive_esp32(args: argparse.Namespace) -> None:
                             print(f"ESP32: {line}")
                             continue
 
-                        display = message.get("display")
-                        if isinstance(display, dict):
-                            diagnostic = (
-                                bool(display.get("enabled", False)),
-                                int(display.get("rx_bytes", 0)),
-                                bool(display.get("handshake_ok", False)),
-                            )
-                            if diagnostic != last_display_diagnostic:
-                                print(
-                                    "HMI diagnostic: "
-                                    f"enabled={diagnostic[0]}, rx_bytes={diagnostic[1]}, "
-                                    f"m_protocol_handshake={diagnostic[2]}"
-                                )
-                                last_display_diagnostic = diagnostic
-
-                        now = time.monotonic()
-                        try:
-                            raw_pressure_hpa = int(message.get("air_pressure_hpa", 0))
-                            snapshot = esp32_message_to_snapshot(
-                                message,
-                                fallback_air_pressure_hpa=args.fallback_air_pressure_hpa,
-                            )
-                            submit_snapshot(args.live_api_url, snapshot)
-                        except (KeyError, TypeError, ValueError) as exc:
-                            print(f"Ignored malformed ESP32 telemetry: {exc}")
-                            continue
-                        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
-                            print(f"Live dashboard unavailable: {exc}")
-                            continue
-
-                        if now - last_live_log_at >= 10:
-                            print("Live dashboard updated from ESP32 telemetry.")
-                            last_live_log_at = now
-
-                        if now - last_submit_at < args.min_interval_seconds:
-                            continue
-
-                        if not snapshot_is_complete_for_prediction(snapshot):
-                            print("Skipped incomplete ESP32 packet for prediction; waiting for next packet.")
-                            continue
-
-                        try:
-                            result = submit_snapshot(args.api_url, snapshot)
-                        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
-                            print(f"Prediction service unavailable: {exc}")
-                            continue
-
-                        last_submit_at = now
-                        connection.sendall(result_to_display_command(result).encode("ascii"))
-                        if raw_pressure_hpa <= 0:
-                            print(
-                                "AirPressure is 0; using fallback "
-                                f"{args.fallback_air_pressure_hpa} hPa until the sensor is installed."
-                            )
-                        print(
-                            "Submitted snapshot: "
-                            f"status={result.get('status')}, "
-                            f"samples={result.get('availableSamples')}/{result.get('requiredSamples')}"
+                        _handle_telemetry_message(
+                            message,
+                            args,
+                            state,
+                            send_display_command=connection.sendall,
                         )
         except OSError as exc:
             print(f"ESP32 connection unavailable: {exc}. Retrying in 3 seconds...")
             time.sleep(3)
 
 
-def add_receiver_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser(
-        "receive-esp32",
-        help="receive ESP32 TCP telemetry and submit it to the local prediction service",
-    )
-    parser.add_argument(
-        "--esp-host",
-        default="esp32-sensors.local",
-        help="ESP32 TCP server address; Station mode uses esp32-sensors.local by default",
-    )
-    parser.add_argument("--esp-port", type=int, default=3333, help="ESP32 TCP server port")
+def receive_esp32_serial(args: argparse.Namespace) -> None:
+    """Read prefixed JSON telemetry from the ESP32 USB serial port."""
+    try:
+        import serial
+    except ImportError as exc:
+        raise SystemExit("pyserial is required; run: python -m pip install -r requirements.txt") from exc
+
+    state = _ReceiverState()
+    while True:
+        try:
+            print(f"Opening ESP32 USB serial port {args.serial_port} at {args.baudrate} baud ...")
+            with serial.Serial(args.serial_port, args.baudrate, timeout=1) as connection:
+                print("Connected. Receiving ESP32 USB serial telemetry.")
+                while True:
+                    line = connection.readline().decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if not line.startswith(args.telemetry_prefix):
+                        if args.print_device_log:
+                            print(f"ESP32: {line}")
+                        continue
+                    try:
+                        message = json.loads(line.removeprefix(args.telemetry_prefix))
+                    except json.JSONDecodeError as exc:
+                        print(f"Ignored malformed ESP32 serial telemetry: {exc}")
+                        continue
+                    _handle_telemetry_message(message, args, state)
+        except serial.SerialException as exc:
+            print(f"ESP32 serial port unavailable: {exc}. Retrying in 3 seconds...")
+            time.sleep(3)
+
+
+def _add_submission_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--api-url",
         default="http://127.0.0.1:8000/v1/snapshots",
@@ -214,4 +259,37 @@ def add_receiver_parser(subparsers: argparse._SubParsersAction) -> None:
         default=1013,
         help="pressure used when ESP32 reports 0 before its pressure sensor is installed",
     )
+
+
+def add_receiver_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "receive-esp32",
+        help="receive ESP32 TCP telemetry and submit it to the local prediction service",
+    )
+    parser.add_argument(
+        "--esp-host",
+        default="esp32-sensors.local",
+        help="ESP32 TCP server address; Station mode uses esp32-sensors.local by default",
+    )
+    parser.add_argument("--esp-port", type=int, default=3333, help="ESP32 TCP server port")
+    _add_submission_options(parser)
     parser.set_defaults(func=receive_esp32)
+
+    serial_parser = subparsers.add_parser(
+        "receive-esp32-serial",
+        help="receive ESP32 USB serial telemetry and submit it to the local prediction service",
+    )
+    serial_parser.add_argument(
+        "--serial-port",
+        required=True,
+        help="macOS example: /dev/cu.wchusbserial10; Windows example: COM3",
+    )
+    serial_parser.add_argument("--baudrate", type=int, default=115200)
+    serial_parser.add_argument("--telemetry-prefix", default="@TELEMETRY ")
+    serial_parser.add_argument(
+        "--print-device-log",
+        action="store_true",
+        help="also print normal ESP32 diagnostic lines",
+    )
+    _add_submission_options(serial_parser)
+    serial_parser.set_defaults(func=receive_esp32_serial)
