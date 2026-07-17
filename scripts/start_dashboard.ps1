@@ -58,14 +58,27 @@ $receiverId = Start-ManagedProcess "esp32-receiver" @("receive-esp32", "--esp-ho
 
 @{ servicePid = $serviceId; receiverPid = $receiverId } | ConvertTo-Json | Set-Content -Encoding utf8 $pidFile
 
-$edgeCandidates = @(
+$browserCandidates = @(
     (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe"),
-    (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe")
+    (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe"),
+    (Join-Path $env:LOCALAPPDATA "Microsoft\Edge\Application\msedge.exe"),
+    (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
+    (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
+    (Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\chrome.exe")
 ) | Where-Object { $_ -and (Test-Path $_) }
 
-if ($edgeCandidates.Count -gt 0) {
-    Start-Process -FilePath $edgeCandidates[0] -ArgumentList "--app=$dashboardUrl", "--start-fullscreen"
-} else {
+ $dashboardOpened = $false
+foreach ($browser in $browserCandidates) {
+    try {
+        Start-Process -FilePath $browser -ArgumentList "--app=$dashboardUrl", "--start-fullscreen"
+        $dashboardOpened = $true
+        break
+    } catch {
+        Write-Host "Could not start $browser; trying the next browser."
+    }
+}
+
+if (-not $dashboardOpened) {
     Start-Process $dashboardUrl
 }
 

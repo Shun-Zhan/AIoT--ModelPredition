@@ -158,6 +158,8 @@ cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
 
 日志保存在 `runtime\logs\`。
 
+若电脑没有安装在默认位置的 Edge，脚本会自动尝试 Chrome；两者都未找到时会以普通浏览器打开。
+
 #### 手动启动
 
 看到 `TcpTestSucceeded : True` 后，打开两个 PowerShell 窗口。下面命令不依赖 `source`，也不会
