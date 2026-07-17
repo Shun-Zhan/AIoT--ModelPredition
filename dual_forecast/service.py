@@ -11,11 +11,36 @@ from .schemas import ForecastResponse, SensorSnapshot
 from .storage import Store
 
 
+def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> dict:
+    """Convert an in-memory telemetry sample into the dashboard shape."""
+    return {
+        "receivedAt": received_at.isoformat(),
+        "uptimeMs": snapshot.uptimeMs,
+        "windOk": snapshot.windOk,
+        "windSpeedMs": snapshot.windSpeedMs,
+        "windVoltage": snapshot.windVoltage,
+        "airOk": snapshot.airOk,
+        "air": {
+            "temperatureC": snapshot.air.temperatureC,
+            "humidityPercent": snapshot.air.humidityPercent,
+        },
+        "airPressureHpa": snapshot.airPressureHpa,
+        "soilOk": snapshot.soilOk,
+        "soil": {
+            "temperatureC": snapshot.soil.temperatureC,
+            "moisturePercent": snapshot.soil.moisturePercent,
+        },
+        "solarOk": snapshot.solar_mean() is not None,
+        "solarRadiationWm2": snapshot.solar_mean(),
+        "warnings": [],
+    }
+
+
 def create_app(settings: Settings = SETTINGS) -> FastAPI:
     app = FastAPI(title="AIoT Dual Forecast", version="0.1.0")
     store = Store(settings.database_path)
     models = ModelBundle(settings)
-    state = {"last_uptime": None, "last_response": None}
+    state = {"last_uptime": None, "last_response": None, "last_live_snapshot": None}
 
     dashboard_html = """<!doctype html>
 <html lang="zh-CN">
@@ -99,10 +124,18 @@ refresh(); setInterval(refresh, 2000);
     @app.get("/v1/dashboard/latest")
     def dashboard_latest():
         response = state["last_response"] or store.latest_forecast()
+        live = state["last_live_snapshot"]
         return {
-            "snapshot": store.latest_snapshot(),
+            "snapshot": snapshot_to_dashboard(*live) if live else store.latest_snapshot(),
             "forecast": response.model_dump(mode="json") if response else None,
         }
+
+    @app.post("/v1/telemetry/live")
+    def update_live_telemetry(snapshot: SensorSnapshot):
+        """Keep the latest ESP32 sample for the browser without changing model history."""
+        received_at = snapshot.receivedAt or datetime.now(timezone.utc)
+        state["last_live_snapshot"] = (snapshot, received_at)
+        return {"status": "ok"}
 
     @app.post("/v1/snapshots", response_model=ForecastResponse)
     def add_snapshot(snapshot: SensorSnapshot):

@@ -116,19 +116,25 @@ def receive_esp32(args: argparse.Namespace) -> None:
                                 last_display_diagnostic = diagnostic
 
                         now = time.monotonic()
-                        if now - last_submit_at < args.min_interval_seconds:
-                            continue
-
                         try:
                             raw_pressure_hpa = int(message.get("air_pressure_hpa", 0))
                             snapshot = esp32_message_to_snapshot(
                                 message,
                                 fallback_air_pressure_hpa=args.fallback_air_pressure_hpa,
                             )
-                            result = submit_snapshot(args.api_url, snapshot)
+                            submit_snapshot(args.live_api_url, snapshot)
                         except (KeyError, TypeError, ValueError) as exc:
                             print(f"Ignored malformed ESP32 telemetry: {exc}")
                             continue
+                        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+                            print(f"Live dashboard unavailable: {exc}")
+                            continue
+
+                        if now - last_submit_at < args.min_interval_seconds:
+                            continue
+
+                        try:
+                            result = submit_snapshot(args.api_url, snapshot)
                         except (urllib.error.URLError, urllib.error.HTTPError) as exc:
                             print(f"Prediction service unavailable: {exc}")
                             continue
@@ -165,6 +171,11 @@ def add_receiver_parser(subparsers: argparse._SubParsersAction) -> None:
         "--api-url",
         default="http://127.0.0.1:8000/v1/snapshots",
         help="local dual-forecast snapshot endpoint",
+    )
+    parser.add_argument(
+        "--live-api-url",
+        default="http://127.0.0.1:8000/v1/telemetry/live",
+        help="local real-time dashboard telemetry endpoint",
     )
     parser.add_argument(
         "--min-interval-seconds",

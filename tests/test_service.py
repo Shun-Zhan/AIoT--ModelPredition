@@ -60,3 +60,14 @@ def test_dashboard_exposes_latest_snapshot(tmp_path):
     latest = client.get("/v1/dashboard/latest")
     assert latest.status_code == 200
     assert latest.json()["snapshot"]["air"]["temperatureC"] == 24.0
+
+
+def test_live_telemetry_refreshes_dashboard_without_storing_model_sample(tmp_path):
+    settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
+    client = TestClient(create_app(settings))
+    live_payload = payload()
+    live_payload["air"]["temperatureC"] = 26.5
+
+    assert client.post("/v1/telemetry/live", json=live_payload).status_code == 200
+    latest = client.get("/v1/dashboard/latest").json()
+    assert latest["snapshot"]["air"]["temperatureC"] == 26.5
