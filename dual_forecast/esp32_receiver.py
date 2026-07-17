@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# Telemetry is always posted to a service on this same computer.  Do not let a
+# system HTTP proxy (common on campus/company networks) route 127.0.0.1 through
+# a proxy server, which can otherwise return 502 even though FastAPI is healthy.
+_LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def esp32_message_to_snapshot(
     message: dict[str, Any], *, fallback_air_pressure_hpa: int | None = None
 ) -> dict[str, Any]:
@@ -74,7 +80,7 @@ def submit_snapshot(api_url: str, snapshot: dict[str, Any]) -> dict[str, Any]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with _LOCAL_HTTP_OPENER.open(request, timeout=10) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
