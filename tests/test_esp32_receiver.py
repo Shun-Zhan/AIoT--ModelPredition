@@ -1,6 +1,8 @@
 from dual_forecast.esp32_receiver import (
     _handle_ack_line,
+    _handle_config_ack_line,
     _send_pending_commands,
+    _send_pending_configs,
     esp32_message_to_snapshot,
     result_to_display_command,
     snapshot_is_complete_for_prediction,
@@ -140,3 +142,17 @@ def test_failed_serial_write_keeps_command_pending(tmp_path):
     except OSError:
         pass
     assert store.pending_commands()[0]["requestId"] == "request-retry"
+
+
+def test_config_protocol_remains_separate_from_valve_commands(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    config = store.enqueue_sampling_config("NIGHT_ECO", 600000)
+    serial = FakeSerial()
+    _send_pending_configs(serial, store)
+    assert serial.data.startswith(b"@CONFIG ")
+    assert not serial.data.startswith(b"@COMMAND ")
+    assert _handle_config_ack_line(
+        '@CONFIG_ACK {"requestId":"%s","accepted":false,"samplingMode":"DEBUG","readIntervalMs":2000,"reason":"valve_open_requires_fast_sampling"}' % config["requestId"],
+        store,
+    )
+    assert store.sampling_config_status()["status"] == "rejected"

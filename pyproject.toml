@@ -16,6 +16,9 @@ dependencies = [
   "torch>=2.4,<3",
   "pydantic>=2.8,<3",
   "pyserial>=3.5,<4",
+  # Generates the mobile-dashboard QR locally as SVG. It does not contact a
+  # third-party QR service, so LAN demonstrations remain usable offline.
+  "qrcode>=8.0,<9",
 ]
 
 [project.optional-dependencies]

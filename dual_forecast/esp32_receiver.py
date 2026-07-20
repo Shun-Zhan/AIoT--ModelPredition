@@ -190,7 +190,27 @@ def _handle_ack_line(line: str, store: Store) -> bool:
         return True
     store.record_ack(ack)
     store.update_decision_ack(ack)
+    if not ack.get("accepted") or ack.get("actualState") not in {"OPEN", "CLOSED"}:
+        store.record_environment_event(
+            "VALVE_EXECUTION_FAILURE", "high", "ESP32 拒绝水阀命令或返回异常状态",
+            {"ack": ack}, "检查继电器、传感器安全条件和 USB 串口后再人工确认",
+        )
     print(f"ESP32 ACK: requestId={ack['requestId']} accepted={ack.get('accepted')} state={ack.get('actualState')}")
+    return True
+
+
+def _handle_config_ack_line(line: str, store: Store) -> bool:
+    if not line.startswith("@CONFIG_ACK "):
+        return False
+    try:
+        ack = json.loads(line.removeprefix("@CONFIG_ACK "))
+        if not isinstance(ack, dict) or not ack.get("requestId"):
+            raise ValueError("CONFIG_ACK requires requestId")
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"Ignored malformed ESP32 CONFIG_ACK: {exc}")
+        return True
+    store.record_config_ack(ack)
+    print(f"ESP32 CONFIG_ACK: requestId={ack['requestId']} accepted={ack.get('accepted')} mode={ack.get('samplingMode')}")
     return True
 
 
@@ -200,6 +220,14 @@ def _send_pending_commands(connection: Any, store: Store) -> None:
         connection.write(line.encode("utf-8"))
         store.mark_command_sent(str(command["requestId"]))
         print(f"Sent ESP32 command: requestId={command.get('requestId')} action={command.get('action')}")
+
+
+def _send_pending_configs(connection: Any, store: Store) -> None:
+    for config in store.pending_sampling_configs(limit=1):
+        line = "@CONFIG " + json.dumps(config, ensure_ascii=False, separators=(",", ":")) + "\n"
+        connection.write(line.encode("utf-8"))
+        store.mark_sampling_config_sent(str(config["requestId"]))
+        print(f"Sent ESP32 sampling config: mode={config.get('samplingMode')} interval={config.get('readIntervalMs')}ms")
 
 
 def _send_heartbeat(connection: Any) -> None:
@@ -259,10 +287,13 @@ def receive_esp32_serial(args: argparse.Namespace) -> None:
                 while True:
                     _send_heartbeat(connection)
                     _send_pending_commands(connection, store)
+                    _send_pending_configs(connection, store)
                     line = connection.readline().decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
                     if _handle_ack_line(line, store):
+                        continue
+                    if _handle_config_ack_line(line, store):
                         continue
                     if not line.startswith(args.telemetry_prefix):
                         if args.print_device_log:

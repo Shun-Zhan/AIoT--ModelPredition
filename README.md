@@ -33,6 +33,28 @@ flowchart LR
 
 断网时，传感器采集、SQLite、网页、本地预测和已有本地安全逻辑继续工作；云端问答和非实时分析降级为不可用，云端失败不会直接开阀。云端模型永远不直接访问 GPIO。
 
+## 本地边缘风险、环境事件与安全动态采样
+
+“边缘智能”运行在**电脑端本地边缘网关**，而不是宣称 ESP32-S3 运行神经网络。它将当前多传感器融合数据、历史趋势、本地 N-BEATS/LSTM 预测和水阀状态组合成可解释风险等级；ESP32-S3 只承担实时采集、快速安全保护和执行已审核的指令。
+
+| 风险等级 | 典型依据 | 本地动作 |
+| --- | --- | --- |
+| `NORMAL` | 数据新鲜，环境稳定 | 常规监测 |
+| `ATTENTION` | 传感器失败或实时数据陈旧 | 记录故障，禁止演示自动开阀 |
+| `HIGH_EVAPOTRANSPIRATION` | 土壤偏干 + 高温 + 强光 + 较高风速 + 预测证据 | 记录综合证据，建议高频监测和低频云端分析 |
+| `IRRIGATION_CANDIDATE` | 有效土壤湿度低于本地灌溉触发阈值 | 记录干旱候选；仍只产生建议，绝不无人值守开阀 |
+
+SQLite 的 `environment_events` 记录事件代码、严重度、发生时间、证据、建议动作和恢复状态，并使用冷却时间去重。当前事件包括 `SOIL_ABNORMALLY_DRY`、`HIGH_EVAPOTRANSPIRATION_RISK`、`NIGHT_STABLE`、`SENSOR_FAILURE`、`DATA_INTERRUPTION` 和 `VALVE_EXECUTION_FAILURE`。页面的事件时间线和接口可审计这些记录。
+
+| 采样模式 | 推荐间隔 | 使用条件 |
+| --- | ---: | --- |
+| `DEBUG` | 2 秒 | 上电默认、安全调试值 |
+| `IRRIGATION_MONITORING` | 2–5 秒 | 灌溉候选、高蒸散或水阀已打开 |
+| `NORMAL_MONITORING` | 30–120 秒 | 环境稳定的正常监测 |
+| `NIGHT_ECO` | 5–15 分钟 | 低光、低风、土壤稳定且没有灌溉候选 |
+
+采样策略只是“电脑端推荐 + ESP32 白名单执行”，不是实测功耗结论。固件**故意不使用 Deep Sleep**：水阀打开时必须保持 2–5 秒监测，且 ESP32 仍要接收关阀命令、维持 8 秒主机心跳超时关阀和最长开阀保护。每次重启都会回到 `DEBUG` / 2 秒，动态配置只保存在 RAM。
+
 ## 仓库结构
 
 - `firmware/esp32_s3_all_sensors/`：ESP32-S3 传感器与安全水阀固件。
@@ -59,6 +81,14 @@ cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
 ```powershell
 .\stop_dashboard.cmd
 ```
+
+如需让同一 Wi-Fi 下的手机访问，必须显式打开 LAN 模式（默认仍只监听 `127.0.0.1`）：
+
+```powershell
+.\start_dashboard.cmd -EspSerialPort COM3 -Lan
+```
+
+PowerShell 会提示本机 IPv4 的写法；手机与电脑连同一 Wi-Fi 后，在手机输入 `http://电脑IPv4:8000/dashboard`。Windows 防火墙弹窗只允许“专用网络”，不要在公共网络开启。
 
 启用真实火山引擎云端大模型时，在同一个 PowerShell 窗口先设置环境变量再启动：
 
@@ -94,6 +124,14 @@ macOS 一键启动：
 cd /你的路径/AIoT--ModelPredition
 ./start_dashboard.sh --serial-port /dev/cu.wchusbserial10
 ```
+
+同一 Wi-Fi 的手机巡检演示需要显式加入 `--lan`：
+
+```bash
+./start_dashboard.sh --serial-port /dev/cu.wchusbserial10 --lan
+```
+
+然后在手机中打开 `http://本机IPv4:8000/dashboard`。macOS 防火墙若提示，允许 Python 在本地网络通信。默认命令不开放局域网端口。
 
 启用真实云端模型：
 
@@ -140,6 +178,12 @@ curl http://127.0.0.1:8000/health
 
 页面地址：`http://127.0.0.1:8000/dashboard`。实时卡片每 2 秒刷新；预测历史默认每 5 分钟入库一次。页面右上角不超过 5 秒且为绿色代表串口实时链路正常，超过 20 秒变红代表中断。
 
+### 手机移动巡检与二维码
+
+在以 `--lan` / `-Lan` 显式启动后，用电脑浏览器打开 Dashboard。页面二维码由本机 `GET /v1/dashboard/qr` 生成为 SVG，二维码内容使用浏览器正在访问的地址，**不调用第三方二维码网站，也不把临时 IP 写入源码**。手机扫二维码前应确认二者在同一 Wi-Fi；如果二维码不能识别局域网 IP，复制页面显示的地址并手动把主机名替换为电脑 IPv4。
+
+手机页面包含实时传感器、边缘风险、采样状态、水阀状态、最近事件、报告摘要、文本问答和可选语音能力提示。Web Speech API / SpeechSynthesis 不可用时自动退回文字问答，页面与本地报告不依赖外网。页面的“确认灌溉”必须长按 1.5 秒，随后仍调用后端安全审核；摇一摇、语音、手势均不能直接开阀。
+
 Windows 查看接收日志：
 
 ```powershell
@@ -184,6 +228,29 @@ tail -f runtime/logs/esp32-receiver.out.log
 ```text
 @ACK {"requestId":"...","accepted":true,"actualState":"OPEN","reason":"started","remainingSeconds":30}
 ```
+
+安全动态采样使用**独立队列和独立协议**，绝不复用水阀 `@COMMAND`：
+
+```text
+@CONFIG {"schemaVersion":"1.0","requestId":"config-...","samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
+@CONFIG_ACK {"requestId":"config-...","accepted":true,"samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
+```
+
+固件只接受四档白名单模式及对应范围；水阀打开时会拒绝慢采样或 `NIGHT_ECO`，并在 `@CONFIG_ACK` 返回 `valve_open_requires_fast_sampling`。`@CONFIG` 不会进入 `command_queue`，因此无法被误解析为开阀命令。
+
+## 节水与运行报告
+
+以下接口均可在云端关闭时使用：
+
+| 接口 | 内容 |
+| --- | --- |
+| `GET /v1/dashboard/latest` | 当前快照、预测、边缘风险、事件、水阀与采样状态、报告摘要 |
+| `GET /v1/events` | 环境事件时间线与恢复状态 |
+| `GET /v1/edge/status` | 当前风险评估与最近配置 ACK |
+| `GET /v1/reports/water` | 24 小时/7 天灌溉次数、时长、可选用水估算、数据质量、每日趋势 |
+| `GET /v1/reports/daily` | 本地日报、风险、预测摘要、事件统计、传感器健康率 |
+
+`AIOT_VALVE_FLOW_LPM` 仅在阀门标称/实测流量已知时配置；报告按 `开阀秒数 / 60 × 流量(L/min)` 计算**估算**用水量，并清楚标注不是水表实测。未配置时用水升数为未知，不会伪造 0 L。未定义对照基准或历史不足时，页面应显示“数据积累中”，不显示“节水 xx%”或具体电流/功耗节省率。
 
 电脑端验证绝对时间 `expiresAt`，并且只发送未过期命令；ESP32 不依赖联网校时，使用 1–30 秒的传输 TTL、独立的最长 60 秒关阀计时器和 8 秒主机心跳超时保护。重复 `requestId` 不会重复执行。
 

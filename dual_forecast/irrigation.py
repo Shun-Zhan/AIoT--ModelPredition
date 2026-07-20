@@ -9,6 +9,7 @@ import pandas as pd
 
 from .cloud import CloudCall, CloudFailure, OpenAICompatibleGateway, new_request_id
 from .config import Settings
+from .edge import RiskAssessment, assess_environment
 from .schemas import DecisionContext, DecisionResult, IrrigationAction, IrrigationDecision
 from .storage import Store
 
@@ -32,34 +33,53 @@ class IrrigationService:
         """Read persisted ACK state so API workers and the serial process agree."""
         return self.store.latest_actuator_state(self.settings.actuator_mode)
 
+    def assess_edge(self, current: dict[str, Any] | None = None) -> RiskAssessment:
+        """Evaluate local risk and persist its event candidates without cloud I/O."""
+        current = current or self.store.latest_live_snapshot() or self.store.latest_snapshot() or {}
+        forecast = self.store.latest_forecast()
+        assessment = assess_environment(
+            current, forecast.model_dump(mode="json") if forecast else {"status": "warming_up", "forecast": []},
+            self.settings, actuator=self.last_device_state,
+        )
+        active_codes = {event.code for event in assessment.events}
+        for event in assessment.events:
+            self.store.record_environment_event(
+                event.code, event.severity, event.message, event.evidence, event.recommended_action,
+                cooldown_seconds=self.settings.event_cooldown_seconds,
+            )
+            # Preserve the previously documented anomaly API/table for existing
+            # users while new consumers get richer /v1/events rows.
+            self.store.record_anomaly(event.code, event.severity, event.message, event.evidence,
+                                      cooldown_seconds=self.settings.event_cooldown_seconds)
+        self.store.resolve_environment_event_codes_not_active(
+            {"SENSOR_FAILURE", "DATA_INTERRUPTION", "SOIL_ABNORMALLY_DRY", "HIGH_EVAPOTRANSPIRATION_RISK", "NIGHT_STABLE"},
+            active_codes,
+        )
+        return assessment
+
     def detect_anomalies(self, current: dict[str, Any]) -> list[dict[str, Any]]:
-        detected: list[tuple[str, str, str, dict]] = []
-        failed = [name for name, ok in (
-            ("air", current.get("airOk")), ("soil", current.get("soilOk")),
-            ("wind", current.get("windOk")), ("solar", current.get("solarOk")),
-        ) if not ok]
-        if failed:
-            detected.append(("SENSOR_FAILURE", "high", "传感器读取失败", {"failed": failed}))
-        pressure = current.get("airPressureHpa")
-        if pressure is not None and not 870 <= float(pressure) <= 1085:
-            detected.append(("AIR_PRESSURE_ABNORMAL", "medium", "大气压力超出合理范围", {"airPressureHpa": pressure}))
-        soil = current.get("soil") or {}
-        moisture = soil.get("moisturePercent") if isinstance(soil, dict) else None
-        if current.get("soilOk") and moisture is not None and float(moisture) < self.settings.irrigation_trigger_percent:
-            detected.append(("SOIL_ABNORMALLY_DRY", "high", "土壤湿度低于灌溉触发阈值", {"moisturePercent": moisture}))
-        for code, severity, message, details in detected:
-            self.store.record_anomaly(code, severity, message, details)
-        return [{"code": item[0], "severity": item[1], "message": item[2], "details": item[3]} for item in detected]
+        assessment = self.assess_edge(current)
+        return [{"code": event.code, "severity": event.severity, "message": event.message,
+                 "details": event.evidence} for event in assessment.events]
 
     def record_data_interruption_if_needed(self) -> None:
         current = self.store.latest_live_snapshot()
         if not current:
-            self.store.record_anomaly("DATA_INTERRUPTION", "high", "尚未收到 ESP32 实时数据", {})
+            self.store.record_environment_event("DATA_INTERRUPTION", "high", "尚未收到 ESP32 实时数据", {},
+                                                "检查 USB 串口链路；保持阀门安全关闭",
+                                                cooldown_seconds=self.settings.event_cooldown_seconds)
             return
-        received = datetime.fromisoformat(str(current["receivedAt"]).replace("Z", "+00:00"))
-        age = (datetime.now(timezone.utc) - received).total_seconds()
-        if age > 20:
-            self.store.record_anomaly("DATA_INTERRUPTION", "high", "ESP32 实时数据已中断", {"ageSeconds": round(age)})
+        self.assess_edge(current)
+
+    def record_valve_execution_failures(self) -> None:
+        """Persist missing ACKs; receiver records reject/state failures immediately."""
+        for missing in self.store.commands_without_ack(self.settings.actuator_ack_timeout_seconds):
+            self.store.record_environment_event(
+                "VALVE_EXECUTION_FAILURE", "high", "水阀命令超时未收到 ESP32 ACK",
+                {"requestId": missing["requestId"], "sentAt": missing["sentAt"], "command": missing["command"]},
+                "检查 USB 串口与继电器；在确认状态前不要重复开阀",
+                cooldown_seconds=self.settings.event_cooldown_seconds,
+            )
 
     def current_context(self, request_id: str | None = None) -> DecisionContext:
         current = self.store.latest_live_snapshot() or self.store.latest_snapshot() or {}
@@ -84,14 +104,16 @@ class IrrigationService:
         fresh = False
         if received_at:
             received = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
-            fresh = datetime.now(timezone.utc) - received <= timedelta(seconds=20)
+            fresh = datetime.now(timezone.utc) - received <= timedelta(seconds=self.settings.data_stale_seconds)
         all_valid = bool(current and fresh and current.get("airOk") and current.get("soilOk") and
                          current.get("windOk") and current.get("solarOk") and
                          current.get("airPressureHpa", 0) > 0)
         current = dict(current)
         current["allSensorsValid"] = all_valid
         current["fresh"] = fresh
-        anomalies = self.detect_anomalies(current)
+        edge = self.assess_edge(current)
+        anomalies = [{"code": event.code, "severity": event.severity, "message": event.message,
+                      "details": event.evidence} for event in edge.events]
         seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
         return DecisionContext(
             schemaVersion="1.0",
@@ -110,6 +132,7 @@ class IrrigationService:
                 "recentAnomalies": self.store.anomaly_rows(limit=20),
                 "wateringLast7Days": self.store.actuator_summary(seven_days_ago),
                 "recentReviewedDecisions": self.store.recent_decisions(limit=20),
+                "edgeRisk": edge.to_dict(),
             },
         )
 

@@ -5,13 +5,17 @@ set -euo pipefail
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 serial_port=""
 open_browser=true
+lan=false
 
 usage() {
   cat <<'EOF'
-Usage: ./start_dashboard.sh [--serial-port /dev/cu.usbserial...] [--no-browser]
+Usage: ./start_dashboard.sh [--serial-port /dev/cu.usbserial...] [--no-browser] [--lan]
 
 The ESP32 USB cable must stay connected. Close Arduino Serial Monitor first,
 because only one program can use the serial port at a time.
+
+--lan is explicit opt-in and binds FastAPI to 0.0.0.0 for phones on the same
+Wi-Fi. Without it, the service remains available only at 127.0.0.1.
 EOF
 }
 
@@ -23,6 +27,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --no-browser) open_browser=false; shift ;;
+    --lan) lan=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -79,7 +84,7 @@ if [[ ! -x "$venv_python" ]]; then
   python3 -m venv "$project_root/.venv"
 fi
 
-if ! "$venv_python" -c 'import serial' >/dev/null 2>&1; then
+if ! "$venv_python" -c 'import serial, qrcode' >/dev/null 2>&1; then
   echo "Installing project dependencies..."
   "$venv_python" -m pip install -r "$project_root/requirements.txt"
 fi
@@ -114,7 +119,9 @@ if lsof "$serial_port" >/dev/null 2>&1 && ! is_alive "$previous_receiver_pid"; t
   exit 1
 fi
 
-service_pid="$(start_process forecast-service "$previous_service_pid" serve --host 127.0.0.1 --port 8000)"
+server_host="127.0.0.1"
+if [[ "$lan" == true ]]; then server_host="0.0.0.0"; fi
+service_pid="$(start_process forecast-service "$previous_service_pid" serve --host "$server_host" --port 8000)"
 for _ in {1..10}; do
   curl --silent --fail http://127.0.0.1:8000/health >/dev/null 2>&1 && break
   sleep 1
@@ -155,4 +162,8 @@ fi
 
 echo "Dashboard ready: $dashboard_url"
 echo "ESP32 USB serial: $serial_port"
+if [[ "$lan" == true ]]; then
+  echo "LAN mode is enabled. On the phone, use http://<this-Mac-IPv4>:8000/dashboard while both devices are on the same Wi-Fi."
+  echo "If macOS Firewall asks, allow the Python process on the local network."
+fi
 echo "Logs: $log_dir"

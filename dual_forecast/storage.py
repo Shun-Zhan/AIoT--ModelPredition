@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from uuid import uuid4
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,10 +68,23 @@ class Store:
               code TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL,
               details_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS environment_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL,
+              code TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL,
+              evidence_json TEXT NOT NULL, recommended_action TEXT NOT NULL,
+              resolved_at TEXT, resolved_reason TEXT
+            );
+            CREATE TABLE IF NOT EXISTS device_config_queue (
+              request_id TEXT PRIMARY KEY, config_json TEXT NOT NULL, status TEXT NOT NULL,
+              queued_at TEXT NOT NULL, sent_at TEXT, ack_json TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_llm_calls_called_at ON llm_calls(called_at);
             CREATE INDEX IF NOT EXISTS idx_decisions_evaluated_at ON decisions(evaluated_at);
             CREATE INDEX IF NOT EXISTS idx_command_queue_status ON command_queue(status, queued_at);
             CREATE INDEX IF NOT EXISTS idx_anomaly_events_time ON anomaly_events(occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_environment_events_time ON environment_events(occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_environment_events_open ON environment_events(code, resolved_at);
+            CREATE INDEX IF NOT EXISTS idx_device_config_queue_status ON device_config_queue(status, queued_at);
             """)
 
     def insert_snapshot(self, snapshot: SensorSnapshot, received_at: datetime, warnings: list[str]) -> bool:
@@ -397,3 +411,190 @@ class Store:
             conn.execute("INSERT INTO anomaly_events(occurred_at,code,severity,message,details_json) VALUES(?,?,?,?,?)",
                          (now.isoformat(), code, severity, message, json.dumps(details, ensure_ascii=False)))
         return True
+
+    def record_environment_event(self, code: str, severity: str, message: str,
+                                 evidence: dict, recommended_action: str,
+                                 *, cooldown_seconds: int = 300) -> bool:
+        """Save an active event once per cooldown window.
+
+        The old ``anomaly_events`` table is kept for backwards compatibility;
+        this richer table additionally records recommendation and recovery.
+        """
+        now = datetime.now(timezone.utc)
+        cutoff = now.timestamp() - cooldown_seconds
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT occurred_at FROM environment_events WHERE code=? AND resolved_at IS NULL "
+                "ORDER BY occurred_at DESC LIMIT 1", (code,),
+            ).fetchone()
+            if row and datetime.fromisoformat(row["occurred_at"]).timestamp() >= cutoff:
+                return False
+            conn.execute(
+                "INSERT INTO environment_events(occurred_at,code,severity,message,evidence_json,recommended_action) "
+                "VALUES(?,?,?,?,?,?)",
+                (now.isoformat(), code, severity, message, json.dumps(evidence, ensure_ascii=False), recommended_action),
+            )
+        return True
+
+    def resolve_environment_events_not_in(self, active_codes: set[str], *, reason: str = "condition_recovered") -> None:
+        """Mark no-longer-observed active events as recovered."""
+        with self.connection() as conn:
+            if active_codes:
+                placeholders = ",".join("?" for _ in active_codes)
+                conn.execute(
+                    f"UPDATE environment_events SET resolved_at=?, resolved_reason=? "
+                    f"WHERE resolved_at IS NULL AND code NOT IN ({placeholders})",
+                    (datetime.now(timezone.utc).isoformat(), reason, *sorted(active_codes)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE environment_events SET resolved_at=?, resolved_reason=? WHERE resolved_at IS NULL",
+                    (datetime.now(timezone.utc).isoformat(), reason),
+                )
+
+    def resolve_environment_event_codes_not_active(self, codes: set[str], active_codes: set[str], *, reason: str = "condition_recovered") -> None:
+        """Resolve only dynamic sensor/environment events, never ACK audit events."""
+        if not codes:
+            return
+        with self.connection() as conn:
+            placeholders = ",".join("?" for _ in codes)
+            if active_codes:
+                active_placeholders = ",".join("?" for _ in active_codes)
+                conn.execute(
+                    f"UPDATE environment_events SET resolved_at=?,resolved_reason=? WHERE resolved_at IS NULL "
+                    f"AND code IN ({placeholders}) AND code NOT IN ({active_placeholders})",
+                    (datetime.now(timezone.utc).isoformat(), reason, *sorted(codes), *sorted(active_codes)),
+                )
+            else:
+                conn.execute(
+                    f"UPDATE environment_events SET resolved_at=?,resolved_reason=? WHERE resolved_at IS NULL AND code IN ({placeholders})",
+                    (datetime.now(timezone.utc).isoformat(), reason, *sorted(codes)),
+                )
+
+    def environment_event_rows(self, limit: int = 50, *, include_resolved: bool = True) -> list[dict]:
+        sql = "SELECT * FROM environment_events"
+        if not include_resolved:
+            sql += " WHERE resolved_at IS NULL"
+        sql += " ORDER BY occurred_at DESC LIMIT ?"
+        with self.connection() as conn:
+            rows = conn.execute(sql, (limit,)).fetchall()
+        return [{
+            "id": row["id"], "occurredAt": row["occurred_at"], "code": row["code"],
+            "severity": row["severity"], "message": row["message"],
+            "evidence": json.loads(row["evidence_json"]), "recommendedAction": row["recommended_action"],
+            "resolved": row["resolved_at"] is not None, "resolvedAt": row["resolved_at"],
+            "resolvedReason": row["resolved_reason"],
+        } for row in rows]
+
+    def enqueue_sampling_config(self, sampling_mode: str, read_interval_ms: int) -> dict | None:
+        """Queue a configuration only when an identical one is not current.
+
+        Configuration has its own queue so it can never be confused with a
+        human-approved water-valve command.
+        """
+        config = {"schemaVersion": "1.0", "samplingMode": sampling_mode, "readIntervalMs": int(read_interval_ms)}
+        encoded = json.dumps(config, ensure_ascii=False, sort_keys=True)
+        with self.connection() as conn:
+            existing = conn.execute(
+                "SELECT request_id,config_json,status FROM device_config_queue "
+                "WHERE status IN ('pending','sent','acked') ORDER BY queued_at DESC LIMIT 1"
+            ).fetchone()
+            if existing:
+                prior = json.loads(existing["config_json"])
+                if prior.get("samplingMode") == sampling_mode and int(prior.get("readIntervalMs", -1)) == int(read_interval_ms):
+                    return None
+            request_id = "config-" + uuid4().hex
+            config["requestId"] = request_id
+            conn.execute(
+                "INSERT INTO device_config_queue(request_id,config_json,status,queued_at,sent_at,ack_json) VALUES(?,?,?,?,?,?)",
+                (request_id, json.dumps(config, ensure_ascii=False), "pending", datetime.now(timezone.utc).isoformat(), None, None),
+            )
+        return config
+
+    def pending_sampling_configs(self, limit: int = 1) -> list[dict]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT config_json FROM device_config_queue WHERE status='pending' ORDER BY queued_at LIMIT ?", (limit,)
+            ).fetchall()
+        return [json.loads(row["config_json"]) for row in rows]
+
+    def mark_sampling_config_sent(self, request_id: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE device_config_queue SET status='sent',sent_at=? WHERE request_id=? AND status='pending'",
+                (datetime.now(timezone.utc).isoformat(), request_id),
+            )
+
+    def record_config_ack(self, ack: dict) -> None:
+        request_id = str(ack.get("requestId", ""))
+        if not request_id:
+            return
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE device_config_queue SET status=?,ack_json=? WHERE request_id=?",
+                ("acked" if ack.get("accepted") else "rejected", json.dumps(ack, ensure_ascii=False), request_id),
+            )
+
+    def sampling_config_status(self) -> dict | None:
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM device_config_queue ORDER BY queued_at DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        config = json.loads(row["config_json"])
+        return {
+            "requestId": row["request_id"], "status": row["status"], "queuedAt": row["queued_at"],
+            "sentAt": row["sent_at"], "ack": json.loads(row["ack_json"]) if row["ack_json"] else None,
+            "samplingMode": config.get("samplingMode"), "readIntervalMs": config.get("readIntervalMs"),
+        }
+
+    def commands_without_ack(self, timeout_seconds: int) -> list[dict]:
+        cutoff = datetime.now(timezone.utc).timestamp() - timeout_seconds
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT request_id,command_json,sent_at FROM command_queue "
+                "WHERE status='sent' AND ack_json IS NULL AND sent_at IS NOT NULL"
+            ).fetchall()
+        return [
+            {"requestId": row["request_id"], "command": json.loads(row["command_json"]), "sentAt": row["sent_at"]}
+            for row in rows if datetime.fromisoformat(row["sent_at"]).timestamp() <= cutoff
+        ]
+
+    def report_daily_rows(self, since: datetime) -> list[dict]:
+        with self.connection() as conn:
+            watering = conn.execute(
+                "SELECT substr(occurred_at,1,10) day,COUNT(*) watering_count,COALESCE(SUM(duration_seconds),0) watering_seconds "
+                "FROM actuator_events WHERE action=? AND occurred_at>=? GROUP BY day ORDER BY day",
+                (IrrigationAction.START_WATERING.value, since.isoformat()),
+            ).fetchall()
+            soil = conn.execute(
+                "SELECT substr(received_at,1,10) day,AVG(soil_moisture_percent) soil_moisture_percent "
+                "FROM snapshots WHERE received_at>=? AND soil_ok=1 GROUP BY day ORDER BY day", (since.isoformat(),)
+            ).fetchall()
+            events = conn.execute(
+                "SELECT substr(occurred_at,1,10) day,COUNT(*) event_count FROM environment_events "
+                "WHERE occurred_at>=? GROUP BY day", (since.isoformat(),)
+            ).fetchall()
+        result: dict[str, dict] = {}
+        for row in watering:
+            result.setdefault(row["day"], {"day": row["day"], "wateringCount": 0, "wateringSeconds": 0, "soilMoisturePercent": None, "eventCount": 0}).update(
+                wateringCount=int(row["watering_count"]), wateringSeconds=int(row["watering_seconds"])
+            )
+        for row in soil:
+            result.setdefault(row["day"], {"day": row["day"], "wateringCount": 0, "wateringSeconds": 0, "soilMoisturePercent": None, "eventCount": 0})["soilMoisturePercent"] = round(float(row["soil_moisture_percent"]), 2)
+        for row in events:
+            result.setdefault(row["day"], {"day": row["day"], "wateringCount": 0, "wateringSeconds": 0, "soilMoisturePercent": None, "eventCount": 0})["eventCount"] = int(row["event_count"])
+        return [result[key] for key in sorted(result)]
+
+    def sensor_data_quality(self, since: datetime) -> dict:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT air_ok,soil_ok,wind_ok,solar_wm2 FROM snapshots WHERE received_at>=?", (since.isoformat(),)
+            ).fetchall()
+        total = len(rows)
+        complete = sum(bool(row["air_ok"] and row["soil_ok"] and row["wind_ok"] and row["solar_wm2"] is not None) for row in rows)
+        return {
+            "samples": total,
+            "completeSamples": complete,
+            "sensorHealthRate": round(100 * complete / total, 1) if total else 0.0,
+            "dataCompletenessRate": round(100 * complete / total, 1) if total else 0.0,
+        }

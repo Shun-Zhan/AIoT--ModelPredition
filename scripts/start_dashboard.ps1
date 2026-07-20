@@ -4,7 +4,10 @@ Starts the local forecast service, ESP32 receiver, and full-screen dashboard.
 #>
 
 param(
-    [string]$EspSerialPort = ""
+    [string]$EspSerialPort = "",
+    # Deliberately opt-in: expose the dashboard to phones on the same LAN.
+    # Default remains loopback so an ordinary desktop start is not network-open.
+    [switch]$Lan
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +17,7 @@ $forecastCli = Join-Path $projectRoot ".venv\Scripts\dual-forecast.exe"
 $runtimeDir = Join-Path $projectRoot "runtime"
 $logDir = Join-Path $runtimeDir "logs"
 $pidFile = Join-Path $runtimeDir "dashboard-processes.json"
+$serverHost = if ($Lan) { "0.0.0.0" } else { "127.0.0.1" }
 $dashboardUrl = "http://127.0.0.1:8000/dashboard"
 
 function Test-ManagedProcessAlive($id) {
@@ -62,7 +66,7 @@ $nativeErrorPreference = Get-Variable PSNativeCommandUseErrorActionPreference -E
 $previousNativeErrorPreference = if ($nativeErrorPreference) { $nativeErrorPreference.Value } else { $null }
 if ($nativeErrorPreference) { $PSNativeCommandUseErrorActionPreference = $false }
 try {
-    & $venvPython -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('serial') else 1)" 2>$null
+    & $venvPython -c "import importlib.util, sys; sys.exit(0 if all(importlib.util.find_spec(name) for name in ('serial', 'qrcode')) else 1)" 2>$null
     $serialDependencyReady = $LASTEXITCODE -eq 0
 } finally {
     if ($nativeErrorPreference) { $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference }
@@ -91,7 +95,7 @@ if (Test-Path $pidFile) {
     try { $saved = Get-Content $pidFile -Raw | ConvertFrom-Json } catch { $saved = @{} }
 }
 
-$serviceId = Start-ManagedProcess "forecast-service" @("serve", "--host", "127.0.0.1", "--port", "8000") $saved.servicePid
+$serviceId = Start-ManagedProcess "forecast-service" @("serve", "--host", $serverHost, "--port", "8000") $saved.servicePid
 Start-Sleep -Seconds 2
 $receiverId = Start-ManagedProcess "esp32-receiver" @("receive-esp32-serial", "--serial-port", $EspSerialPort) $saved.receiverPid
 
@@ -136,4 +140,8 @@ if (-not $dashboardOpened) {
 }
 
 Write-Host "Dashboard opened. ESP32 USB serial port: $EspSerialPort"
+if ($Lan) {
+    Write-Host "LAN mode is enabled. On the phone, use http://<this-PC-IPv4>:8000/dashboard while both devices are on the same Wi-Fi."
+    Write-Host "If Windows Firewall asks, allow private-network access only."
+}
 Write-Host "Logs: $logDir"

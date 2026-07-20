@@ -29,7 +29,10 @@
 // -------------------- Common --------------------
 
 static const uint32_t PC_BAUD = 115200;
-static const uint32_t READ_INTERVAL_MS = 2000;
+// Safe boot default. A requested setting lives only in RAM, so every reset
+// returns to frequent sampling rather than an unattended low-power mode.
+static const uint32_t DEFAULT_READ_INTERVAL_MS = 2000;
+static const uint32_t IRRIGATION_MAX_READ_INTERVAL_MS = 5000;
 
 // The USB cable used to upload this sketch can also carry telemetry to the
 // local computer.  Each sample is emitted as one line beginning with
@@ -39,6 +42,8 @@ static const bool USB_SERIAL_TELEMETRY_ENABLED = true;
 static const char *USB_TELEMETRY_PREFIX = "@TELEMETRY ";
 static const char *USB_COMMAND_PREFIX = "@COMMAND ";
 static const char *USB_ACK_PREFIX = "@ACK ";
+static const char *USB_CONFIG_PREFIX = "@CONFIG ";
+static const char *USB_CONFIG_ACK_PREFIX = "@CONFIG_ACK ";
 
 // -------------------- Water valve relay --------------------
 
@@ -57,6 +62,8 @@ uint32_t lastHostHeartbeatMs = 0;
 bool latestSensorSnapshotValid = false;
 char activeRequestId[101] = {};
 char lastRequestId[101] = {};
+uint32_t readIntervalMs = DEFAULT_READ_INTERVAL_MS;
+char samplingMode[32] = "DEBUG";
 
 // -------------------- Wi-Fi TCP telemetry --------------------
 
@@ -323,6 +330,51 @@ void sendValveAck(const char *requestId, bool accepted, const char *reason) {
       static_cast<unsigned long>(remaining));
 }
 
+void sendConfigAck(const char *requestId, bool accepted, const char *reason) {
+  Serial.printf(
+      "%s{\"requestId\":\"%s\",\"accepted\":%s,\"samplingMode\":\"%s\","
+      "\"readIntervalMs\":%lu,\"reason\":\"%s\"}\n",
+      USB_CONFIG_ACK_PREFIX, requestId, accepted ? "true" : "false", samplingMode,
+      static_cast<unsigned long>(readIntervalMs), reason);
+}
+
+bool validSamplingConfiguration(const char *mode, int intervalMs) {
+  if (strcmp(mode, "DEBUG") == 0) return intervalMs == 2000;
+  if (strcmp(mode, "IRRIGATION_MONITORING") == 0) return intervalMs >= 2000 && intervalMs <= 5000;
+  if (strcmp(mode, "NORMAL_MONITORING") == 0) return intervalMs >= 30000 && intervalMs <= 120000;
+  if (strcmp(mode, "NIGHT_ECO") == 0) return intervalMs >= 300000 && intervalMs <= 900000;
+  return false;
+}
+
+void handleSamplingConfig(const char *json) {
+  char schema[8] = {};
+  char requestId[101] = {};
+  char requestedMode[32] = {};
+  int requestedIntervalMs = 0;
+  if (!jsonStringValue(json, "schemaVersion", schema, sizeof(schema)) ||
+      strcmp(schema, "1.0") != 0 ||
+      !jsonStringValue(json, "requestId", requestId, sizeof(requestId)) ||
+      !jsonStringValue(json, "samplingMode", requestedMode, sizeof(requestedMode)) ||
+      !jsonIntValue(json, "readIntervalMs", requestedIntervalMs)) {
+    sendConfigAck(requestId[0] ? requestId : "unknown", false, "invalid_schema");
+    return;
+  }
+  if (!validSamplingConfiguration(requestedMode, requestedIntervalMs)) {
+    sendConfigAck(requestId, false, "mode_or_interval_not_allowed");
+    return;
+  }
+  // No deep sleep is implemented. While the valve is OPEN, only fast
+  // monitoring is allowed so timeout/heartbeat safety remains responsive.
+  if (valveOpen && (requestedIntervalMs > IRRIGATION_MAX_READ_INTERVAL_MS ||
+                    strcmp(requestedMode, "NIGHT_ECO") == 0)) {
+    sendConfigAck(requestId, false, "valve_open_requires_fast_sampling");
+    return;
+  }
+  readIntervalMs = static_cast<uint32_t>(requestedIntervalMs);
+  strlcpy(samplingMode, requestedMode, sizeof(samplingMode));
+  sendConfigAck(requestId, true, "applied_ram_only_reset_returns_debug");
+}
+
 void closeValveForSafety(const char *reason) {
   if (!valveOpen) return;
   char requestId[sizeof(activeRequestId)];
@@ -408,6 +460,8 @@ void serviceUsbControl() {
       } else if (strncmp(line, USB_COMMAND_PREFIX, strlen(USB_COMMAND_PREFIX)) == 0) {
         lastHostHeartbeatMs = millis();
         handleValveCommand(line + strlen(USB_COMMAND_PREFIX));
+      } else if (strncmp(line, USB_CONFIG_PREFIX, strlen(USB_CONFIG_PREFIX)) == 0) {
+        handleSamplingConfig(line + strlen(USB_CONFIG_PREFIX));
       }
       length = 0;
     } else if (value != '\r' && length < sizeof(line) - 1) {
@@ -1566,7 +1620,7 @@ void loop() {
   serviceUsbControl();
   serviceWifi();
 
-  if (millis() - lastReadMs < READ_INTERVAL_MS) {
+  if (millis() - lastReadMs < readIntervalMs) {
     delay(2);
     return;
   }
