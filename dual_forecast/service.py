@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import threading
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
 from .config import SETTINGS, Settings
 from .inference import ModelBundle, build_response
-from .schemas import ForecastResponse, SensorSnapshot
+from .irrigation import IrrigationService
+from .schemas import ChatRequest, ForecastResponse, SensorSnapshot
 from .storage import Store
 
 
@@ -40,7 +42,30 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     app = FastAPI(title="AIoT Dual Forecast", version="0.1.0")
     store = Store(settings.database_path)
     models = ModelBundle(settings)
+    irrigation = IrrigationService(store, settings)
     state = {"last_uptime": None, "last_response": None, "last_live_snapshot": None}
+    stop_periodic = threading.Event()
+
+    def periodic_worker():
+        """Low-frequency cloud enhancement; never confirms or executes actions."""
+        interval = max(60, settings.llm_min_interval_minutes * 60)
+        elapsed = 0
+        while not stop_periodic.wait(10):
+            irrigation.record_data_interruption_if_needed()
+            elapsed += 10
+            if settings.llm_enabled and elapsed >= interval:
+                irrigation.analyze(trigger="periodic")
+                elapsed = 0
+
+    @app.on_event("startup")
+    def start_periodic_worker():
+        thread = threading.Thread(target=periodic_worker, name="aiot-periodic-cloud", daemon=True)
+        state["periodic_thread"] = thread
+        thread.start()
+
+    @app.on_event("shutdown")
+    def stop_periodic_worker():
+        stop_periodic.set()
 
     dashboard_html = """<!doctype html>
 <html lang="zh-CN">
@@ -60,6 +85,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .unit { font-size:14px; color:#94a3b8; font-weight:400; }
     .wide { margin-top:14px; } .ok { color:#4ade80; } .warn { color:#fbbf24; } .bad { color:#fb7185; }
     #model { white-space:pre-line; line-height:1.7; } .footer { margin-top:15px; }
+    button { margin:12px 8px 0 0; padding:9px 12px; border:1px solid #3b82f6; color:#dbeafe; background:#1d4ed8; border-radius:6px; cursor:pointer; }
+    input { width:min(650px,75%); padding:10px; border:1px solid #475569; background:#0f172a; color:#e5e7eb; border-radius:6px; }
   </style>
 </head>
 <body>
@@ -75,6 +102,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card"><div class="label">平均太阳辐射</div><div id="solar" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
     <section class="card wide"><div class="label">预测模型</div><div id="model" class="value" style="font-size:18px">等待数据...</div></section>
+    <section class="card wide"><div class="label">云端大模型与水阀安全层</div><div id="cloud" class="value" style="font-size:17px">正在读取状态...</div><button id="analyze">生成云端分析建议</button><button id="confirm" hidden>人工确认并下发</button></section>
+    <section class="card wide"><div class="label">自然语言问答</div><input id="question" placeholder="例如：今天需要调整灌溉计划吗？"><button id="ask">提问</button><div id="answer" class="muted" style="margin-top:12px;white-space:pre-line"></div></section>
     <div id="updated" class="muted footer">尚未收到 ESP32 数据</div>
   </main>
 <script>
@@ -116,7 +145,21 @@ async function refresh() {
     el('connection').className = 'bad';
   }
 }
-refresh(); setInterval(refresh, 2000); setInterval(renderFreshness, 1000);
+async function refreshCloud() {
+  try {
+    const c = await (await fetch('/v1/cloud/status', {cache:'no-store'})).json();
+    const d = c.decision, a = c.actuator;
+    let text = `云端：${c.enabled ? '已启用' : '离线/未启用'}，水阀：${a.state || 'OFF'}`;
+    if (d) text += `\n建议：${d.proposedAction || d.finalAction}；状态：${d.status}\n原因：${d.reason}`;
+    el('cloud').textContent = text;
+    el('confirm').hidden = !(d && d.status === 'awaiting_confirmation');
+    el('confirm').dataset.id = d ? d.requestId : '';
+  } catch (_) { el('cloud').textContent = '云端状态不可用，但本地传感器与预测不受影响。'; }
+}
+el('analyze').onclick = async () => { await fetch('/v1/cloud/analyze', {method:'POST'}); await refreshCloud(); };
+el('confirm').onclick = async () => { const id=el('confirm').dataset.id; await fetch(`/v1/decisions/${id}/confirm`, {method:'POST'}); await refreshCloud(); };
+el('ask').onclick = async () => { const q=el('question').value.trim(); if (!q) return; const r=await fetch('/v1/cloud/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})}); const d=await r.json(); el('answer').textContent=`${d.answer}\n数据范围：${d.dataRange.start || '--'} 至 ${d.dataRange.end || '--'}`; };
+refresh(); refreshCloud(); setInterval(refresh, 2000); setInterval(refreshCloud, 5000); setInterval(renderFreshness, 1000);
 </script>
 </body></html>"""
 
@@ -142,6 +185,7 @@ refresh(); setInterval(refresh, 2000); setInterval(renderFreshness, 1000);
         """Keep the latest ESP32 sample for the browser without changing model history."""
         received_at = snapshot.receivedAt or datetime.now(timezone.utc)
         state["last_live_snapshot"] = (snapshot, received_at)
+        store.save_live_snapshot(snapshot, received_at)
         return {"status": "ok"}
 
     @app.post("/v1/snapshots", response_model=ForecastResponse)
@@ -180,6 +224,60 @@ refresh(); setInterval(refresh, 2000); setInterval(renderFreshness, 1000);
     def reload_models():
         models.reload()
         return {"modelsReady": models.ready, "modelVersion": models.model_version}
+
+    @app.get("/v1/cloud/status")
+    def cloud_status():
+        decision = store.latest_decision()
+        return {
+            "enabled": settings.llm_enabled,
+            "configured": irrigation.gateway.configured,
+            "provider": "volcengine-openai-compatible",
+            "demoAutoExecute": settings.demo_auto_execute,
+            "latestCall": store.latest_llm_call(),
+            "decision": decision.model_dump(mode="json") if decision else None,
+            "actuator": irrigation.last_device_state,
+        }
+
+    @app.post("/v1/cloud/analyze")
+    def cloud_analyze():
+        result = irrigation.analyze(trigger="manual")
+        if settings.demo_auto_execute and result.status == "awaiting_confirmation":
+            result = irrigation.confirm(result.requestId)
+        return result.model_dump(mode="json")
+
+    @app.post("/v1/cloud/chat")
+    def cloud_chat(request: ChatRequest):
+        return irrigation.chat(request.question)
+
+    @app.get("/v1/reports/latest")
+    def latest_report():
+        decision = store.latest_decision()
+        return {"latestCall": store.latest_llm_call(), "latestDecision": decision.model_dump(mode="json") if decision else None}
+
+    @app.get("/v1/anomalies")
+    def anomalies():
+        return {"events": store.anomaly_rows()}
+
+    @app.get("/v1/decisions/latest")
+    def latest_decision():
+        decision = store.latest_decision()
+        return decision.model_dump(mode="json") if decision else {"status": "none"}
+
+    @app.post("/v1/decisions/evaluate")
+    def evaluate_decision():
+        return irrigation.analyze(trigger="manual").model_dump(mode="json")
+
+    @app.post("/v1/decisions/{request_id}/confirm")
+    def confirm_decision(request_id: str):
+        try:
+            return irrigation.confirm(request_id).model_dump(mode="json")
+        except KeyError:
+            raise HTTPException(status_code=404, detail="decision not found")
+
+    @app.get("/v1/actuator/state")
+    def actuator_state():
+        decision = store.latest_decision()
+        return {"actuator": irrigation.last_device_state, "lastDecision": decision.model_dump(mode="json") if decision else None}
 
     return app
 

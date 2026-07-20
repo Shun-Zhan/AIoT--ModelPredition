@@ -37,6 +37,26 @@ static const uint32_t READ_INTERVAL_MS = 2000;
 // by the computer-side serial receiver.
 static const bool USB_SERIAL_TELEMETRY_ENABLED = true;
 static const char *USB_TELEMETRY_PREFIX = "@TELEMETRY ";
+static const char *USB_COMMAND_PREFIX = "@COMMAND ";
+static const char *USB_ACK_PREFIX = "@ACK ";
+
+// -------------------- Water valve relay --------------------
+
+// One-channel 3.3 V relay input, configured as HIGH-level active. The
+// normally-closed water valve power circuit uses relay COM + NO, so LOW is
+// always the safe/off state. The display experiment is disabled; GPIO11 is
+// now reserved exclusively for this relay.
+static const uint8_t VALVE_RELAY_PIN = 11;
+static const bool VALVE_RELAY_ACTIVE_HIGH = true;
+static const uint32_t MAX_WATERING_MS = 60000;
+static const uint32_t HOST_HEARTBEAT_TIMEOUT_MS = 8000;
+
+bool valveOpen = false;
+uint32_t valveCloseAtMs = 0;
+uint32_t lastHostHeartbeatMs = 0;
+bool latestSensorSnapshotValid = false;
+char activeRequestId[101] = {};
+char lastRequestId[101] = {};
 
 // -------------------- Wi-Fi TCP telemetry --------------------
 
@@ -77,8 +97,8 @@ static const uint32_t WIFI_STATUS_PRINT_INTERVAL_MS = 10000;
 static const bool DISPLAY_ENABLED = false;
 // ESP32 RX <- display TX and ESP32 TX -> display RX. GPIO11/12 do not overlap
 // with the existing I2C, ADC or RS485 assignments.
-static const uint8_t DISPLAY_UART_RX_PIN = 11;
-static const uint8_t DISPLAY_UART_TX_PIN = 12;
+static const uint8_t DISPLAY_UART_RX_PIN = 12;
+static const uint8_t DISPLAY_UART_TX_PIN = 13;
 // The replacement M070 VisualTFT project staged on the TF card uses 19200
 // baud. Keep this in sync with the project loaded on the screen itself.
 static const uint32_t DISPLAY_BAUD = 19200;
@@ -253,6 +273,156 @@ struct SensorSnapshot {
   bool solar2Ok;
   uint16_t solarRadiation2Wm2;
 };
+
+void setValveRelay(bool open) {
+  valveOpen = open;
+  digitalWrite(VALVE_RELAY_PIN,
+               open == VALVE_RELAY_ACTIVE_HIGH ? HIGH : LOW);
+  if (!open) {
+    valveCloseAtMs = 0;
+  }
+}
+
+bool jsonStringValue(const char *json, const char *key, char *output,
+                     size_t outputSize) {
+  char marker[72];
+  snprintf(marker, sizeof(marker), "\"%s\":\"", key);
+  const char *start = strstr(json, marker);
+  if (!start) return false;
+  start += strlen(marker);
+  const char *end = strchr(start, '"');
+  if (!end || end == start || static_cast<size_t>(end - start) >= outputSize) return false;
+  memcpy(output, start, end - start);
+  output[end - start] = '\0';
+  return true;
+}
+
+bool jsonIntValue(const char *json, const char *key, int &output) {
+  char marker[72];
+  snprintf(marker, sizeof(marker), "\"%s\":", key);
+  const char *start = strstr(json, marker);
+  if (!start) return false;
+  start += strlen(marker);
+  char *end = nullptr;
+  const long value = strtol(start, &end, 10);
+  if (end == start) return false;
+  output = static_cast<int>(value);
+  return true;
+}
+
+void sendValveAck(const char *requestId, bool accepted, const char *reason) {
+  uint32_t remaining = 0;
+  if (valveOpen && valveCloseAtMs != 0 && static_cast<int32_t>(valveCloseAtMs - millis()) > 0) {
+    remaining = (valveCloseAtMs - millis() + 999) / 1000;
+  }
+  Serial.printf(
+      "%s{\"requestId\":\"%s\",\"accepted\":%s,\"actualState\":\"%s\","
+      "\"reason\":\"%s\",\"remainingSeconds\":%lu}\n",
+      USB_ACK_PREFIX, requestId, accepted ? "true" : "false",
+      valveOpen ? "OPEN" : "CLOSED", reason,
+      static_cast<unsigned long>(remaining));
+}
+
+void closeValveForSafety(const char *reason) {
+  if (!valveOpen) return;
+  char requestId[sizeof(activeRequestId)];
+  strlcpy(requestId, activeRequestId, sizeof(requestId));
+  setValveRelay(false);
+  sendValveAck(requestId, true, reason);
+  activeRequestId[0] = '\0';
+}
+
+void handleValveCommand(const char *json) {
+  char schema[8] = {};
+  char requestId[101] = {};
+  char action[24] = {};
+  char reasonCode[65] = {};
+  char expiresAt[48] = {};
+  int durationSeconds = 0;
+  int ttlSeconds = 0;
+
+  if (!jsonStringValue(json, "schemaVersion", schema, sizeof(schema)) ||
+      strcmp(schema, "1.0") != 0 ||
+      !jsonStringValue(json, "requestId", requestId, sizeof(requestId)) ||
+      !jsonStringValue(json, "action", action, sizeof(action)) ||
+      !jsonStringValue(json, "reasonCode", reasonCode, sizeof(reasonCode)) ||
+      !jsonStringValue(json, "expiresAt", expiresAt, sizeof(expiresAt))) {
+    sendValveAck(requestId[0] ? requestId : "unknown", false, "invalid_schema");
+    return;
+  }
+
+  if (strcmp(requestId, lastRequestId) == 0) {
+    sendValveAck(requestId, true, "duplicate_idempotent");
+    return;
+  }
+  if (!jsonIntValue(json, "ttlSeconds", ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 30) {
+    sendValveAck(requestId, false, "expired_or_invalid_ttl");
+    return;
+  }
+
+  if (strcmp(action, "START_WATERING") == 0) {
+    if (!jsonIntValue(json, "durationSeconds", durationSeconds) ||
+        durationSeconds < 1 || durationSeconds > 60) {
+      sendValveAck(requestId, false, "invalid_duration");
+      return;
+    }
+    if (!latestSensorSnapshotValid) {
+      sendValveAck(requestId, false, "sensor_invalid");
+      return;
+    }
+    strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
+    strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
+    setValveRelay(true);
+    valveCloseAtMs = millis() + static_cast<uint32_t>(durationSeconds) * 1000;
+    lastHostHeartbeatMs = millis();
+    sendValveAck(requestId, true, "started");
+    return;
+  }
+
+  if (strcmp(action, "STOP_WATERING") == 0) {
+    strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
+    setValveRelay(false);
+    activeRequestId[0] = '\0';
+    sendValveAck(requestId, true, "stopped");
+    return;
+  }
+
+  if (strcmp(action, "NO_OP") == 0) {
+    strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
+    sendValveAck(requestId, true, "no_action");
+    return;
+  }
+  sendValveAck(requestId, false, "action_not_allowed");
+}
+
+void serviceUsbControl() {
+  static char line[1024] = {};
+  static size_t length = 0;
+  while (Serial.available()) {
+    const int value = Serial.read();
+    if (value < 0) break;
+    if (value == '\n') {
+      line[length] = '\0';
+      if (strcmp(line, "@HEARTBEAT") == 0) {
+        lastHostHeartbeatMs = millis();
+      } else if (strncmp(line, USB_COMMAND_PREFIX, strlen(USB_COMMAND_PREFIX)) == 0) {
+        lastHostHeartbeatMs = millis();
+        handleValveCommand(line + strlen(USB_COMMAND_PREFIX));
+      }
+      length = 0;
+    } else if (value != '\r' && length < sizeof(line) - 1) {
+      line[length++] = static_cast<char>(value);
+    } else if (length >= sizeof(line) - 1) {
+      length = 0;
+    }
+  }
+
+  if (valveOpen && static_cast<int32_t>(millis() - valveCloseAtMs) >= 0) {
+    closeValveForSafety("duration_timeout_closed");
+  } else if (valveOpen && millis() - lastHostHeartbeatMs > HOST_HEARTBEAT_TIMEOUT_MS) {
+    closeValveForSafety("host_heartbeat_timeout_closed");
+  }
+}
 
 uint16_t modbusCrc16(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFF;
@@ -1309,6 +1479,10 @@ void sendTelemetry(const SensorSnapshot &snapshot) {
 }
 
 void setup() {
+  // Establish the fail-safe output before initializing buses or waiting for
+  // USB, so reset and boot never energize the relay.
+  pinMode(VALVE_RELAY_PIN, OUTPUT);
+  setValveRelay(false);
   Serial.begin(PC_BAUD);
   delay(1000);
 
@@ -1337,6 +1511,7 @@ void setup() {
 
   Serial.println();
   Serial.println("Combined IOT sensor reader started");
+  Serial.printf("Water valve relay: GPIO%d HIGH=ON; boot state CLOSED\n", VALVE_RELAY_PIN);
   Serial.printf("Wind speed 1/2: ADC GPIO%d/GPIO%d, voltage gain %.3f\n",
                 WIND_1_ADC_PIN, WIND_2_ADC_PIN, WIND_SENSOR_VOLTAGE_GAIN);
   if (AIR_SENSOR_TYPE == AIR_SENSOR_DHT11) {
@@ -1388,6 +1563,7 @@ void setup() {
 
 void loop() {
   static uint32_t lastReadMs = 0;
+  serviceUsbControl();
   serviceWifi();
 
   if (millis() - lastReadMs < READ_INTERVAL_MS) {
@@ -1467,6 +1643,11 @@ void loop() {
     Serial.println("Solar radiation sensor 2 read failed.");
   }
 
+  latestSensorSnapshotValid =
+      (snapshot.wind1Ok || snapshot.wind2Ok) && snapshot.AirPressure > 0 &&
+      snapshot.airOk && snapshot.soilOk &&
+      (snapshot.solar1Ok || snapshot.solar2Ok);
+  serviceUsbControl();
   updateDisplay(snapshot);
   sendTelemetry(snapshot);
   Serial.println("=================================");

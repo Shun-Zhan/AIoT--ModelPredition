@@ -71,3 +71,23 @@ def test_live_telemetry_refreshes_dashboard_without_storing_model_sample(tmp_pat
     assert client.post("/v1/telemetry/live", json=live_payload).status_code == 200
     latest = client.get("/v1/dashboard/latest").json()
     assert latest["snapshot"]["air"]["temperatureC"] == 26.5
+
+
+def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite",
+        artifact_dir=tmp_path / "artifacts", llm_enabled=False,
+    )
+    client = TestClient(create_app(settings))
+    status = client.get("/v1/cloud/status")
+    assert status.status_code == 200
+    assert not status.json()["enabled"]
+    assert status.json()["actuator"]["state"] == "CLOSED"
+
+    analysis = client.post("/v1/cloud/analyze").json()
+    assert analysis["finalAction"] == "NO_OP"
+    assert analysis["status"] == "disabled"
+
+    chat = client.post("/v1/cloud/chat", json={"question": "今天要浇水吗？"}).json()
+    assert not chat["llmUsed"]
+    assert "本地离线模式" in chat["answer"]

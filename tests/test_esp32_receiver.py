@@ -1,8 +1,11 @@
 from dual_forecast.esp32_receiver import (
+    _handle_ack_line,
+    _send_pending_commands,
     esp32_message_to_snapshot,
     result_to_display_command,
     snapshot_is_complete_for_prediction,
 )
+from dual_forecast.storage import Store
 
 
 def test_esp32_message_maps_to_service_snapshot():
@@ -90,3 +93,50 @@ def test_prediction_status_without_forecast_keeps_the_display_protocol_valid():
     assert result_to_display_command(
         {"status": "insufficient_data", "availableSamples": 239, "requiredSamples": 288}
     ) == "DISPLAY status=insufficient_data samples=239/288 et0=0.000 soil=0.0\n"
+
+
+class FakeSerial:
+    def __init__(self):
+        self.data = b""
+
+    def write(self, data):
+        self.data += data
+
+
+class FailingSerial:
+    def write(self, data):
+        raise OSError("USB disconnected")
+
+
+def test_only_prefixed_ack_is_parsed(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    assert not _handle_ack_line('{"requestId":"normal-log"}', store)
+    assert _handle_ack_line('@ACK {"requestId":"req-12345","accepted":true,"actualState":"OPEN"}', store)
+
+
+def test_pending_command_uses_command_prefix(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    from datetime import datetime, timedelta, timezone
+    assert store.enqueue_command({
+        "schemaVersion": "1.0", "requestId": "request-command", "action": "NO_OP",
+        "durationSeconds": None, "reasonCode": "TEST", "reason": "test", "confidence": 1,
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), "ttlSeconds": 30,
+    })
+    serial = FakeSerial()
+    _send_pending_commands(serial, store)
+    assert serial.data.startswith(b"@COMMAND {")
+
+
+def test_failed_serial_write_keeps_command_pending(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    from datetime import datetime, timedelta, timezone
+    assert store.enqueue_command({
+        "schemaVersion": "1.0", "requestId": "request-retry", "action": "NO_OP",
+        "durationSeconds": None, "reasonCode": "TEST", "reason": "test", "confidence": 1,
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), "ttlSeconds": 30,
+    })
+    try:
+        _send_pending_commands(FailingSerial(), store)
+    except OSError:
+        pass
+    assert store.pending_commands()[0]["requestId"] == "request-retry"

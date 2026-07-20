@@ -11,6 +11,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from .storage import Store
+
 
 # Telemetry is always posted to a service on this same computer.  Do not let a
 # system HTTP proxy (common on campus/company networks) route 127.0.0.1 through
@@ -175,9 +177,39 @@ def _handle_telemetry_message(
     )
 
 
+def _handle_ack_line(line: str, store: Store) -> bool:
+    """Handle only the explicit ACK prefix; ordinary device logs stay logs."""
+    if not line.startswith("@ACK "):
+        return False
+    try:
+        ack = json.loads(line.removeprefix("@ACK "))
+        if not isinstance(ack, dict) or not ack.get("requestId"):
+            raise ValueError("ACK requires requestId")
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"Ignored malformed ESP32 ACK: {exc}")
+        return True
+    store.record_ack(ack)
+    store.update_decision_ack(ack)
+    print(f"ESP32 ACK: requestId={ack['requestId']} accepted={ack.get('accepted')} state={ack.get('actualState')}")
+    return True
+
+
+def _send_pending_commands(connection: Any, store: Store) -> None:
+    for command in store.pending_commands(limit=1):
+        line = "@COMMAND " + json.dumps(command, ensure_ascii=False, separators=(",", ":")) + "\n"
+        connection.write(line.encode("utf-8"))
+        store.mark_command_sent(str(command["requestId"]))
+        print(f"Sent ESP32 command: requestId={command.get('requestId')} action={command.get('action')}")
+
+
+def _send_heartbeat(connection: Any) -> None:
+    connection.write(b"@HEARTBEAT\n")
+
+
 def receive_esp32(args: argparse.Namespace) -> None:
     """Keep one TCP connection to ESP32 and forward sampled messages to FastAPI."""
     state = _ReceiverState()
+    store = Store(args.database)
 
     while True:
         try:
@@ -218,14 +250,19 @@ def receive_esp32_serial(args: argparse.Namespace) -> None:
         raise SystemExit("pyserial is required; run: python -m pip install -r requirements.txt") from exc
 
     state = _ReceiverState()
+    store = Store(args.database)
     while True:
         try:
             print(f"Opening ESP32 USB serial port {args.serial_port} at {args.baudrate} baud ...")
             with serial.Serial(args.serial_port, args.baudrate, timeout=1) as connection:
                 print("Connected. Receiving ESP32 USB serial telemetry.")
                 while True:
+                    _send_heartbeat(connection)
+                    _send_pending_commands(connection, store)
                     line = connection.readline().decode("utf-8", errors="replace").strip()
                     if not line:
+                        continue
+                    if _handle_ack_line(line, store):
                         continue
                     if not line.startswith(args.telemetry_prefix):
                         if args.print_device_log:
@@ -243,6 +280,11 @@ def receive_esp32_serial(args: argparse.Namespace) -> None:
 
 
 def _add_submission_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--database",
+        default="runtime/forecast.sqlite3",
+        help="SQLite command queue and ACK database",
+    )
     parser.add_argument(
         "--api-url",
         default="http://127.0.0.1:8000/v1/snapshots",
