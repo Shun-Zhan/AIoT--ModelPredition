@@ -1,9 +1,0 @@
-{
-  "additionalFiles": "../..",
-  "compiler.optimization_flags": "-Os",
-  "customBuildProperties": "",
-  "fqbn": "esp32:esp32:adafruit_feather_esp32s3_nopsram",
-  "hardwareFolders": "/Users/jiahaoruan/Library/Arduino15/packages/esp32/hardware/esp32/3.3.10,/Users/jiahaoruan/Library/Arduino15/packages/esp32/hardware/esp32/3.3.10",
-  "otherLibrariesFolders": "/Users/jiahaoruan/Documents/Arduino/libraries",
-  "sketchLocation": "/Users/jiahaoruan/Work/IOT/AIoT--ModelPredition/firmware/esp32_s3_all_sensors"
-}

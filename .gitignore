@@ -28,3 +28,11 @@ data/
 
 # Local Wi-Fi credentials for the ESP32 firmware
 firmware/esp32_s3_all_sensors/wifi_credentials.h
+
+# Arduino IDE / arduino-cli compilation output (rebuild locally as needed)
+/build/
+/firmware/**/build/
+
+# One-off local hardware probes, intentionally not part of the product firmware
+/firmware/display_uart_probe/
+/firmware/relay_valve_test/
