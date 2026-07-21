@@ -44,10 +44,11 @@ def test_full_window_returns_twelve_bounded_points():
     assert gaps == [300] * 11
 
 
-def test_long_gap_blocks_prediction():
+def test_long_gap_is_skipped_and_restarts_clean_window_progress():
     frame = live_frame()
     frame.iloc[100:105, frame.columns.get_loc("soil_moisture_percent")] = np.nan
     response = build_response(frame, FakeModels(), SETTINGS)
-    assert response.status == "insufficient_data"
+    assert response.status == "warming_up"
+    assert 0 < response.availableSamples < 288
+    assert any("incomplete intervals were skipped" in warning for warning in response.warnings)
     assert not response.forecast
-

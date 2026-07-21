@@ -5,6 +5,12 @@ Starts the local forecast service, ESP32 receiver, and full-screen dashboard.
 
 param(
     [string]$EspSerialPort = "",
+    # Receive telemetry over the ESP32's provisioned Wi-Fi TCP endpoint.
+    [switch]$Wifi,
+    # "auto" (default) receives the ESP32 local UDP announcement. This works
+    # even when DHCP changes the address and a phone hotspot has no mDNS.
+    # An IP or esp32-sensors.local remains available as a troubleshooting fallback.
+    [string]$EspWifiHost = "auto",
     # Deliberately opt-in: expose the dashboard to phones on the same LAN.
     # Default remains loopback so an ordinary desktop start is not network-open.
     [switch]$Lan
@@ -80,7 +86,7 @@ if (-not (Test-Path $forecastCli) -or -not $serialDependencyReady) {
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $serialPorts = @(Get-CimInstance Win32_SerialPort -ErrorAction SilentlyContinue)
-if (-not $EspSerialPort) {
+if (-not $Wifi -and -not $EspSerialPort) {
     $usbPorts = @($serialPorts | Where-Object { $_.PNPDeviceID -match "USB|VID_" })
     if ($usbPorts.Count -eq 1) {
         $EspSerialPort = $usbPorts[0].DeviceID
@@ -95,11 +101,30 @@ if (Test-Path $pidFile) {
     try { $saved = Get-Content $pidFile -Raw | ConvertFrom-Json } catch { $saved = @{} }
 }
 
+$requestedTransport = if ($Wifi) { "wifi" } else { "usb" }
+$previousReceiverId = $saved.receiverPid
+$previousTransport = [string]$saved.transport
+$previousWifiHost = [string]$saved.espWifiHost
+$receiverNeedsRestart = $previousTransport -and (
+    $previousTransport -ne $requestedTransport -or
+    ($Wifi -and $previousTransport -eq "wifi" -and $previousWifiHost -ne $EspWifiHost)
+)
+if ((Test-ManagedProcessAlive $previousReceiverId) -and $receiverNeedsRestart) {
+    Stop-Process -Id $previousReceiverId -ErrorAction SilentlyContinue
+    Write-Host "Stopped previous $previousTransport ESP32 receiver (PID $previousReceiverId) to apply updated connection settings."
+    $previousReceiverId = $null
+}
+
 $serviceId = Start-ManagedProcess "forecast-service" @("serve", "--host", $serverHost, "--port", "8000") $saved.servicePid
 Start-Sleep -Seconds 2
-$receiverId = Start-ManagedProcess "esp32-receiver" @("receive-esp32-serial", "--serial-port", $EspSerialPort) $saved.receiverPid
+$receiverArgs = if ($Wifi) {
+    @("receive-esp32", "--esp-host", $EspWifiHost)
+} else {
+    @("receive-esp32-serial", "--serial-port", $EspSerialPort)
+}
+$receiverId = Start-ManagedProcess "esp32-receiver" $receiverArgs $previousReceiverId
 
-@{ servicePid = $serviceId; receiverPid = $receiverId } | ConvertTo-Json | Set-Content -Encoding utf8 $pidFile
+@{ servicePid = $serviceId; receiverPid = $receiverId; transport = $requestedTransport; espWifiHost = $EspWifiHost; serialPort = $EspSerialPort } | ConvertTo-Json | Set-Content -Encoding utf8 $pidFile
 
 $liveReady = $false
 for ($i = 0; $i -lt 15; $i++) {
@@ -112,7 +137,11 @@ for ($i = 0; $i -lt 15; $i++) {
 if ($liveReady) {
     Write-Host "Live ESP32 telemetry confirmed."
 } else {
-    Write-Warning "Dashboard has not received fresh ESP32 telemetry yet. Check $logDir\esp32-receiver.out.log and close Arduino Serial Monitor if the port is busy."
+    if ($Wifi) {
+        Write-Warning "Dashboard has not received fresh ESP32 Wi-Fi telemetry yet. Check $logDir\esp32-receiver.out.log and confirm ESP32 joined Wi-Fi so it can announce itself."
+    } else {
+        Write-Warning "Dashboard has not received fresh ESP32 telemetry yet. Check $logDir\esp32-receiver.out.log and close Arduino Serial Monitor if the port is busy."
+    }
 }
 
 $browserCandidates = @(
@@ -139,7 +168,15 @@ if (-not $dashboardOpened) {
     Start-Process $dashboardUrl
 }
 
-Write-Host "Dashboard opened. ESP32 USB serial port: $EspSerialPort"
+if ($Wifi) {
+    if ($EspWifiHost -eq "auto") {
+        Write-Host "Dashboard opened. ESP32 Wi-Fi telemetry: automatic local discovery (UDP 3334 -> TCP 3333)"
+    } else {
+        Write-Host "Dashboard opened. ESP32 Wi-Fi telemetry: $EspWifiHost`:3333"
+    }
+} else {
+    Write-Host "Dashboard opened. ESP32 USB serial port: $EspSerialPort"
+}
 if ($Lan) {
     Write-Host "LAN mode is enabled. On the phone, use http://<this-PC-IPv4>:8000/dashboard while both devices are on the same Wi-Fi."
     Write-Host "If Windows Firewall asks, allow private-network access only."

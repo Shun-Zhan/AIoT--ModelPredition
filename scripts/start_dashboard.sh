@@ -1,18 +1,28 @@
 #!/usr/bin/env bash
-# Starts the local forecast API, USB serial receiver, and browser dashboard on macOS.
+# Starts the local forecast API, an ESP32 receiver, and browser dashboard on macOS.
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 serial_port=""
+wifi=false
+# "auto" listens for the ESP32's local UDP announcement. It survives DHCP IP
+# changes and does not rely on a hotspot supporting mDNS (.local names).
+esp_wifi_host="auto"
 open_browser=true
 lan=false
 
 usage() {
   cat <<'EOF'
-Usage: ./start_dashboard.sh [--serial-port /dev/cu.usbserial...] [--no-browser] [--lan]
+Usage: ./start_dashboard.sh [--serial-port /dev/cu.usbserial...] [--wifi]
+                            [--esp-wifi-host auto] [--no-browser] [--lan]
 
-The ESP32 USB cable must stay connected. Close Arduino Serial Monitor first,
-because only one program can use the serial port at a time.
+Default: receive telemetry via the ESP32 USB serial port. The USB cable must
+stay connected and Arduino Serial Monitor must be closed.
+
+--wifi receives telemetry via the ESP32 local Wi-Fi TCP endpoint instead.
+It auto-discovers the ESP32 after DHCP assigns its address, including when a
+phone hotspot cannot resolve mDNS. Use --esp-wifi-host with an explicit IP or
+esp32-sensors.local only as a troubleshooting fallback.
 
 --lan is explicit opt-in and binds FastAPI to 0.0.0.0 for phones on the same
 Wi-Fi. Without it, the service remains available only at 127.0.0.1.
@@ -24,6 +34,12 @@ while [[ $# -gt 0 ]]; do
     --serial-port|-p)
       serial_port="${2:-}"
       [[ -n "$serial_port" ]] || { echo "--serial-port needs a value." >&2; exit 2; }
+      shift 2
+      ;;
+    --wifi) wifi=true; shift ;;
+    --esp-wifi-host)
+      esp_wifi_host="${2:-}"
+      [[ -n "$esp_wifi_host" ]] || { echo "--esp-wifi-host needs a value." >&2; exit 2; }
       shift 2
       ;;
     --no-browser) open_browser=false; shift ;;
@@ -47,6 +63,9 @@ read_pid() {
   [[ -f "$pid_file" ]] || return 0
   python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$pid_file" "$1" 2>/dev/null || true
 }
+
+requested_transport="usb"
+if [[ "$wifi" == true ]]; then requested_transport="wifi"; fi
 
 start_process() {
   local name="$1"
@@ -90,7 +109,7 @@ if ! "$venv_python" -c 'import serial, qrcode' >/dev/null 2>&1; then
 fi
 
 mkdir -p "$log_dir"
-if [[ -z "$serial_port" ]]; then
+if [[ "$wifi" != true && -z "$serial_port" ]]; then
   ports=(/dev/cu.wchusbserial* /dev/cu.usbserial* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem*)
   existing_ports=()
   for port in "${ports[@]}"; do
@@ -106,14 +125,25 @@ if [[ -z "$serial_port" ]]; then
   fi
 fi
 
-if [[ ! -e "$serial_port" ]]; then
+if [[ "$wifi" != true && ! -e "$serial_port" ]]; then
   echo "ESP32 serial port does not exist: $serial_port" >&2
   exit 1
 fi
 
 previous_service_pid="$(read_pid servicePid)"
 previous_receiver_pid="$(read_pid receiverPid)"
-if lsof "$serial_port" >/dev/null 2>&1 && ! is_alive "$previous_receiver_pid"; then
+previous_transport="$(read_pid transport)"
+previous_wifi_host="$(read_pid espWifiHost)"
+# A receiver opened for USB cannot switch itself to TCP (or vice versa).
+# It is safe to replace only the managed receiver PID stored by this script.
+# Restart Wi-Fi mode too when its endpoint selection changed, so upgrading from
+# an old mDNS/IP launch to the new automatic discovery takes effect directly.
+if is_alive "$previous_receiver_pid" && { [[ -n "$previous_transport" && "$previous_transport" != "$requested_transport" ]] || [[ "$wifi" == true && "$previous_transport" == "wifi" && "$previous_wifi_host" != "$esp_wifi_host" ]]; }; then
+  kill "$previous_receiver_pid"
+  echo "Stopped previous $previous_transport ESP32 receiver (PID $previous_receiver_pid) to apply updated connection settings." >&2
+  previous_receiver_pid=""
+fi
+if [[ "$wifi" != true ]] && lsof "$serial_port" >/dev/null 2>&1 && ! is_alive "$previous_receiver_pid"; then
   echo "Serial port is already in use: $serial_port" >&2
   echo "Close Arduino Serial Monitor or stop the existing receiver first." >&2
   exit 1
@@ -130,10 +160,14 @@ curl --silent --fail http://127.0.0.1:8000/health >/dev/null || {
   echo "Forecast service did not start. See $log_dir/forecast-service.err.log" >&2
   exit 1
 }
-receiver_pid="$(start_process esp32-receiver "$previous_receiver_pid" receive-esp32-serial --serial-port "$serial_port")"
+if [[ "$wifi" == true ]]; then
+  receiver_pid="$(start_process esp32-receiver "$previous_receiver_pid" receive-esp32 --esp-host "$esp_wifi_host")"
+else
+  receiver_pid="$(start_process esp32-receiver "$previous_receiver_pid" receive-esp32-serial --serial-port "$serial_port")"
+fi
 
-printf '{\n  "servicePid": %s,\n  "receiverPid": %s,\n  "serialPort": "%s"\n}\n' \
-  "$service_pid" "$receiver_pid" "$serial_port" >"$pid_file"
+printf '{\n  "servicePid": %s,\n  "receiverPid": %s,\n  "transport": "%s",\n  "serialPort": "%s",\n  "espWifiHost": "%s"\n}\n' \
+  "$service_pid" "$receiver_pid" "$requested_transport" "$serial_port" "$esp_wifi_host" >"$pid_file"
 
 live_ready=false
 for _ in {1..15}; do
@@ -147,7 +181,11 @@ if [[ "$live_ready" == true ]]; then
   echo "Live ESP32 telemetry confirmed."
 else
   echo "Warning: dashboard has not received fresh ESP32 telemetry yet." >&2
-  echo "Check $log_dir/esp32-receiver.out.log and close Arduino Serial Monitor if the port is busy." >&2
+  if [[ "$wifi" == true ]]; then
+    echo "Check $log_dir/esp32-receiver.out.log. Confirm ESP32 joined Wi-Fi; its TCP server will announce itself automatically." >&2
+  else
+    echo "Check $log_dir/esp32-receiver.out.log and close Arduino Serial Monitor if the port is busy." >&2
+  fi
 fi
 
 if [[ "$open_browser" == true ]]; then
@@ -161,7 +199,15 @@ if [[ "$open_browser" == true ]]; then
 fi
 
 echo "Dashboard ready: $dashboard_url"
-echo "ESP32 USB serial: $serial_port"
+if [[ "$wifi" == true ]]; then
+  if [[ "$esp_wifi_host" == "auto" ]]; then
+    echo "ESP32 Wi-Fi telemetry: automatic local discovery (UDP 3334 → TCP 3333)"
+  else
+    echo "ESP32 Wi-Fi telemetry: $esp_wifi_host:3333"
+  fi
+else
+  echo "ESP32 USB serial: $serial_port"
+fi
 if [[ "$lan" == true ]]; then
   echo "LAN mode is enabled. On the phone, use http://<this-Mac-IPv4>:8000/dashboard while both devices are on the same Wi-Fi."
   echo "If macOS Firewall asks, allow the Python process on the local network."

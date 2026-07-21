@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
+import struct
 import threading
 from urllib.parse import urlparse
+import zlib
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 import qrcode
-import qrcode.image.svg
 
 from .config import SETTINGS, Settings
 from .inference import ModelBundle, build_response
@@ -38,8 +38,34 @@ def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> di
         },
         "solarOk": snapshot.solar_mean() is not None,
         "solarRadiationWm2": snapshot.solar_mean(),
+        "edgePrediction": (
+            snapshot.edgePrediction.model_dump() if snapshot.edgePrediction is not None else None
+        ),
         "warnings": [],
     }
+
+
+def qr_png(url: str, *, border: int = 2, pixel_size: int = 6) -> bytes:
+    """Create a QR PNG without Pillow so a fresh install stays self-contained."""
+    code = qrcode.QRCode(border=border)
+    code.add_data(url)
+    code.make(fit=True)
+    matrix = code.get_matrix()
+    width = len(matrix) * pixel_size
+    rows = []
+    for matrix_row in matrix:
+        raster = b"".join((b"\x00" if cell else b"\xff") * pixel_size for cell in matrix_row)
+        rows.extend((b"\x00" + raster,) * pixel_size)
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, width, 8, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"".join(rows), level=9))
+        + chunk(b"IEND", b"")
+    )
 
 
 def create_app(settings: Settings = SETTINGS) -> FastAPI:
@@ -53,10 +79,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     def edge_payload() -> dict:
         current = store.latest_live_snapshot() or store.latest_snapshot() or {}
         assessment = irrigation.assess_edge(current)
-        config = store.enqueue_sampling_config(
-            assessment.recommended_sampling_mode.value, assessment.recommended_read_interval_ms,
-        )
-        return {**assessment.to_dict(), "configQueued": config is not None}
+        # This helper is called by the browser polling endpoint.  A GET must
+        # never alter the ESP32's sampling policy: otherwise refreshing the
+        # dashboard while telemetry is stale can enqueue DEBUG, then the next
+        # fresh packet enqueues another mode, causing avoidable config churn.
+        return {**assessment.to_dict(), "configQueued": False}
 
     def water_report() -> dict:
         now = datetime.now(timezone.utc)
@@ -119,6 +146,239 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     def stop_periodic_worker():
         stop_periodic.set()
 
+    # Keep the dashboard logic in a standalone, ES5-compatible asset.  Some
+    # embedded/mobile browsers used during demonstrations do not execute the
+    # previous large inline script reliably; an external script also makes it
+    # much easier to invalidate an old cached dashboard page.
+    dashboard_script = r"""(function () {
+  'use strict';
+  var lastSnapshotAt = null;
+  var latestAnswer = '';
+  var longPressTimer = null;
+  var voiceRecognition = null;
+  var voiceStopTimer = null;
+  var voiceBusy = false;
+  var voiceGotResult = false;
+
+  function el(id) { return document.getElementById(id); }
+  function has(value) { return value !== null && value !== undefined; }
+  function number(value, digits) {
+    return has(value) && isFinite(Number(value)) ? Number(value).toFixed(digits) : '--';
+  }
+  function setValue(id, value, unit, digits) {
+    el(id).innerHTML = number(value, has(digits) ? digits : 1) + ' <span class="unit">' + unit + '</span>';
+  }
+  function request(method, path, body, success, failure) {
+    var xhr = new XMLHttpRequest();
+    var separator = path.indexOf('?') === -1 ? '?' : '&';
+    xhr.open(method, path + separator + '_=' + new Date().getTime(), true);
+    xhr.setRequestHeader('Cache-Control', 'no-cache');
+    if (body) xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) return;
+      if (xhr.status < 200 || xhr.status >= 300) {
+        if (failure) failure('HTTP ' + xhr.status);
+        return;
+      }
+      try { success(JSON.parse(xhr.responseText)); }
+      catch (error) { if (failure) failure('响应格式错误'); }
+    };
+    xhr.onerror = function () { if (failure) failure('网络连接失败'); };
+    xhr.send(body ? JSON.stringify(body) : null);
+  }
+  function renderFreshness() {
+    if (!lastSnapshotAt) return;
+    var seconds = Math.max(0, Math.round((new Date().getTime() - lastSnapshotAt.getTime()) / 1000));
+    var connection = el('connection');
+    connection.textContent = '实时数据：' + seconds + ' 秒前';
+    connection.className = seconds <= 5 ? 'ok' : (seconds <= 20 ? 'warn' : 'bad');
+  }
+  function refresh() {
+    request('GET', '/v1/dashboard/latest', null, function (data) {
+      var s = data.snapshot;
+      if (!s) {
+        el('connection').textContent = '等待 ESP32 数据';
+        el('connection').className = 'warn';
+        return;
+      }
+      lastSnapshotAt = new Date(s.receivedAt);
+      renderFreshness();
+      var air = s.air || {}, soil = s.soil || {};
+      setValue('airTemp', s.airOk ? air.temperatureC : null, '°C', 1);
+      setValue('airRh', s.airOk ? air.humidityPercent : null, '%RH', 1);
+      setValue('pressure', s.airPressureHpa, 'hPa', 0);
+      setValue('wind', s.windOk ? s.windSpeedMs : null, 'm/s', 1);
+      setValue('soilTemp', s.soilOk ? soil.temperatureC : null, '°C', 1);
+      setValue('soilMoist', s.soilOk ? soil.moisturePercent : null, '%', 1);
+      setValue('solar', s.solarOk ? s.solarRadiationWm2 : null, 'W/m²', 0);
+      el('updated').textContent = '最近采集：' + s.receivedAt + '，设备运行 ' + Math.round((s.uptimeMs || 0) / 1000) + ' 秒';
+
+      var forecast = data.forecast;
+      if (forecast) {
+        var first = forecast.forecast && forecast.forecast.length ? forecast.forecast[0] : null;
+        var forecastStatus = forecast.status || '--';
+        if (forecastStatus === 'warming_up') forecastStatus = '连续完整数据积累中';
+        else if (forecastStatus === 'ok') forecastStatus = '预测正常';
+        else if (forecastStatus === 'model_unavailable') forecastStatus = '模型未就绪';
+        var modelText = '状态：' + forecastStatus + '\n连续完整样本：' + (forecast.availableSamples || 0) + '/' + (forecast.requiredSamples || '--');
+        if (first) modelText += '\n下一时段 ET₀：' + number(first.et0Mm, 3) + ' mm，预测土壤湿度：' + number(first.soilMoisturePercent, 1) + ' %';
+        el('model').textContent = modelText;
+        el('model').className = forecast.status === 'ok' ? 'value ok' : 'value warn';
+      }
+      var edgePrediction = s.edgePrediction;
+      if (!edgePrediction) {
+        el('edgePrediction').textContent = '等待 ESP32 边缘预测数据...';
+        el('edgePrediction').className = 'meta';
+      } else if (!edgePrediction.valid) {
+        el('edgePrediction').textContent = '状态：传感器不完整，ESP32 本地预测暂停。';
+        el('edgePrediction').className = 'meta warn';
+      } else {
+        var edgeText = '模式：ESP32 轻量离线降级\n';
+        edgeText += '30 分钟后土壤湿度：' + number(edgePrediction.predictedSoilMoisture30mPercent, 1) + ' %\n';
+        edgeText += '预计干燥速率：' + number(edgePrediction.dryingRatePercentPerHour, 3) + ' %/h\n';
+        edgeText += '风险：' + (edgePrediction.riskLevel || '--') + '（' + (edgePrediction.reason || '--') + '）';
+        el('edgePrediction').textContent = edgeText;
+        el('edgePrediction').className = 'value ' + (edgePrediction.riskLevel === 'NORMAL' ? 'ok' : (edgePrediction.riskLevel === 'ATTENTION' ? 'warn' : 'bad'));
+        el('edgePrediction').style.fontSize = '17px';
+      }
+      var edge = data.edge || {}, risk = edge.riskLevel || '--';
+      el('risk').textContent = risk + ' · ' + (has(edge.riskScore) ? edge.riskScore : '--') + '/100';
+      el('risk').className = 'value ' + (risk === 'NORMAL' ? 'ok' : (risk === 'ATTENTION' ? 'warn' : 'bad'));
+      el('riskReasons').textContent = (edge.reasons || []).join('；');
+      el('sampling').textContent = '推荐采样：' + (edge.recommendedSamplingMode || '--') + '（' + (edge.recommendedReadIntervalMs || '--') + ' ms）' + (data.samplingConfig ? '；设备配置：' + data.samplingConfig.status : '');
+      var actuator = data.actuator || {};
+      var fresh = edge.dataFreshness || {};
+      el('valve').textContent = '水阀：' + (actuator.state || 'CLOSED') + '；数据新鲜度：' + (fresh.fresh ? '新鲜' : '需检查') + '（' + (has(fresh.ageSeconds) ? fresh.ageSeconds : '--') + ' 秒）';
+      var events = data.events || [], eventText = [];
+      for (var i = 0; i < events.length && i < 8; i++) {
+        eventText.push((events[i].resolved ? '已恢复' : '进行中') + ' [' + events[i].severity + '] ' + events[i].code + '\n' + events[i].message + ' · ' + events[i].occurredAt);
+      }
+      el('events').textContent = eventText.length ? eventText.join('\n\n') : '暂无事件';
+      var report = data.waterReport || {}, day = report.last24Hours || {}, week = report.last7Days || {};
+      var reportText = '24h：' + (day.wateringCount || 0) + ' 次 / ' + (day.wateringSeconds || 0) + ' 秒；7d：' + (week.wateringCount || 0) + ' 次 / ' + (week.wateringSeconds || 0) + ' 秒。';
+      reportText += report.estimatedLiters === null || !has(report.estimatedLiters) ? '未配置阀门流量，无法估算用水量。' : '估算用水量 ' + report.estimatedLiters + ' L。';
+      el('report').textContent = reportText + ' ' + (report.historyStatus || '');
+    }, function (message) {
+      el('connection').textContent = '数据读取失败：' + message;
+      el('connection').className = 'bad';
+    });
+  }
+  function refreshCloud() {
+    request('GET', '/v1/cloud/status', null, function (data) {
+      var decision = data.decision, actuator = data.actuator || {};
+      var text = '云端：' + (data.enabled ? '已启用' : '离线/未启用') + '，水阀：' + (actuator.state || 'OFF');
+      if (decision) text += '\n建议：' + (decision.proposedAction || decision.finalAction) + '；状态：' + decision.status + '\n原因：' + decision.reason;
+      el('cloud').textContent = text;
+      el('confirm').hidden = !(decision && decision.status === 'awaiting_confirmation');
+      el('cancel').hidden = !(decision && decision.status === 'awaiting_confirmation');
+      el('confirm').setAttribute('data-id', decision ? decision.requestId : '');
+    }, function () { el('cloud').textContent = '云端状态不可用，但本地传感器与预测不受影响。'; });
+  }
+  function confirmDecision() {
+    var id = el('confirm').getAttribute('data-id');
+    if (id) request('POST', '/v1/decisions/' + encodeURIComponent(id) + '/confirm', {}, refreshCloud, refreshCloud);
+  }
+  function setQr() {
+    var address = window.location.protocol + '//' + window.location.host + '/dashboard';
+    el('address').textContent = address;
+    var qr = el('qr');
+    qr.src = '/v1/dashboard/qr?url=' + encodeURIComponent(address) + '&_=' + new Date().getTime();
+    qr.onerror = function () {
+      qr.style.display = 'none';
+      el('address').textContent = address + '（二维码生成失败，请复制此地址）';
+    };
+  }
+  el('analyze').onclick = function () { request('POST', '/v1/cloud/analyze', {}, refreshCloud, refreshCloud); };
+  el('cancel').onclick = function () { el('cloud').textContent = '待确认建议已在页面取消；未产生任何水阀命令。'; el('confirm').hidden = true; el('cancel').hidden = true; };
+  el('confirm').addEventListener('mousedown', function () { longPressTimer = setTimeout(confirmDecision, 1500); });
+  el('confirm').addEventListener('mouseup', function () { clearTimeout(longPressTimer); });
+  el('confirm').addEventListener('mouseleave', function () { clearTimeout(longPressTimer); });
+  el('confirm').addEventListener('touchstart', function () { longPressTimer = setTimeout(confirmDecision, 1500); });
+  el('confirm').addEventListener('touchend', function () { clearTimeout(longPressTimer); });
+  el('ask').onclick = function () {
+    var question = el('question').value.replace(/^\s+|\s+$/g, '');
+    if (!question) return;
+    request('POST', '/v1/cloud/chat', {question: question}, function (data) {
+      latestAnswer = data.answer || '';
+      var range = data.dataRange || {};
+      el('answer').textContent = latestAnswer + '\n数据范围：' + (range.start || '--') + ' 至 ' + (range.end || '--') + '\n依据：' + (data.evidence || []).join('；');
+    }, function () { el('answer').textContent = '问答服务暂不可用。'; });
+  };
+  function resetVoiceButton() {
+    voiceBusy = false;
+    voiceRecognition = null;
+    if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
+    el('voice').textContent = '开始说话';
+  }
+  function stopVoice(status) {
+    if (status) el('voiceStatus').textContent = status;
+    if (!voiceBusy || !voiceRecognition) { resetVoiceButton(); return; }
+    if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
+    try { voiceRecognition.stop(); }
+    catch (error) { resetVoiceButton(); }
+  }
+  el('voiceStatus').textContent = '点击“开始说话”后说一句完整问题；可再次点击停止，8 秒无语音会自动停止。';
+  el('voice').onclick = function () {
+    var Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) { el('voiceStatus').textContent = '当前浏览器不支持语音输入，请使用文字提问。'; return; }
+    if (voiceBusy) { stopVoice('已停止语音输入。'); return; }
+    voiceBusy = true;
+    voiceGotResult = false;
+    voiceRecognition = new Recognition();
+    voiceRecognition.lang = 'zh-CN';
+    voiceRecognition.continuous = false;
+    voiceRecognition.interimResults = false;
+    voiceRecognition.maxAlternatives = 1;
+    voiceRecognition.onstart = function () {
+      el('voice').textContent = '停止录音';
+      el('voiceStatus').textContent = '正在聆听…请说一句完整问题；再次点击“停止录音”可立即关闭麦克风。';
+      voiceStopTimer = setTimeout(function () { stopVoice('8 秒未检测到语音，已自动停止。'); }, 8000);
+    };
+    voiceRecognition.onresult = function (event) {
+      var transcript = event.results[0][0].transcript;
+      voiceGotResult = true;
+      if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
+      el('question').value = transcript;
+      el('voiceStatus').textContent = '已识别：“' + transcript + '”，正在提交问题。';
+      el('ask').click();
+      stopVoice();
+    };
+    voiceRecognition.onerror = function (event) {
+      if (event.error === 'aborted') return;
+      var messages = {
+        'not-allowed': '麦克风权限被拒绝，请在浏览器网站设置中允许麦克风。',
+        'no-speech': '没有识别到语音，已停止。',
+        'audio-capture': '未找到可用麦克风，请检查系统输入设备。',
+        'network': '浏览器语音识别服务连接失败，请改用文字提问。'
+      };
+      el('voiceStatus').textContent = messages[event.error] || ('语音输入失败：' + event.error);
+    };
+    voiceRecognition.onend = function () {
+      var hadResult = voiceGotResult;
+      resetVoiceButton();
+      if (!hadResult && el('voiceStatus').textContent.indexOf('正在聆听') === 0) {
+        el('voiceStatus').textContent = '语音输入已结束。';
+      }
+    };
+    try { voiceRecognition.start(); }
+    catch (error) { resetVoiceButton(); el('voiceStatus').textContent = '无法启动语音输入，请稍后重试。'; }
+  };
+  el('speak').onclick = function () {
+    if (!('speechSynthesis' in window)) { el('voiceStatus').textContent = '当前浏览器不支持朗读。'; return; }
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(latestAnswer || el('answer').textContent));
+  };
+  el('copy').onclick = function () {
+    var address = el('address').textContent.replace('（二维码生成失败，请复制此地址）', '');
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(address);
+    else { el('address').textContent = address + '（请长按复制）'; }
+  };
+  setQr(); refresh(); refreshCloud();
+  window.setInterval(refresh, 2000);
+  window.setInterval(refreshCloud, 5000);
+  window.setInterval(renderFreshness, 1000);
+}());"""
+
     dashboard_html = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -151,83 +411,15 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card"><div class="label">平均太阳辐射</div><div id="solar" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
     <section class="card wide mobile-full"><h2>移动巡检与边缘风险</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
-    <section class="card wide"><h2>预测模型</h2><div id="model" class="value" style="font-size:18px">等待数据...</div></section>
+    <section class="card wide"><h2>预测模型（电脑端完整时序模型）</h2><div id="model" class="value" style="font-size:18px">等待数据...</div></section>
+    <section class="card wide"><h2>ESP32 边缘预测（断网降级）</h2><div id="edgePrediction" class="meta">等待 ESP32 边缘预测数据...</div><div class="meta">仅作趋势与风险提示；不会直接打开水阀。</div></section>
     <section class="card wide"><h2>环境事件时间线</h2><div id="events" class="timeline muted">暂无事件</div></section>
     <section class="card wide"><h2>云端增强与水阀安全层</h2><div id="cloud" class="meta">正在读取状态...</div><button id="analyze">请求一次分析</button><button id="confirm" class="hold" hidden>长按 1.5 秒确认灌溉</button><button id="cancel" class="secondary" hidden>取消待确认建议</button><div class="meta">长按仅是交互确认；后端仍会重新校验传感器新鲜度、湿度、冷却时间和日限额。</div></section>
-    <section class="card wide"><h2>自然语言问答（可选语音）</h2><div class="row"><input id="question" placeholder="例如：今天需要调整灌溉计划吗？"><button id="ask">提问</button><button id="voice" class="secondary">语音输入</button><button id="speak" class="secondary">朗读回答</button></div><div id="voiceStatus" class="meta"></div><div id="answer" class="muted" style="margin-top:12px;white-space:pre-line"></div></section>
+    <section class="card wide"><h2>自然语言问答（可选语音）</h2><div class="row"><input id="question" placeholder="例如：今天需要调整灌溉计划吗？"><button id="ask">提问</button><button id="voice" class="secondary">开始说话</button><button id="speak" class="secondary">朗读回答</button></div><div id="voiceStatus" class="meta"></div><div id="answer" class="muted" style="margin-top:12px;white-space:pre-line"></div></section>
     <section class="card wide"><h2>手机入口</h2><div class="row"><img id="qr" class="qr" alt="当前页面二维码"><div><div id="address" class="meta"></div><button id="copy" class="secondary">复制访问地址</button><div class="meta">二维码由浏览器按当前地址生成；若手机不能访问，请让电脑与手机在同一 Wi‑Fi，并以 --host 0.0.0.0 启动服务。</div></div></div></section>
     <section class="card wide"><h2>节水与运行报告</h2><div id="report" class="meta">数据积累中</div></section><div id="updated" class="muted">尚未收到 ESP32 数据</div>
   </main>
-<script>
-const el = id => document.getElementById(id);
-const num = (v, digits=1) => v === null || v === undefined ? '--' : Number(v).toFixed(digits);
-let lastSnapshotAt = null, longPressTimer = null, latestDecision = null, latestAnswer = '';
-function setValue(id, value, unit, digits=1) { el(id).innerHTML = `${num(value,digits)} <span class="unit">${unit}</span>`; }
-function renderFreshness() {
-  if (!lastSnapshotAt) return;
-  const seconds = Math.max(0, Math.round((Date.now() - lastSnapshotAt.getTime()) / 1000));
-  el('connection').textContent = `实时数据：${seconds} 秒前`;
-  el('connection').className = seconds <= 5 ? 'ok' : (seconds <= 20 ? 'warn' : 'bad');
-}
-async function refresh() {
-  try {
-    const response = await fetch('/v1/dashboard/latest', {cache:'no-store'});
-    const data = await response.json();
-    const s = data.snapshot;
-    if (!s) { el('connection').textContent = '等待 ESP32 数据'; return; }
-    lastSnapshotAt = new Date(s.receivedAt);
-    renderFreshness();
-    setValue('airTemp', s.airOk ? s.air.temperatureC : null, '°C');
-    setValue('airRh', s.airOk ? s.air.humidityPercent : null, '%RH');
-    setValue('pressure', s.airPressureHpa, 'hPa', 0);
-    setValue('wind', s.windOk ? s.windSpeedMs : null, 'm/s');
-    setValue('soilTemp', s.soilOk ? s.soil.temperatureC : null, '°C');
-    setValue('soilMoist', s.soilOk ? s.soil.moisturePercent : null, '%');
-    setValue('solar', s.solarOk ? s.solarRadiationWm2 : null, 'W/m²', 0);
-    el('updated').textContent = `最近采集：${s.receivedAt}，设备运行 ${Math.round(s.uptimeMs/1000)} 秒`;
-    const f = data.forecast;
-    if (f) {
-      const first = f.forecast && f.forecast.length ? f.forecast[0] : null;
-      el('model').textContent = `状态：${f.status}\n样本：${f.availableSamples}/${f.requiredSamples}` +
-        (first ? `\n下一时段 ET₀：${Number(first.et0Mm).toFixed(3)} mm，预测土壤湿度：${Number(first.soilMoisturePercent).toFixed(1)} %` : '');
-      el('model').className = f.status === 'ok' ? 'value ok' : 'value warn';
-    }
-    const edge=data.edge||{}, risk=edge.riskLevel||'--'; el('risk').textContent=`${risk} · ${edge.riskScore ?? '--'}/100`;
-    el('risk').className=`value ${risk==='NORMAL'?'ok':risk==='ATTENTION'?'warn':'bad'}`;
-    el('riskReasons').textContent=(edge.reasons||[]).join('；');
-    el('sampling').textContent=`推荐采样：${edge.recommendedSamplingMode||'--'}（${edge.recommendedReadIntervalMs||'--'} ms）${data.samplingConfig?`；设备配置：${data.samplingConfig.status}`:''}`;
-    el('valve').textContent=`水阀：${(data.actuator||{}).state||'CLOSED'}；数据新鲜度：${edge.dataFreshness?.fresh?'新鲜':'需检查'}（${edge.dataFreshness?.ageSeconds??'--'} 秒）`;
-    el('events').textContent=(data.events||[]).slice(0,8).map(e=>`${e.resolved?'已恢复':'进行中'} [${e.severity}] ${e.code}\n${e.message} · ${e.occurredAt}`).join('\n\n') || '暂无事件';
-    const r=data.waterReport||{}; el('report').textContent=`24h：${r.last24Hours?.wateringCount??0} 次 / ${r.last24Hours?.wateringSeconds??0} 秒；7d：${r.last7Days?.wateringCount??0} 次 / ${r.last7Days?.wateringSeconds??0} 秒。${r.estimatedLiters===null?'未配置阀门流量，无法估算用水量。':`估算用水量 ${r.estimatedLiters} L。`} ${r.historyStatus||''}`;
-  } catch (error) {
-    el('connection').textContent = '电脑服务未连接';
-    el('connection').className = 'bad';
-  }
-}
-async function refreshCloud() {
-  try {
-    const c = await (await fetch('/v1/cloud/status', {cache:'no-store'})).json();
-    const d = c.decision, a = c.actuator; latestDecision=d;
-    let text = `云端：${c.enabled ? '已启用' : '离线/未启用'}，水阀：${a.state || 'OFF'}`;
-    if (d) text += `\n建议：${d.proposedAction || d.finalAction}；状态：${d.status}\n原因：${d.reason}`;
-    el('cloud').textContent = text;
-    el('confirm').hidden = !(d && d.status === 'awaiting_confirmation');
-    el('cancel').hidden = !(d && d.status === 'awaiting_confirmation');
-    el('confirm').dataset.id = d ? d.requestId : '';
-  } catch (_) { el('cloud').textContent = '云端状态不可用，但本地传感器与预测不受影响。'; }
-}
-el('analyze').onclick = async () => { await fetch('/v1/cloud/analyze', {method:'POST'}); await refreshCloud(); };
-const confirmNow=async()=>{const id=el('confirm').dataset.id;if(id){await fetch(`/v1/decisions/${id}/confirm`, {method:'POST'});await refreshCloud();}};
-['pointerdown','touchstart'].forEach(ev=>el('confirm').addEventListener(ev,()=>{el('confirm').classList.add('active');longPressTimer=setTimeout(confirmNow,1500)}));
-['pointerup','pointerleave','pointercancel','touchend'].forEach(ev=>el('confirm').addEventListener(ev,()=>{el('confirm').classList.remove('active');clearTimeout(longPressTimer)}));
-el('cancel').onclick=()=>{el('cloud').textContent='待确认建议已在页面取消；未产生任何水阀命令。';el('confirm').hidden=true;el('cancel').hidden=true;};
-el('ask').onclick = async () => { const q=el('question').value.trim(); if (!q) return; const r=await fetch('/v1/cloud/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})}); const d=await r.json(); latestAnswer=d.answer;el('answer').textContent=`${d.answer}\n数据范围：${d.dataRange.start || '--'} 至 ${d.dataRange.end || '--'}\n依据：${(d.evidence||[]).join('；')}`; };
-const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition; el('voiceStatus').textContent=`语音输入：${Recognition?'可用':'浏览器不支持，仍可文字提问'}；语音播报：${'speechSynthesis' in window?'可用':'浏览器不支持'}`;
-el('voice').onclick=()=>{if(!Recognition){el('voiceStatus').textContent='当前浏览器不支持语音输入，请使用文字提问。';return;}const rec=new Recognition();rec.lang='zh-CN';rec.onresult=e=>{el('question').value=e.results[0][0].transcript;el('ask').click();};rec.start();};
-el('speak').onclick=()=>{if(!('speechSynthesis' in window)){el('voiceStatus').textContent='当前浏览器不支持朗读。';return;}speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(latestAnswer||el('answer').textContent));};
-const origin=window.location.origin;const dashboardAddress=origin+'/dashboard';el('address').textContent=dashboardAddress;el('qr').src='/v1/dashboard/qr?url='+encodeURIComponent(dashboardAddress);el('qr').onerror=()=>{el('qr').style.display='none';el('address').textContent+='（本机二维码生成失败，请复制地址）';};el('copy').onclick=()=>navigator.clipboard?.writeText(dashboardAddress);
-refresh(); refreshCloud(); setInterval(refresh, 2000); setInterval(refreshCloud, 5000); setInterval(renderFreshness, 1000);
-</script>
+<script defer src="/v1/dashboard/app.js?v=20260721-5"></script>
 </body></html>"""
 
     @app.get("/health")
@@ -236,21 +428,26 @@ refresh(); refreshCloud(); setInterval(refresh, 2000); setInterval(refreshCloud,
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard():
-        return dashboard_html
+        return HTMLResponse(content=dashboard_html, headers={"Cache-Control": "no-store, max-age=0"})
+
+    @app.get("/v1/dashboard/app.js")
+    def dashboard_app_js():
+        return Response(
+            content=dashboard_script,
+            media_type="application/javascript; charset=utf-8",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     @app.get("/v1/dashboard/qr")
     def dashboard_qr(url: str):
-        """Generate a dashboard QR locally as SVG, without a QR web service."""
+        """Generate a dashboard QR locally as a broadly compatible PNG."""
         if len(url) > 2048:
             raise HTTPException(status_code=400, detail="dashboard URL is too long")
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise HTTPException(status_code=400, detail="URL must be an absolute http(s) dashboard address")
-        image = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage, border=2)
-        output = BytesIO()
-        image.save(output)
         return Response(
-            content=output.getvalue(), media_type="image/svg+xml",
+            content=qr_png(url), media_type="image/png",
             headers={"Cache-Control": "no-store"},
         )
 

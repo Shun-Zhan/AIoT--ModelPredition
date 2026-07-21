@@ -89,12 +89,38 @@ def prepare_live_frame(raw: pd.DataFrame, settings: Settings) -> tuple[pd.DataFr
 def build_response(raw: pd.DataFrame, models: ModelBundle, settings: Settings) -> ForecastResponse:
     now = datetime.now(timezone.utc)
     frame, warnings = prepare_live_frame(raw, settings)
-    available = min(len(frame), settings.live_window)
-    if len(frame) < settings.live_window:
-        return ForecastResponse(status="warming_up", generatedAt=now, requiredSamples=settings.live_window, availableSamples=available, warnings=warnings)
-    window = frame.iloc[-settings.live_window:].copy()
-    if window[SOIL_FEATURES].isna().any().any():
-        return ForecastResponse(status="insufficient_data", generatedAt=now, requiredSamples=settings.live_window, availableSamples=available, warnings=warnings + ["window contains a gap longer than the interpolation limit"])
+    if frame.empty:
+        return ForecastResponse(
+            status="warming_up",
+            generatedAt=now,
+            requiredSamples=settings.live_window,
+            availableSamples=0,
+            warnings=warnings + ["waiting for complete environmental samples"],
+        )
+
+    # A broken time interval must never be passed to the model as if it were
+    # trustworthy data.  Rather than surfacing an opaque ``insufficient_data``
+    # status forever, discard the incomplete prefix and show the actual count
+    # of consecutive clean five-minute intervals accumulated after the last
+    # gap.  The next complete ESP32 packet can therefore resume progress
+    # immediately, while the model still receives the cadence it was trained
+    # on.
+    complete = frame[SOIL_FEATURES].notna().all(axis=1)
+    missing_positions = np.flatnonzero(~complete.to_numpy())
+    clean_frame = frame.iloc[int(missing_positions[-1]) + 1:] if len(missing_positions) else frame
+    available = min(len(clean_frame), settings.live_window)
+    if len(clean_frame) < settings.live_window:
+        clean_warning = "waiting for consecutive complete five-minute samples"
+        if len(missing_positions):
+            clean_warning = "incomplete intervals were skipped; collecting a new consecutive clean window"
+        return ForecastResponse(
+            status="warming_up",
+            generatedAt=now,
+            requiredSamples=settings.live_window,
+            availableSamples=available,
+            warnings=warnings + [clean_warning],
+        )
+    window = clean_frame.iloc[-settings.live_window:].copy()
     if not models.ready:
         return ForecastResponse(status="model_unavailable", generatedAt=now, requiredSamples=settings.live_window, availableSamples=available, warnings=warnings + ["train both models before requesting forecasts"])
     hourly = window.resample("1h").mean().dropna()

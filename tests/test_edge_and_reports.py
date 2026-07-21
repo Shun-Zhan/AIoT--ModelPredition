@@ -109,15 +109,21 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     settings = replace(SETTINGS, database_path=tmp_path / "ui.sqlite", artifact_dir=tmp_path / "artifacts", llm_enabled=False)
     client = TestClient(create_app(settings))
     html = client.get("/dashboard").text
-    assert "setTimeout(confirmNow,1500)" in html
-    assert "window.location.origin" in html
-    assert "/v1/dashboard/qr?url=" in html
-    assert "api.qrserver.com" not in html
-    assert "SpeechRecognition" in html
+    assert "/v1/dashboard/app.js" in html
+    app_js = client.get("/v1/dashboard/app.js")
+    assert app_js.status_code == 200
+    assert "setTimeout(confirmDecision, 1500)" in app_js.text
+    assert "window.location.protocol" in app_js.text
+    assert "/v1/dashboard/qr?url=" in app_js.text
+    assert "api.qrserver.com" not in app_js.text
+    assert "SpeechRecognition" in app_js.text
+    assert "停止录音" in app_js.text
+    assert "8 秒未检测到语音，已自动停止" in app_js.text
+    assert "voiceRecognition.stop()" in app_js.text
     qr = client.get("/v1/dashboard/qr", params={"url": "http://192.168.1.20:8000/dashboard"})
     assert qr.status_code == 200
-    assert qr.headers["content-type"].startswith("image/svg+xml")
-    assert b"<svg" in qr.content
+    assert qr.headers["content-type"].startswith("image/png")
+    assert qr.content.startswith(b"\x89PNG\r\n\x1a\n")
     assert client.get("/v1/dashboard/qr", params={"url": "/dashboard"}).status_code == 400
     assert client.get("/v1/reports/water").status_code == 200
     assert client.get("/v1/events").status_code == 200

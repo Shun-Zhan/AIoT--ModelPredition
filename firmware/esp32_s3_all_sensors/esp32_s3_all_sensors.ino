@@ -14,17 +14,19 @@
     All devices use 4800 8N1. The soil address is 0x03; solar addresses are
     0x01 and 0x02.
 
-  Wi-Fi provisioning:
-    USB serial remains the primary telemetry/control transport. On a fresh
-    flash (or after @WIFI_RESET over USB), the ESP32 opens a temporary
+  Wi-Fi provisioning and telemetry:
+    On a fresh flash (or after @WIFI_RESET over USB), the ESP32 opens a temporary
     AIOT-SETUP-xxxxxx Wi-Fi network. A phone can use its local configuration
     page to store any normal 2.4 GHz WPA2 Wi-Fi/hotspot credential in ESP32
-    NVS. Credentials never live in this source file or Git.
+    NVS. After joining the network the ESP32 exposes its telemetry/control
+    TCP endpoint as esp32-sensors.local:3333. Credentials never live in this
+    source file or Git.
 */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
@@ -36,6 +38,10 @@ static const uint32_t PC_BAUD = 115200;
 // returns to frequent sampling rather than an unattended low-power mode.
 static const uint32_t DEFAULT_READ_INTERVAL_MS = 2000;
 static const uint32_t IRRIGATION_MAX_READ_INTERVAL_MS = 5000;
+// The lightweight edge estimator deliberately runs much less often than
+// sensor acquisition.  It is a safe, explainable fallback while the computer
+// gateway or network is unavailable; it never opens the valve by itself.
+static const uint32_t EDGE_PREDICTION_INTERVAL_MS = 5UL * 60UL * 1000UL;
 
 // The USB cable used to upload this sketch can also carry telemetry to the
 // local computer.  Each sample is emitted as one line beginning with
@@ -71,10 +77,9 @@ char samplingMode[32] = "DEBUG";
 
 // -------------------- Wi-Fi provisioning and legacy TCP telemetry --------------------
 
-// USB is still the default telemetry/control path. Wi-Fi provisioning merely
-// lets the device join normal 2.4 GHz WPA2 home/router/phone/Windows-hotspot
-// networks without recompiling. It uses DHCP; never set a static IP for an
-// arbitrary hotspot.
+// Saved credentials let the ESP32 join normal 2.4 GHz WPA2
+// home/router/phone/Windows-hotspot networks without recompiling. It uses
+// DHCP; never set a static IP for an arbitrary hotspot.
 static const bool WIFI_PROVISIONING_ENABLED = true;
 static const char *WIFI_PREFERENCES_NAMESPACE = "aiot_wifi";
 static const char *WIFI_PREFERENCE_SSID_KEY = "ssid";
@@ -82,32 +87,27 @@ static const char *WIFI_PREFERENCE_PASSWORD_KEY = "password";
 static const char *WIFI_SETUP_AP_PREFIX = "AIOT-SETUP-";
 static const char *WIFI_SETUP_AP_PASSWORD = "12345678";
 static const uint8_t WIFI_SETUP_AP_MAX_CLIENTS = 2;
+// Use a fixed, broadly supported 2.4 GHz channel for the temporary portal.
+// More importantly, the portal below runs as a pure AP. On this ESP32-S3,
+// switching directly from a failed STA association to AP+STA can report
+// success while not actually beaconing an SSID.
+static const uint8_t WIFI_SETUP_AP_CHANNEL = 6;
+static const IPAddress WIFI_SETUP_AP_IP(192, 168, 4, 1);
+static const IPAddress WIFI_SETUP_AP_GATEWAY(192, 168, 4, 1);
+static const IPAddress WIFI_SETUP_AP_SUBNET(255, 255, 255, 0);
 static const uint32_t WIFI_PROVISION_CONNECT_TIMEOUT_MS = 20000;
 static const uint32_t WIFI_PROVISION_RETRY_INTERVAL_MS = 30000;
 
-// This is an optional, legacy direct-TCP telemetry server. Leave it false for
-// the competition USB architecture. The provisioning portal above is still
-// available when this remains false.
-static const bool WIFI_TELEMETRY_ENABLED = false;
-static const bool WIFI_USE_SOFT_AP = false;
-static const char *WIFI_AP_SSID = "ESP32-S3-IOT";
-static const char *WIFI_AP_PASSWORD = "12345678";
-#if __has_include("wifi_credentials.h")
-#include "wifi_credentials.h"
-#else
-static const char *ROUTER_SSID = "YOUR_WIFI_SSID";
-static const char *ROUTER_PASSWORD = "YOUR_WIFI_PASSWORD";
-// Change these to match the IPv4 address of Windows "Local Area
-// Connection*" shown by ipconfig, or set this to false to use DHCP.
-static const bool USE_WINDOWS_HOTSPOT_STATIC_IP = true;
-static IPAddress WINDOWS_HOTSPOT_IP(10, 98, 128, 50);
-static IPAddress WINDOWS_HOTSPOT_GATEWAY(10, 98, 128, 1);
-static IPAddress WINDOWS_HOTSPOT_SUBNET(255, 255, 255, 0);
-static IPAddress WINDOWS_HOTSPOT_DNS(10, 98, 128, 1);
-#endif
+// The PC connects to this local TCP endpoint over the same Wi-Fi and forwards
+// each packet into FastAPI. USB remains useful for flashing/debugging, but is
+// no longer required for normal dashboard telemetry.
+static const bool WIFI_TELEMETRY_ENABLED = true;
 static const char *MDNS_HOSTNAME = "esp32-sensors";
 static const uint16_t TCP_PORT = 3333;
-static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+// UDP broadcast lets the PC receiver find a DHCP-assigned ESP32 address even
+// on hotspots that do not support esp32-sensors.local / mDNS.
+static const uint16_t TCP_DISCOVERY_PORT = 3334;
+static const uint32_t TCP_DISCOVERY_INTERVAL_MS = 3000;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 static const uint32_t WIFI_STATUS_PRINT_INTERVAL_MS = 10000;
 
@@ -219,11 +219,14 @@ HardwareSerial DisplaySerial(0);
 TwoWire AhtWire(1);
 WiFiServer TcpServer(TCP_PORT);
 WiFiClient TcpClient;
+WiFiUDP TcpDiscoveryUdp;
 WebServer WifiSetupServer(80);
 Preferences WifiPreferences;
 
 bool wifiReady = false;
+bool wifiMdnsReady = false;
 uint32_t lastWifiRetryMs = 0;
+uint32_t lastTcpDiscoveryMs = 0;
 bool wifiProvisioningInitialized = false;
 bool wifiSetupPortalActive = false;
 bool wifiSetupRoutesRegistered = false;
@@ -240,6 +243,7 @@ char wifiSetupApPassword[20] = {};
 // Declared here because the USB control parser is defined before the Wi-Fi
 // provisioning implementation below.
 void resetWifiProvisioningFromUsb();
+bool startWifi();
 
 struct DisplayForecast {
   bool received;
@@ -315,6 +319,22 @@ struct SensorSnapshot {
   uint16_t solarRadiation2Wm2;
 };
 
+// This is intentionally not the PC's N-BEATS + LSTM model.  It is a small
+// C++ evapotranspiration-inspired trend estimate that fits comfortably on the
+// ESP32-S3 and remains available without Wi-Fi or a Python runtime.
+struct EdgePrediction {
+  bool valid;
+  float predictedSoilMoisture30mPercent;
+  float dryingRatePercentPerHour;
+  const char *riskLevel;
+  const char *reason;
+  uint32_t updatedUptimeMs;
+};
+
+EdgePrediction latestEdgePrediction = {
+    false, 0.0f, 0.0f, "SENSOR_INVALID", "sensor_invalid", 0};
+uint32_t lastEdgePredictionMs = 0;
+
 void setValveRelay(bool open) {
   valveOpen = open;
   digitalWrite(VALVE_RELAY_PIN,
@@ -356,20 +376,34 @@ void sendValveAck(const char *requestId, bool accepted, const char *reason) {
   if (valveOpen && valveCloseAtMs != 0 && static_cast<int32_t>(valveCloseAtMs - millis()) > 0) {
     remaining = (valveCloseAtMs - millis() + 999) / 1000;
   }
-  Serial.printf(
+  char packet[384];
+  const int written = snprintf(
+      packet, sizeof(packet),
       "%s{\"requestId\":\"%s\",\"accepted\":%s,\"actualState\":\"%s\","
       "\"reason\":\"%s\",\"remainingSeconds\":%lu}\n",
       USB_ACK_PREFIX, requestId, accepted ? "true" : "false",
       valveOpen ? "OPEN" : "CLOSED", reason,
       static_cast<unsigned long>(remaining));
+  if (written <= 0 || written >= static_cast<int>(sizeof(packet))) return;
+  Serial.write(reinterpret_cast<const uint8_t *>(packet), written);
+  if (WIFI_TELEMETRY_ENABLED && TcpClient && TcpClient.connected()) {
+    TcpClient.write(reinterpret_cast<const uint8_t *>(packet), written);
+  }
 }
 
 void sendConfigAck(const char *requestId, bool accepted, const char *reason) {
-  Serial.printf(
+  char packet[384];
+  const int written = snprintf(
+      packet, sizeof(packet),
       "%s{\"requestId\":\"%s\",\"accepted\":%s,\"samplingMode\":\"%s\","
       "\"readIntervalMs\":%lu,\"reason\":\"%s\"}\n",
       USB_CONFIG_ACK_PREFIX, requestId, accepted ? "true" : "false", samplingMode,
       static_cast<unsigned long>(readIntervalMs), reason);
+  if (written <= 0 || written >= static_cast<int>(sizeof(packet))) return;
+  Serial.write(reinterpret_cast<const uint8_t *>(packet), written);
+  if (WIFI_TELEMETRY_ENABLED && TcpClient && TcpClient.connected()) {
+    TcpClient.write(reinterpret_cast<const uint8_t *>(packet), written);
+  }
 }
 
 bool validSamplingConfiguration(const char *mode, int intervalMs) {
@@ -481,6 +515,23 @@ void handleValveCommand(const char *json) {
   sendValveAck(requestId, false, "action_not_allowed");
 }
 
+void handleDisplayCommand(const char *line);
+
+void handleHostControlLine(const char *line, bool allowWifiReset) {
+  if (strcmp(line, "@HEARTBEAT") == 0) {
+    lastHostHeartbeatMs = millis();
+  } else if (allowWifiReset && strcmp(line, USB_WIFI_RESET_COMMAND) == 0) {
+    resetWifiProvisioningFromUsb();
+  } else if (strncmp(line, USB_COMMAND_PREFIX, strlen(USB_COMMAND_PREFIX)) == 0) {
+    lastHostHeartbeatMs = millis();
+    handleValveCommand(line + strlen(USB_COMMAND_PREFIX));
+  } else if (strncmp(line, USB_CONFIG_PREFIX, strlen(USB_CONFIG_PREFIX)) == 0) {
+    handleSamplingConfig(line + strlen(USB_CONFIG_PREFIX));
+  } else {
+    handleDisplayCommand(line);
+  }
+}
+
 void serviceUsbControl() {
   static char line[1024] = {};
   static size_t length = 0;
@@ -489,16 +540,7 @@ void serviceUsbControl() {
     if (value < 0) break;
     if (value == '\n') {
       line[length] = '\0';
-      if (strcmp(line, "@HEARTBEAT") == 0) {
-        lastHostHeartbeatMs = millis();
-      } else if (strcmp(line, USB_WIFI_RESET_COMMAND) == 0) {
-        resetWifiProvisioningFromUsb();
-      } else if (strncmp(line, USB_COMMAND_PREFIX, strlen(USB_COMMAND_PREFIX)) == 0) {
-        lastHostHeartbeatMs = millis();
-        handleValveCommand(line + strlen(USB_COMMAND_PREFIX));
-      } else if (strncmp(line, USB_CONFIG_PREFIX, strlen(USB_CONFIG_PREFIX)) == 0) {
-        handleSamplingConfig(line + strlen(USB_CONFIG_PREFIX));
-      }
+      handleHostControlLine(line, true);
       length = 0;
     } else if (value != '\r' && length < sizeof(line) - 1) {
       line[length++] = static_cast<char>(value);
@@ -1421,14 +1463,34 @@ void stopWifiSetupPortal() {
 }
 
 void startWifiSetupPortal() {
-  if (!WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED || wifiSetupPortalActive) {
+  if (!WIFI_PROVISIONING_ENABLED || wifiSetupPortalActive) {
     return;
   }
 
+  // The station association and TCP stream are no longer valid while the
+  // temporary configuration AP is active.
+  if (TcpClient) TcpClient.stop();
+  wifiReady = false;
+  if (wifiMdnsReady) {
+    MDNS.end();
+    wifiMdnsReady = false;
+  }
   buildWifiSetupAccessPointCredentials();
-  WiFi.mode(WIFI_AP_STA);
+
+  // A full radio transition is intentional. It fixes an ESP32-S3 edge case
+  // observed after a failed phone-hotspot association: softAP() returned true
+  // in AP+STA mode, but no phone or Mac could see the SSID over the air.
+  // Credentials live in Preferences, so WIFI_OFF does not erase them.
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+  WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
-  if (!WiFi.softAP(wifiSetupApSsid, wifiSetupApPassword, 1, false,
+  if (!WiFi.softAPConfig(WIFI_SETUP_AP_IP, WIFI_SETUP_AP_GATEWAY,
+                         WIFI_SETUP_AP_SUBNET)) {
+    Serial.println("[Wi-Fi setup] Failed to configure access-point IP.");
+  }
+  if (!WiFi.softAP(wifiSetupApSsid, wifiSetupApPassword, WIFI_SETUP_AP_CHANNEL, false,
                    WIFI_SETUP_AP_MAX_CLIENTS)) {
     Serial.println("[Wi-Fi setup] Failed to start configuration access point.");
     return;
@@ -1440,12 +1502,14 @@ void startWifiSetupPortal() {
   Serial.printf("Connect phone to: %s\n", wifiSetupApSsid);
   Serial.printf("Setup password: %s\n", wifiSetupApPassword);
   Serial.printf("Open: http://%s/\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("AP mode=%d channel=%u IP=%s\n", static_cast<int>(WiFi.getMode()),
+                WIFI_SETUP_AP_CHANNEL, WiFi.softAPIP().toString().c_str());
   Serial.println("Only normal 2.4 GHz Wi-Fi/hotspots are supported by this portal.");
   Serial.println("--------------------------------");
 }
 
 void beginProvisionedWifiConnection() {
-  if (!WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED) {
+  if (!WIFI_PROVISIONING_ENABLED) {
     return;
   }
   if (!loadProvisionedWifiCredentials()) {
@@ -1454,6 +1518,12 @@ void beginProvisionedWifiConnection() {
   }
 
   stopWifiSetupPortal();
+  if (TcpClient) TcpClient.stop();
+  wifiReady = false;
+  if (wifiMdnsReady) {
+    MDNS.end();
+    wifiMdnsReady = false;
+  }
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
@@ -1467,7 +1537,7 @@ void beginProvisionedWifiConnection() {
 }
 
 void resetWifiProvisioningFromUsb() {
-  if (!WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED) {
+  if (!WIFI_PROVISIONING_ENABLED) {
     Serial.println("[Wi-Fi setup] Provisioning is disabled in this firmware build.");
     return;
   }
@@ -1482,7 +1552,7 @@ void resetWifiProvisioningFromUsb() {
 }
 
 void initWifiProvisioning() {
-  if (!WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED) {
+  if (!WIFI_PROVISIONING_ENABLED) {
     return;
   }
   if (!WifiPreferences.begin(WIFI_PREFERENCES_NAMESPACE, false)) {
@@ -1494,7 +1564,7 @@ void initWifiProvisioning() {
 }
 
 void serviceWifiProvisioning() {
-  if (!wifiProvisioningInitialized || !WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED) {
+  if (!wifiProvisioningInitialized || !WIFI_PROVISIONING_ENABLED) {
     return;
   }
 
@@ -1515,6 +1585,9 @@ void serviceWifiProvisioning() {
       wifiProvisioningNextRetryMs = millis() + WIFI_PROVISION_RETRY_INTERVAL_MS;
       Serial.printf("[Wi-Fi] Connected. SSID=%s IP=%s RSSI=%d dBm\n", WiFi.SSID().c_str(),
                     WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      if (WIFI_TELEMETRY_ENABLED && !startWifi()) {
+        Serial.println("[Wi-Fi] Connected, but the TCP telemetry server could not start.");
+      }
       return;
     }
     if (millis() - wifiProvisioningConnectStartedMs >= WIFI_PROVISION_CONNECT_TIMEOUT_MS) {
@@ -1527,6 +1600,9 @@ void serviceWifiProvisioning() {
     return;
   }
 
+  // Once credentials fail, keep the provisioning AP stable. A user may need
+  // several seconds to find and join it; do not repeatedly tear it down for
+  // background association attempts.
   if (!wifiSetupPortalActive && WiFi.status() != WL_CONNECTED &&
       static_cast<int32_t>(millis() - wifiProvisioningNextRetryMs) >= 0) {
     beginProvisionedWifiConnection();
@@ -1535,90 +1611,60 @@ void serviceWifiProvisioning() {
 
 void printWifiInfo() {
   Serial.println("----- Wi-Fi TCP telemetry -----");
-  Serial.print("Mode: ");
-  Serial.println(WIFI_USE_SOFT_AP ? "SoftAP" : "Station");
+  Serial.println("Mode: Station (saved provisioning credentials, DHCP)");
   Serial.print("SSID: ");
-  Serial.println(WIFI_USE_SOFT_AP ? WIFI_AP_SSID : ROUTER_SSID);
+  Serial.println(WiFi.SSID());
   Serial.print("IP address: ");
-  Serial.println(WIFI_USE_SOFT_AP ? WiFi.softAPIP() : WiFi.localIP());
+  Serial.println(WiFi.localIP());
+  Serial.print("Computer connects to: ");
+  Serial.print(MDNS_HOSTNAME);
+  Serial.print(".local:");
+  Serial.println(TCP_PORT);
   Serial.print("TCP server: ");
-  Serial.print(WIFI_USE_SOFT_AP ? WiFi.softAPIP() : WiFi.localIP());
+  Serial.print(WiFi.localIP());
   Serial.print(':');
   Serial.println(TCP_PORT);
   Serial.println("--------------------------------");
 }
 
-void printNearbyWifi() {
-  Serial.println("Wi-Fi scan after connection failure:");
-  const int count = WiFi.scanNetworks(false, true);
-  if (count <= 0) {
-    Serial.println("  no visible networks");
-  } else {
-    for (int i = 0; i < count; ++i) {
-      Serial.printf("  %s  RSSI=%d dBm  channel=%d  security=%d\n",
-                    WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
-                    static_cast<int>(WiFi.encryptionType(i)));
-    }
+IPAddress wifiBroadcastAddress() {
+  const IPAddress localIp = WiFi.localIP();
+  const IPAddress subnetMask = WiFi.subnetMask();
+  return IPAddress(static_cast<uint8_t>(localIp[0] | static_cast<uint8_t>(~subnetMask[0])),
+                   static_cast<uint8_t>(localIp[1] | static_cast<uint8_t>(~subnetMask[1])),
+                   static_cast<uint8_t>(localIp[2] | static_cast<uint8_t>(~subnetMask[2])),
+                   static_cast<uint8_t>(localIp[3] | static_cast<uint8_t>(~subnetMask[3])));
+}
+
+void announceTcpService(bool force = false) {
+  if (!wifiReady || WiFi.status() != WL_CONNECTED) {
+    return;
   }
-  WiFi.scanDelete();
+  const uint32_t now = millis();
+  if (!force && now - lastTcpDiscoveryMs < TCP_DISCOVERY_INTERVAL_MS) {
+    return;
+  }
+  lastTcpDiscoveryMs = now;
+
+  const char *announcement = "AIOT_DISCOVERY {\"service\":\"aiot-esp32\",\"port\":3333}\n";
+  TcpDiscoveryUdp.beginPacket(wifiBroadcastAddress(), TCP_DISCOVERY_PORT);
+  TcpDiscoveryUdp.write(reinterpret_cast<const uint8_t *>(announcement), strlen(announcement));
+  TcpDiscoveryUdp.endPacket();
 }
 
 bool startWifi() {
-  if (!WIFI_TELEMETRY_ENABLED) {
+  if (!WIFI_TELEMETRY_ENABLED || WiFi.status() != WL_CONNECTED) {
     return false;
   }
+  if (wifiReady) return true;
 
-  WiFi.mode(WIFI_USE_SOFT_AP ? WIFI_AP : WIFI_STA);
-
-  if (WIFI_USE_SOFT_AP) {
-    if (!WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD)) {
-      Serial.println("Wi-Fi SoftAP start failed.");
-      return false;
-    }
-  } else {
-    // Windows Mobile Hotspot can be sensitive to the station's power-save
-    // transition during the WPA2 handshake. Keep the radio awake and clear
-    // the previous association before starting a fresh connection attempt.
-    WiFi.setSleep(false);
-    WiFi.setAutoReconnect(true);
-    WiFi.disconnect(false);
-    delay(200);
-    if (USE_WINDOWS_HOTSPOT_STATIC_IP) {
-      if (!WiFi.config(WINDOWS_HOTSPOT_IP, WINDOWS_HOTSPOT_GATEWAY,
-                       WINDOWS_HOTSPOT_SUBNET, WINDOWS_HOTSPOT_DNS)) {
-        Serial.println("Static Windows hotspot IP configuration failed.");
-      } else {
-        Serial.printf("Static IP configured: %s\n",
-                      WINDOWS_HOTSPOT_IP.toString().c_str());
-      }
-    }
-    WiFi.begin(ROUTER_SSID, ROUTER_PASSWORD);
-    Serial.print("Connecting to router Wi-Fi");
-
-    const uint32_t startMs = millis();
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - startMs < WIFI_CONNECT_TIMEOUT_MS) {
-      delay(250);
-      Serial.print('.');
-    }
-    Serial.println();
-
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.printf("Router Wi-Fi connection timeout (status=%d).\n",
-                    static_cast<int>(WiFi.status()));
-      Serial.printf("Associated SSID: %s, BSSID: %s, local IP: %s\n",
-                    WiFi.SSID().c_str(), WiFi.BSSIDstr().c_str(),
-                    WiFi.localIP().toString().c_str());
-      WiFi.printDiag(Serial);
-      printNearbyWifi();
-      return false;
-    }
-
-    if (MDNS.begin(MDNS_HOSTNAME)) {
+  if (!wifiMdnsReady) {
+    wifiMdnsReady = MDNS.begin(MDNS_HOSTNAME);
+    if (wifiMdnsReady) {
       MDNS.addService("iot-sensor", "tcp", TCP_PORT);
       Serial.printf("mDNS host: %s.local\n", MDNS_HOSTNAME);
     } else {
-      Serial.println("mDNS start failed; use the printed IP address.");
+      Serial.println("mDNS start failed; start the PC receiver with the printed IP address.");
     }
   }
 
@@ -1626,6 +1672,7 @@ bool startWifi() {
   TcpServer.setNoDelay(true);
   wifiReady = true;
   printWifiInfo();
+  announceTcpService(true);
   return true;
 }
 
@@ -1666,7 +1713,10 @@ void forwardTcpToUsbSerial() {
       line[lineLength] = '\0';
       if (lineLength > 0) {
         Serial.printf("[TCP RX] %s\n", line);
-        handleDisplayCommand(line);
+        // Wi-Fi carries the same signed/validated command protocol as USB.
+        // It deliberately does not accept @WIFI_RESET; physical USB is
+        // required to erase saved network credentials.
+        handleHostControlLine(line, false);
       }
       lineLength = 0;
       continue;
@@ -1720,7 +1770,7 @@ void serviceWifi() {
                   WiFi.RSSI());
   }
 
-  if (!WIFI_USE_SOFT_AP && WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Router Wi-Fi disconnected.");
     TcpClient.stop();
     wifiReady = false;
@@ -1729,6 +1779,7 @@ void serviceWifi() {
   }
 
   acceptTcpClient();
+  announceTcpService();
   forwardTcpToUsbSerial();
   forwardUsbSerialToTcp();
   serviceDisplayProtocol();
@@ -1739,7 +1790,87 @@ void serviceWifi() {
   }
 }
 
-void sendTelemetry(const SensorSnapshot &snapshot) {
+float averageWindSpeed(const SensorSnapshot &snapshot) {
+  float total = 0.0f;
+  uint8_t count = 0;
+  if (snapshot.wind1Ok) {
+    total += snapshot.wind1SpeedMs;
+    ++count;
+  }
+  if (snapshot.wind2Ok) {
+    total += snapshot.wind2SpeedMs;
+    ++count;
+  }
+  return count > 0 ? total / count : 0.0f;
+}
+
+float averageSolarRadiation(const SensorSnapshot &snapshot) {
+  uint32_t total = 0;
+  uint8_t count = 0;
+  if (snapshot.solar1Ok) {
+    total += snapshot.solarRadiation1Wm2;
+    ++count;
+  }
+  if (snapshot.solar2Ok) {
+    total += snapshot.solarRadiation2Wm2;
+    ++count;
+  }
+  return count > 0 ? static_cast<float>(total) / count : 0.0f;
+}
+
+EdgePrediction updateEdgePrediction(const SensorSnapshot &snapshot) {
+  const bool inputsValid = snapshot.airOk && snapshot.soilOk &&
+                           snapshot.AirPressure > 0 &&
+                           (snapshot.solar1Ok || snapshot.solar2Ok);
+  if (!inputsValid) {
+    return {false, 0.0f, 0.0f, "SENSOR_INVALID", "sensor_invalid", millis()};
+  }
+
+  const uint32_t now = snapshot.uptimeMs;
+  if (!latestEdgePrediction.valid ||
+      now - lastEdgePredictionMs >= EDGE_PREDICTION_INTERVAL_MS) {
+    const float solarWm2 = averageSolarRadiation(snapshot);
+    const float windMs = averageWindSpeed(snapshot);
+    const float temperatureC = snapshot.air.temperatureC;
+    const float humidityPct = constrain(snapshot.air.humidityPercent, 0.0f, 100.0f);
+    const float humidityDeficit = (100.0f - humidityPct) / 100.0f;
+
+    // Unit: soil-moisture percentage points per hour.  The coefficients are
+    // conservative by design and serve as an explainable fallback trend,
+    // rather than a replacement for the trained time-series model on the PC.
+    const float baseDrying = 0.05f;
+    const float solarDrying = constrain(solarWm2, 0.0f, 1200.0f) * 0.0009f;
+    const float windDrying = constrain(windMs, 0.0f, 12.0f) * 0.05f;
+    const float heatDrying =
+        max(0.0f, temperatureC - 10.0f) * 0.018f * humidityDeficit;
+    float dryingRate = baseDrying + solarDrying + windDrying + heatDrying;
+    if (solarWm2 < 10.0f) {
+      dryingRate *= 0.45f;
+    }
+
+    const float predictedMoisture = constrain(
+        snapshot.soil.moisturePercent - dryingRate * 0.5f, 0.0f, 100.0f);
+    const char *riskLevel = "NORMAL";
+    const char *reason = "stable_soil";
+    if (predictedMoisture <= 20.0f) {
+      riskLevel = "DRY_RISK";
+      reason = "low_soil_moisture";
+    } else if (predictedMoisture <= 35.0f || dryingRate >= 0.60f) {
+      riskLevel = "ATTENTION";
+      reason = dryingRate >= 0.60f ? "rapid_drying" : "soil_moisture_declining";
+    } else if (solarWm2 >= 300.0f || windMs >= 4.0f) {
+      reason = "evaporation_observed";
+    }
+
+    latestEdgePrediction = {true, predictedMoisture, dryingRate, riskLevel,
+                            reason, now};
+    lastEdgePredictionMs = now;
+  }
+  return latestEdgePrediction;
+}
+
+void sendTelemetry(const SensorSnapshot &snapshot,
+                   const EdgePrediction &edgePrediction) {
   uint8_t validWindCount = 0;
   float averageWindVoltage = 0.0f;
   float averageWindSpeedMs = 0.0f;
@@ -1758,7 +1889,7 @@ void sendTelemetry(const SensorSnapshot &snapshot) {
     averageWindSpeedMs /= validWindCount;
   }
 
-  char packet[896];
+  char packet[1280];
   const int written = snprintf(
       packet,
       sizeof(packet),
@@ -1769,6 +1900,8 @@ void sendTelemetry(const SensorSnapshot &snapshot) {
       "\"air\":{\"ok\":%s,\"temperature_c\":%.2f,\"humidity_pct\":%.2f},"
       "\"soil\":{\"ok\":%s,\"temperature_c\":%.1f,\"moisture_pct\":%.1f},"
       "\"solar\":{\"sensor_1\":{\"ok\":%s,\"radiation_w_m2\":%u},\"sensor_2\":{\"ok\":%s,\"radiation_w_m2\":%u}},"
+      "\"edge_prediction\":{\"valid\":%s,\"mode\":\"edge_fallback\",\"predicted_soil_moisture_30m_pct\":%.1f,"
+      "\"drying_rate_pct_per_h\":%.3f,\"risk_level\":\"%s\",\"reason\":\"%s\",\"updated_uptime_ms\":%lu},"
       "\"display\":{\"enabled\":%s,\"rx_bytes\":%lu,\"handshake_ok\":%s}}\n",
       static_cast<unsigned long>(snapshot.uptimeMs),
       validWindCount > 0 ? "true" : "false",
@@ -1791,6 +1924,12 @@ void sendTelemetry(const SensorSnapshot &snapshot) {
       snapshot.solarRadiation1Wm2,
       snapshot.solar2Ok ? "true" : "false",
       snapshot.solarRadiation2Wm2,
+      edgePrediction.valid ? "true" : "false",
+      edgePrediction.predictedSoilMoisture30mPercent,
+      edgePrediction.dryingRatePercentPerHour,
+      edgePrediction.riskLevel,
+      edgePrediction.reason,
+      static_cast<unsigned long>(edgePrediction.updatedUptimeMs),
       DISPLAY_ENABLED ? "true" : "false",
       static_cast<unsigned long>(displayRxBytes),
       displayHandshakeConfirmed ? "true" : "false");
@@ -1862,19 +2001,15 @@ void setup() {
                 SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN, SOLAR_BAUD,
                 SOLAR_1_ADDR, SOLAR_2_ADDR);
 
+  Serial.printf("USB serial telemetry enabled at %lu baud.\n",
+                static_cast<unsigned long>(PC_BAUD));
   if (WIFI_TELEMETRY_ENABLED) {
-    if (!startWifi()) {
-      Serial.println("Wi-Fi is unavailable; sensor collection will continue and Wi-Fi will retry.");
-      lastWifiRetryMs = millis();
-    }
+    Serial.println("Wi-Fi TCP telemetry enabled: Dashboard can receive data without USB after provisioning.");
+  }
+  if (WIFI_PROVISIONING_ENABLED) {
+    Serial.println("Wi-Fi provisioning enabled: use the setup portal to join a normal 2.4 GHz network.");
   } else {
-    Serial.printf("USB serial telemetry enabled at %lu baud.\n",
-                  static_cast<unsigned long>(PC_BAUD));
-    if (WIFI_PROVISIONING_ENABLED) {
-      Serial.println("Wi-Fi provisioning enabled: use the setup portal only to join a normal 2.4 GHz network.");
-    } else {
-      Serial.println("Wi-Fi transport and provisioning disabled.");
-    }
+    Serial.println("Wi-Fi provisioning disabled.");
   }
   initWifiProvisioning();
 
@@ -1991,8 +2126,17 @@ void loop() {
       (snapshot.wind1Ok || snapshot.wind2Ok) && snapshot.AirPressure > 0 &&
       snapshot.airOk && snapshot.soilOk &&
       (snapshot.solar1Ok || snapshot.solar2Ok);
+  const EdgePrediction edgePrediction = updateEdgePrediction(snapshot);
+  if (edgePrediction.valid) {
+    Serial.printf("ESP32 edge prediction: soil in 30 min %.1f %% | drying %.3f %%/h | %s (%s)\n",
+                  edgePrediction.predictedSoilMoisture30mPercent,
+                  edgePrediction.dryingRatePercentPerHour,
+                  edgePrediction.riskLevel, edgePrediction.reason);
+  } else {
+    Serial.println("ESP32 edge prediction: unavailable (sensor_invalid).");
+  }
   serviceUsbControl();
   updateDisplay(snapshot);
-  sendTelemetry(snapshot);
+  sendTelemetry(snapshot, edgePrediction);
   Serial.println("=================================");
 }

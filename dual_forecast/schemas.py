@@ -19,6 +19,19 @@ class SoilData(BaseModel):
     moisturePercent: float
 
 
+class EdgePrediction(BaseModel):
+    """Small ESP32-resident fallback prediction, separate from the PC model."""
+
+    model_config = ConfigDict(extra="forbid")
+    valid: bool
+    mode: Literal["edge_fallback"]
+    predictedSoilMoisture30mPercent: float | None = Field(default=None, ge=0, le=100)
+    dryingRatePercentPerHour: float | None = Field(default=None, ge=0, le=10)
+    riskLevel: Literal["NORMAL", "ATTENTION", "DRY_RISK", "SENSOR_INVALID"]
+    reason: str = Field(min_length=1, max_length=64)
+    updatedUptimeMs: int = Field(ge=0, le=0xFFFFFFFF)
+
+
 class SensorSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     uptimeMs: int = Field(ge=0, le=0xFFFFFFFF)
@@ -34,6 +47,7 @@ class SensorSnapshot(BaseModel):
     solar2Ok: bool
     solarRadiation2Wm2: int = Field(ge=0, le=65535)
     airPressureHpa: int = Field(ge=0, le=65535)
+    edgePrediction: EdgePrediction | None = None
     receivedAt: datetime | None = None
 
     @model_validator(mode="before")
