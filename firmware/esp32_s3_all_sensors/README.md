@@ -1,6 +1,6 @@
 # ESP32-S3 全传感器与安全水阀固件
 
-用 Arduino IDE 打开 `esp32_s3_all_sensors.ino`，板型选择 `Adafruit Feather ESP32-S3 No PSRAM`。固件只依赖 ESP32 Arduino Core 自带组件，无需额外安装 Arduino 库。当前使用烧录 USB 线传输数据和命令，Wi-Fi 与旧串口屏均关闭。
+用 Arduino IDE 打开 `esp32_s3_all_sensors.ino`，板型选择 `Adafruit Feather ESP32-S3 No PSRAM`。固件只依赖 ESP32 Arduino Core 自带组件，无需额外安装 Arduino 库。当前使用烧录 USB 线传输数据和命令；Wi-Fi 仅用于可选的手机配网和设备联网，不替代 USB 的传感器闭环与水阀安全控制。
 
 ## 引脚总表
 
@@ -62,6 +62,36 @@ AHT20 与 BMP280 使用两组独立 I²C。AHT20：VCC→3.3 V、GND→GND、SDA
 
 Arduino 串口监视器和 `dual-forecast receive-esp32-serial` 不能同时打开。macOS 端口一般类似 `/dev/cu.wchusbserial10`，Windows 为 `COM3` 等。
 
+## 手机 Wi-Fi 配网（普通热点/路由器）
+
+固件不会把 Wi-Fi 名称或密码写在源码中。首次烧录、ESP32 未保存网络、或通过 USB 发送 `@WIFI_RESET` 后，设备会在串口打印类似：
+
+```text
+----- Wi-Fi setup portal -----
+Connect phone to: AIOT-SETUP-12AB34
+Setup password: aiot-12AB34
+Open: http://192.168.4.1/
+```
+
+操作步骤：
+
+1. 手机连接串口中显示的 `AIOT-SETUP-xxxxxx`，密码也是串口中显示的 `aiot-xxxxxx`。
+2. 在手机浏览器打开 `http://192.168.4.1/`。
+3. 填入当前网络的 SSID 与密码，提交后等待约 20 秒。
+4. ESP32 会用 DHCP 自动获取 IP，并在 USB 串口打印 `Connected. SSID=... IP=...`。
+
+已保存网络会在后续上电时自动尝试连接；连接失败约 20 秒后会再次开启 `AIOT-SETUP-xxxxxx`，让手机重配。真实凭据只保存在该 ESP32 的 NVS 闪存中，不会进入 Git，也不会在串口或网页回显保存的密码。
+
+支持范围：普通 **2.4 GHz** WPA2 Wi-Fi、手机热点、Windows 移动热点、家用路由器。ESP32-S3 不支持 5 GHz；需要网页跳转、扫码、验证码的校园网通常无法直接稳定接入；802.1X 学号/密码校园网需要另行按学校 EAP 认证方式适配。不要尝试绕过学校网络认证或设备接入策略。
+
+这项配网功能只让 ESP32 获得网络连接，不会把 Dashboard 或开阀控制暴露到公网。当前稳定主链路仍是：
+
+```text
+ESP32 → USB 串口 → 电脑接收器 / 本地预测 / Dashboard →（可选）云端大模型
+```
+
+若使用电脑热点供手机查看 Dashboard，电脑用 `-Lan` / `--lan` 启动 Dashboard，手机和电脑连同一个热点后访问电脑 IPv4 的 `/dashboard`；这与 ESP32 是否已完成配网是两件独立的事。
+
 ## 编译
 
 ```bash
@@ -71,4 +101,4 @@ arduino-cli compile \
   firmware/esp32_s3_all_sensors
 ```
 
-若未来恢复 Wi-Fi TCP，可把 `WIFI_TELEMETRY_ENABLED` 改为 `true`，并使用未提交的 `wifi_credentials.h`。当前比赛闭环默认使用 USB，避免热点和网络切换影响现场演示。
+如需恢复旧的 Wi-Fi TCP 测试服务器，可将 `WIFI_TELEMETRY_ENABLED` 改为 `true`，并使用未提交的 `wifi_credentials.h`；该旧模式与手机配网模式互斥。当前比赛闭环默认使用 USB，避免热点和网络切换影响现场演示。

@@ -14,16 +14,19 @@
     All devices use 4800 8N1. The soil address is 0x03; solar addresses are
     0x01 and 0x02.
 
-  Wi-Fi/TCP:
-    The default SoftAP is ESP32-S3-IOT / 12345678. Connect a computer to this
-    Wi-Fi, then use a TCP client to connect to 192.168.4.1:3333. Every sample
-    is sent as one JSON line. Wi-Fi uses the ESP32-S3's built-in radio and
-    does not occupy an external GPIO.
+  Wi-Fi provisioning:
+    USB serial remains the primary telemetry/control transport. On a fresh
+    flash (or after @WIFI_RESET over USB), the ESP32 opens a temporary
+    AIOT-SETUP-xxxxxx Wi-Fi network. A phone can use its local configuration
+    page to store any normal 2.4 GHz WPA2 Wi-Fi/hotspot credential in ESP32
+    NVS. Credentials never live in this source file or Git.
 */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
 #include <ESPmDNS.h>
 
 // -------------------- Common --------------------
@@ -44,6 +47,7 @@ static const char *USB_COMMAND_PREFIX = "@COMMAND ";
 static const char *USB_ACK_PREFIX = "@ACK ";
 static const char *USB_CONFIG_PREFIX = "@CONFIG ";
 static const char *USB_CONFIG_ACK_PREFIX = "@CONFIG_ACK ";
+static const char *USB_WIFI_RESET_COMMAND = "@WIFI_RESET";
 
 // -------------------- Water valve relay --------------------
 
@@ -65,13 +69,24 @@ char lastRequestId[101] = {};
 uint32_t readIntervalMs = DEFAULT_READ_INTERVAL_MS;
 char samplingMode[32] = "DEBUG";
 
-// -------------------- Wi-Fi TCP telemetry --------------------
+// -------------------- Wi-Fi provisioning and legacy TCP telemetry --------------------
 
-// Set false to let the ESP32-S3 join the computer's shared/mobile-hotspot
-// Wi-Fi. Fill in ROUTER_SSID and ROUTER_PASSWORD before compiling.
-// Keep true only for the standalone ESP32 hotspot mode.
-// USB serial telemetry is the default transport in this revision, so Wi-Fi
-// is disabled and no hotspot/network configuration is required.
+// USB is still the default telemetry/control path. Wi-Fi provisioning merely
+// lets the device join normal 2.4 GHz WPA2 home/router/phone/Windows-hotspot
+// networks without recompiling. It uses DHCP; never set a static IP for an
+// arbitrary hotspot.
+static const bool WIFI_PROVISIONING_ENABLED = true;
+static const char *WIFI_PREFERENCES_NAMESPACE = "aiot_wifi";
+static const char *WIFI_PREFERENCE_SSID_KEY = "ssid";
+static const char *WIFI_PREFERENCE_PASSWORD_KEY = "password";
+static const char *WIFI_SETUP_AP_PREFIX = "AIOT-SETUP-";
+static const uint8_t WIFI_SETUP_AP_MAX_CLIENTS = 2;
+static const uint32_t WIFI_PROVISION_CONNECT_TIMEOUT_MS = 20000;
+static const uint32_t WIFI_PROVISION_RETRY_INTERVAL_MS = 30000;
+
+// This is an optional, legacy direct-TCP telemetry server. Leave it false for
+// the competition USB architecture. The provisioning portal above is still
+// available when this remains false.
 static const bool WIFI_TELEMETRY_ENABLED = false;
 static const bool WIFI_USE_SOFT_AP = false;
 static const char *WIFI_AP_SSID = "ESP32-S3-IOT";
@@ -203,9 +218,27 @@ HardwareSerial DisplaySerial(0);
 TwoWire AhtWire(1);
 WiFiServer TcpServer(TCP_PORT);
 WiFiClient TcpClient;
+WebServer WifiSetupServer(80);
+Preferences WifiPreferences;
 
 bool wifiReady = false;
 uint32_t lastWifiRetryMs = 0;
+bool wifiProvisioningInitialized = false;
+bool wifiSetupPortalActive = false;
+bool wifiSetupRoutesRegistered = false;
+bool wifiProvisioningConnecting = false;
+bool wifiProvisioningConnectPending = false;
+uint32_t wifiProvisioningConnectStartedMs = 0;
+uint32_t wifiProvisioningConnectAtMs = 0;
+uint32_t wifiProvisioningNextRetryMs = 0;
+char provisionedWifiSsid[33] = {};
+char provisionedWifiPassword[65] = {};
+char wifiSetupApSsid[32] = {};
+char wifiSetupApPassword[20] = {};
+
+// Declared here because the USB control parser is defined before the Wi-Fi
+// provisioning implementation below.
+void resetWifiProvisioningFromUsb();
 
 struct DisplayForecast {
   bool received;
@@ -457,6 +490,8 @@ void serviceUsbControl() {
       line[length] = '\0';
       if (strcmp(line, "@HEARTBEAT") == 0) {
         lastHostHeartbeatMs = millis();
+      } else if (strcmp(line, USB_WIFI_RESET_COMMAND) == 0) {
+        resetWifiProvisioningFromUsb();
       } else if (strncmp(line, USB_COMMAND_PREFIX, strlen(USB_COMMAND_PREFIX)) == 0) {
         lastHostHeartbeatMs = millis();
         handleValveCommand(line + strlen(USB_COMMAND_PREFIX));
@@ -1253,6 +1288,253 @@ void setupRs485DirectionPin(int pin) {
   }
 }
 
+// -------------------- Phone Wi-Fi provisioning --------------------
+
+// This local portal is deliberately separate from the computer-side
+// Dashboard. It only stores the SSID/password on this ESP32 and never offers
+// a valve-control endpoint. The USB protocol remains the sole control path.
+void startWifiSetupPortal();
+void beginProvisionedWifiConnection();
+
+void buildWifiSetupAccessPointCredentials() {
+  const uint32_t suffix = static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFFFFULL);
+  snprintf(wifiSetupApSsid, sizeof(wifiSetupApSsid), "%s%06lX", WIFI_SETUP_AP_PREFIX,
+           static_cast<unsigned long>(suffix));
+  // Per-device WPA2 password. It is printed on USB serial when the portal
+  // starts, so a nearby device cannot silently reconfigure Wi-Fi credentials.
+  snprintf(wifiSetupApPassword, sizeof(wifiSetupApPassword), "aiot-%06lX",
+           static_cast<unsigned long>(suffix));
+}
+
+bool loadProvisionedWifiCredentials() {
+  const String ssid = WifiPreferences.getString(WIFI_PREFERENCE_SSID_KEY, "");
+  const String password = WifiPreferences.getString(WIFI_PREFERENCE_PASSWORD_KEY, "");
+  if (ssid.isEmpty() || ssid.length() > 32 || password.length() > 63) {
+    provisionedWifiSsid[0] = '\0';
+    provisionedWifiPassword[0] = '\0';
+    return false;
+  }
+  strlcpy(provisionedWifiSsid, ssid.c_str(), sizeof(provisionedWifiSsid));
+  strlcpy(provisionedWifiPassword, password.c_str(), sizeof(provisionedWifiPassword));
+  return true;
+}
+
+bool saveProvisionedWifiCredentials(const String &ssid, const String &password) {
+  if (ssid.isEmpty() || ssid.length() > 32 || password.length() > 63) {
+    return false;
+  }
+  // A non-empty WPA2 personal password must have at least eight characters.
+  // Empty remains allowed for an intentionally open network.
+  if (!password.isEmpty() && password.length() < 8) {
+    return false;
+  }
+  if (WifiPreferences.putString(WIFI_PREFERENCE_SSID_KEY, ssid) == 0 ||
+      WifiPreferences.putString(WIFI_PREFERENCE_PASSWORD_KEY, password) == 0) {
+    return false;
+  }
+  strlcpy(provisionedWifiSsid, ssid.c_str(), sizeof(provisionedWifiSsid));
+  strlcpy(provisionedWifiPassword, password.c_str(), sizeof(provisionedWifiPassword));
+  return true;
+}
+
+String wifiSetupPage(const String &notice = "") {
+  String page;
+  page.reserve(2600);
+  page += F("<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>AIoT Wi-Fi 配网</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"
+            "'Segoe UI',sans-serif;background:#f3f7f5;color:#18332b;margin:0;padding:24px}main{max-width:"
+            "520px;margin:auto;background:#fff;border-radius:16px;padding:24px;box-shadow:0 6px 24px #0002}"
+            "h1{margin-top:0}label{display:block;font-weight:600;margin-top:16px}input{box-sizing:border-box;"
+            "width:100%;margin-top:6px;padding:12px;border:1px solid #b8c9c2;border-radius:8px;font-size:16px}"
+            "button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:8px;background:#16704a;"
+            "color:white;font-size:16px;font-weight:700}.note{background:#eef8f2;padding:12px;border-radius:8px}"
+            ".warn{background:#fff3d6;padding:12px;border-radius:8px}small{color:#52675f}</style><main>"
+            "<h1>AIoT Wi-Fi 配网</h1><p class='note'>这里只保存网络凭据；传感器数据与水阀控制仍以 USB 串口为主。"
+            "支持普通 2.4 GHz WPA2 Wi-Fi、手机热点和 Windows 热点。</p>");
+  if (!notice.isEmpty()) {
+    page += "<p class='warn'>" + notice + "</p>";
+  }
+  page += F("<form method='post' action='/save'><label>Wi-Fi 名称（SSID）</label>"
+            "<input name='ssid' maxlength='32' autocomplete='username' required placeholder='例如 IOT_DEMO'>"
+            "<label>Wi-Fi 密码</label><input type='password' name='password' maxlength='63' "
+            "autocomplete='current-password' placeholder='普通 WPA2 网络至少 8 位'>"
+            "<small>开放网络可留空；校园网页认证、5 GHz、扫码/验证码网络通常不能直接使用。</small>"
+            "<button type='submit'>保存并连接</button></form>"
+            "<form method='post' action='/reset'><button type='submit' style='background:#6b746f'>"
+            "清除已保存网络</button></form><p><small>保存后设备会尝试 DHCP 自动获取 IP。若失败，约 20 秒后会回到此配网页面。"
+            "</small></p></main></html>");
+  return page;
+}
+
+void handleWifiSetupRoot() {
+  WifiSetupServer.send(200, "text/html; charset=utf-8", wifiSetupPage());
+}
+
+void handleWifiSetupSave() {
+  const String ssid = WifiSetupServer.arg("ssid");
+  const String password = WifiSetupServer.arg("password");
+  if (!saveProvisionedWifiCredentials(ssid, password)) {
+    WifiSetupServer.send(400, "text/html; charset=utf-8",
+                         wifiSetupPage("SSID 无效，或密码长度不符合 WPA2 要求。"));
+    return;
+  }
+
+  WifiSetupServer.send(
+      200, "text/html; charset=utf-8",
+      wifiSetupPage("已保存。设备正在连接；请等待约 20 秒，然后回到电脑串口查看自动分配的 IP。"));
+  wifiProvisioningConnectPending = true;
+  wifiProvisioningConnectAtMs = millis() + 1000;
+}
+
+void handleWifiSetupReset() {
+  WifiPreferences.clear();
+  provisionedWifiSsid[0] = '\0';
+  provisionedWifiPassword[0] = '\0';
+  wifiProvisioningConnecting = false;
+  wifiProvisioningConnectPending = false;
+  WiFi.disconnect(false);
+  WifiSetupServer.send(200, "text/html; charset=utf-8",
+                       wifiSetupPage("已清除。现在可以填写新的 Wi-Fi。"));
+  Serial.println("[Wi-Fi setup] Stored credentials cleared from local NVS.");
+}
+
+void registerWifiSetupRoutes() {
+  if (wifiSetupRoutesRegistered) {
+    return;
+  }
+  WifiSetupServer.on("/", HTTP_GET, handleWifiSetupRoot);
+  WifiSetupServer.on("/save", HTTP_POST, handleWifiSetupSave);
+  WifiSetupServer.on("/reset", HTTP_POST, handleWifiSetupReset);
+  WifiSetupServer.onNotFound([]() {
+    WifiSetupServer.sendHeader("Location", "/");
+    WifiSetupServer.send(302, "text/plain", "");
+  });
+  wifiSetupRoutesRegistered = true;
+}
+
+void stopWifiSetupPortal() {
+  if (!wifiSetupPortalActive) {
+    return;
+  }
+  WifiSetupServer.stop();
+  WiFi.softAPdisconnect(true);
+  wifiSetupPortalActive = false;
+}
+
+void startWifiSetupPortal() {
+  if (!WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED || wifiSetupPortalActive) {
+    return;
+  }
+
+  buildWifiSetupAccessPointCredentials();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  if (!WiFi.softAP(wifiSetupApSsid, wifiSetupApPassword, 1, false,
+                   WIFI_SETUP_AP_MAX_CLIENTS)) {
+    Serial.println("[Wi-Fi setup] Failed to start configuration access point.");
+    return;
+  }
+  registerWifiSetupRoutes();
+  WifiSetupServer.begin();
+  wifiSetupPortalActive = true;
+  Serial.println("----- Wi-Fi setup portal -----");
+  Serial.printf("Connect phone to: %s\n", wifiSetupApSsid);
+  Serial.printf("Setup password: %s\n", wifiSetupApPassword);
+  Serial.printf("Open: http://%s/\n", WiFi.softAPIP().toString().c_str());
+  Serial.println("Only normal 2.4 GHz Wi-Fi/hotspots are supported by this portal.");
+  Serial.println("--------------------------------");
+}
+
+void beginProvisionedWifiConnection() {
+  if (!WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED) {
+    return;
+  }
+  if (!loadProvisionedWifiCredentials()) {
+    startWifiSetupPortal();
+    return;
+  }
+
+  stopWifiSetupPortal();
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.disconnect(false);
+  delay(100);
+  WiFi.begin(provisionedWifiSsid, provisionedWifiPassword);
+  wifiProvisioningConnecting = true;
+  wifiProvisioningConnectStartedMs = millis();
+  Serial.printf("[Wi-Fi] Connecting to saved network '%s' using DHCP...\n", provisionedWifiSsid);
+}
+
+void resetWifiProvisioningFromUsb() {
+  if (!WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED) {
+    Serial.println("[Wi-Fi setup] Provisioning is disabled in this firmware build.");
+    return;
+  }
+  WifiPreferences.clear();
+  provisionedWifiSsid[0] = '\0';
+  provisionedWifiPassword[0] = '\0';
+  wifiProvisioningConnecting = false;
+  wifiProvisioningConnectPending = false;
+  WiFi.disconnect(false);
+  Serial.println("[Wi-Fi setup] Credentials cleared by USB command.");
+  startWifiSetupPortal();
+}
+
+void initWifiProvisioning() {
+  if (!WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED) {
+    return;
+  }
+  if (!WifiPreferences.begin(WIFI_PREFERENCES_NAMESPACE, false)) {
+    Serial.println("[Wi-Fi setup] Cannot open ESP32 NVS preferences.");
+    return;
+  }
+  wifiProvisioningInitialized = true;
+  beginProvisionedWifiConnection();
+}
+
+void serviceWifiProvisioning() {
+  if (!wifiProvisioningInitialized || !WIFI_PROVISIONING_ENABLED || WIFI_TELEMETRY_ENABLED) {
+    return;
+  }
+
+  if (wifiSetupPortalActive) {
+    WifiSetupServer.handleClient();
+  }
+
+  if (wifiProvisioningConnectPending &&
+      static_cast<int32_t>(millis() - wifiProvisioningConnectAtMs) >= 0) {
+    wifiProvisioningConnectPending = false;
+    beginProvisionedWifiConnection();
+    return;
+  }
+
+  if (wifiProvisioningConnecting) {
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiProvisioningConnecting = false;
+      wifiProvisioningNextRetryMs = millis() + WIFI_PROVISION_RETRY_INTERVAL_MS;
+      Serial.printf("[Wi-Fi] Connected. SSID=%s IP=%s RSSI=%d dBm\n", WiFi.SSID().c_str(),
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      return;
+    }
+    if (millis() - wifiProvisioningConnectStartedMs >= WIFI_PROVISION_CONNECT_TIMEOUT_MS) {
+      wifiProvisioningConnecting = false;
+      wifiProvisioningNextRetryMs = millis() + WIFI_PROVISION_RETRY_INTERVAL_MS;
+      Serial.printf("[Wi-Fi] Saved network connection timed out (status=%d).\n",
+                    static_cast<int>(WiFi.status()));
+      startWifiSetupPortal();
+    }
+    return;
+  }
+
+  if (!wifiSetupPortalActive && WiFi.status() != WL_CONNECTED &&
+      static_cast<int32_t>(millis() - wifiProvisioningNextRetryMs) >= 0) {
+    beginProvisionedWifiConnection();
+  }
+}
+
 void printWifiInfo() {
   Serial.println("----- Wi-Fi TCP telemetry -----");
   Serial.print("Mode: ");
@@ -1588,9 +1870,15 @@ void setup() {
       lastWifiRetryMs = millis();
     }
   } else {
-    Serial.printf("USB serial telemetry enabled at %lu baud. Wi-Fi transport disabled.\n",
+    Serial.printf("USB serial telemetry enabled at %lu baud.\n",
                   static_cast<unsigned long>(PC_BAUD));
+    if (WIFI_PROVISIONING_ENABLED) {
+      Serial.println("Wi-Fi provisioning enabled: use the setup portal only to join a normal 2.4 GHz network.");
+    } else {
+      Serial.println("Wi-Fi transport and provisioning disabled.");
+    }
   }
+  initWifiProvisioning();
 
   printI2cScan(Wire, "BMP280 bus");
 
@@ -1619,6 +1907,7 @@ void loop() {
   static uint32_t lastReadMs = 0;
   serviceUsbControl();
   serviceWifi();
+  serviceWifiProvisioning();
 
   if (millis() - lastReadMs < readIntervalMs) {
     delay(2);
@@ -1668,6 +1957,7 @@ void loop() {
     }
   }
   serviceWifi();
+  serviceWifiProvisioning();
 
   snapshot.soilOk = readSoilSensor(snapshot.soil);
   if (snapshot.soilOk) {
@@ -1677,6 +1967,7 @@ void loop() {
     Serial.println("Soil sensor read failed.");
   }
   serviceWifi();
+  serviceWifiProvisioning();
 
   delay(MODBUS_GAP_MS);
 
@@ -1687,6 +1978,7 @@ void loop() {
     Serial.println("Solar radiation sensor 1 read failed.");
   }
   serviceWifi();
+  serviceWifiProvisioning();
 
   delay(MODBUS_GAP_MS);
 

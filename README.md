@@ -275,6 +275,12 @@ AHT20：VCC→3.3 V，GND→GND，SDA→GPIO5，SCL→GPIO8。BMP280：VCC→3.3
 
 更详细固件说明见 `firmware/esp32_s3_all_sensors/README.md`。当前串口屏方案已停用，GPIO11 专用于继电器。
 
+### ESP32 手机 Wi-Fi 配网（可选增强）
+
+USB 仍是默认采集、预测和安全开阀主链路；ESP32 的 Wi-Fi 配网只解决“换到手机热点、Windows 热点或家用路由器时，无需改代码重烧录”的联网需求。首次烧录或 USB 串口发送 `@WIFI_RESET` 后，ESP32 开启一次性配置热点 `AIOT-SETUP-xxxxxx`，热点密码和访问地址 `http://192.168.4.1/` 会输出到 USB 串口。手机连接后填写当前 **2.4 GHz** 普通 WPA2 网络的 SSID/密码，凭据仅保存在 ESP32 本机 NVS 中，随后通过 DHCP 自动取址。5 GHz、网页认证/扫码/验证码校园网不属于该通用配网范围；校园网 802.1X 需要单独适配学校认证方式。
+
+完成配网不等于手机自动能访问 Dashboard。Dashboard 仍由电脑运行；让手机巡检时，使用 `-Lan` / `--lan` 启动，并让手机与电脑位于同一局域网后访问 `http://电脑IPv4:8000/dashboard`。
+
 ## 评委现场演示流程
 
 1. 烧录固件并展示芯片识别为 ESP32-S3、GPIO11 上电 LOW。
