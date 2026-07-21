@@ -80,6 +80,7 @@ static const char *WIFI_PREFERENCES_NAMESPACE = "aiot_wifi";
 static const char *WIFI_PREFERENCE_SSID_KEY = "ssid";
 static const char *WIFI_PREFERENCE_PASSWORD_KEY = "password";
 static const char *WIFI_SETUP_AP_PREFIX = "AIOT-SETUP-";
+static const char *WIFI_SETUP_AP_PASSWORD = "12345678";
 static const uint8_t WIFI_SETUP_AP_MAX_CLIENTS = 2;
 static const uint32_t WIFI_PROVISION_CONNECT_TIMEOUT_MS = 20000;
 static const uint32_t WIFI_PROVISION_RETRY_INTERVAL_MS = 30000;
@@ -1300,10 +1301,7 @@ void buildWifiSetupAccessPointCredentials() {
   const uint32_t suffix = static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFFFFULL);
   snprintf(wifiSetupApSsid, sizeof(wifiSetupApSsid), "%s%06lX", WIFI_SETUP_AP_PREFIX,
            static_cast<unsigned long>(suffix));
-  // Per-device WPA2 password. It is printed on USB serial when the portal
-  // starts, so a nearby device cannot silently reconfigure Wi-Fi credentials.
-  snprintf(wifiSetupApPassword, sizeof(wifiSetupApPassword), "aiot-%06lX",
-           static_cast<unsigned long>(suffix));
+  strlcpy(wifiSetupApPassword, WIFI_SETUP_AP_PASSWORD, sizeof(wifiSetupApPassword));
 }
 
 bool loadProvisionedWifiCredentials() {
