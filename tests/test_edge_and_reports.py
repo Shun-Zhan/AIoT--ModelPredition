@@ -113,8 +113,19 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     app_js = client.get("/v1/dashboard/app.js")
     assert app_js.status_code == 200
     assert "setTimeout(confirmDecision, 1500)" in app_js.text
+    assert "请持续按住：" in app_js.text
+    assert "confirmStatus" in app_js.text
+    assert "正在分析…" in app_js.text
+    assert "setAnalyzeState" in app_js.text
+    assert "/cancel" in app_js.text
+    assert "pointerdown" in app_js.text
     assert "window.location.protocol" in app_js.text
     assert "/v1/dashboard/qr?url=" in app_js.text
+    assert "action-button" in html
+    assert "analyzeStatus" in html
+    assert "#E0E5EC" in html
+    assert "--shadow-extruded" in html
+    assert "prefers-reduced-motion" in html
     assert "api.qrserver.com" not in app_js.text
     assert "SpeechRecognition" in app_js.text
     assert "停止录音" in app_js.text

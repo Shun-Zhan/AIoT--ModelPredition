@@ -6,7 +6,7 @@ from dual_forecast.cloud import CloudCall, CloudFailure
 from dual_forecast.config import SETTINGS
 from dual_forecast.esp32_receiver import _handle_ack_line, _send_pending_commands
 from dual_forecast.irrigation import IrrigationService
-from dual_forecast.schemas import IrrigationAction, IrrigationDecision, SensorSnapshot
+from dual_forecast.schemas import ForecastPoint, ForecastResponse, IrrigationAction, IrrigationDecision, SensorSnapshot
 from dual_forecast.storage import Store
 
 
@@ -52,6 +52,19 @@ def test_start_waits_for_human_confirmation_then_is_queued(tmp_path):
     assert queued[0]["durationSeconds"] == 30
 
 
+def test_cancelled_suggestion_never_queues_a_device_command(tmp_path):
+    svc, store = service(tmp_path)
+    result = svc.evaluate(decision(), svc.current_context("request-123"), trigger="test")
+
+    cancelled = svc.cancel(result.requestId)
+
+    assert cancelled.status == "cancelled_by_user"
+    assert cancelled.finalAction == IrrigationAction.NO_OP
+    assert cancelled.durationSeconds is None
+    assert not cancelled.humanConfirmed
+    assert store.claim_pending_commands() == []
+
+
 def test_expired_and_incomplete_sensor_decisions_are_rejected(tmp_path):
     svc, _ = service(tmp_path)
     expired = svc.evaluate(decision("request-expired", expires_delta=-1), svc.current_context("request-expired"), trigger="test")
@@ -86,6 +99,38 @@ def test_cloud_failure_keeps_local_service_safe(tmp_path):
     assert result.status == "gateway_error"
     assert result.finalAction == IrrigationAction.NO_OP
     assert store.latest_snapshot() is not None
+
+
+def test_context_includes_configured_farm_profile_seven_day_trends_and_no_weather_guess(tmp_path):
+    settings = replace(
+        SETTINGS,
+        database_path=tmp_path / "farm.sqlite",
+        artifact_dir=tmp_path / "artifacts",
+        farm_crop="番茄",
+        farm_growth_stage="开花结果期",
+        farm_soil_type="壤土",
+        farm_plot_area_m2=12.0,
+        farm_irrigation_method="滴灌",
+    )
+    store = Store(settings.database_path)
+    now = datetime.now(timezone.utc)
+    earlier = snapshot(42.0)
+    latest = snapshot(38.0)
+    latest.uptimeMs = 1000 + 2 * 60 * 60 * 1000
+    store.insert_snapshot(earlier, now - timedelta(hours=2), [])
+    store.insert_snapshot(latest, now, [])
+    store.save_live_snapshot(latest, now)
+    context = IrrigationService(store, settings).current_context("farm-profile-123")
+
+    assert context.constraints["farmProfile"] == {
+        "crop": "番茄", "growthStage": "开花结果期", "soilType": "壤土",
+        "plotAreaM2": 12.0, "irrigationMethod": "滴灌", "valveFlowLpm": None,
+        "operatorNotes": None, "status": "configured",
+    }
+    soil = context.trends["windows"]["last7Days"]["soil_moisture_percent"]
+    assert soil["change"] == -4.0
+    assert soil["changePerHour"] == -2.0
+    assert context.constraints["weather"]["status"] == "not_configured"
 
 
 def test_ack_updates_final_execution_state(tmp_path):
@@ -207,6 +252,53 @@ class StartWateringGateway:
             prompt_tokens=100,
             completion_tokens=40,
         )
+
+
+def ready_forecast() -> ForecastResponse:
+    now = datetime.now(timezone.utc)
+    return ForecastResponse(
+        status="ok", generatedAt=now, requiredSamples=288, availableSamples=288,
+        forecast=[ForecastPoint(timestamp=now + timedelta(minutes=5), et0Mm=0.1, soilMoisturePercent=19.5)],
+    )
+
+
+def test_auto_irrigation_requires_forecast_then_queues_after_local_gates(tmp_path):
+    svc, store = service(tmp_path, enabled=True)
+    svc.settings = replace(
+        svc.settings,
+        auto_irrigation_enabled=True,
+        auto_irrigation_min_confidence=0.8,
+        auto_irrigation_require_forecast_ready=True,
+    )
+    svc.gateway = StartWateringGateway()
+
+    held = svc.analyze(trigger="periodic")
+    assert held.status == "awaiting_confirmation"
+    assert any("complete local forecast" in reason for reason in held.safetyReasons)
+    assert store.claim_pending_commands() == []
+
+    store.save_forecast(ready_forecast())
+    queued = svc.analyze(trigger="periodic")
+    assert queued.status == "auto_confirmed_waiting_device"
+    assert queued.autoConfirmed
+    assert not queued.humanConfirmed
+    command = store.claim_pending_commands()[0]
+    assert command["action"] == "START_WATERING"
+    assert command["reason"].startswith("local-auto-approved:")
+
+
+def test_auto_irrigation_never_bypasses_fresh_sensor_gate(tmp_path):
+    svc, store = service(tmp_path, enabled=True)
+    svc.settings = replace(svc.settings, auto_irrigation_enabled=True)
+    svc.gateway = StartWateringGateway()
+    store.save_forecast(ready_forecast())
+    store.save_live_snapshot(snapshot(), datetime.now(timezone.utc) - timedelta(seconds=svc.settings.data_stale_seconds + 1))
+
+    held = svc.analyze(trigger="periodic")
+
+    assert held.status == "rejected"
+    assert any("incomplete" in reason for reason in held.safetyReasons)
+    assert store.claim_pending_commands() == []
 
 
 class RecordingSerial:

@@ -84,6 +84,38 @@ if (-not (Test-Path $forecastCli) -or -not $serialDependencyReady) {
     if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed. See the error above." }
 }
 
+function Initialize-CloudConfiguration {
+    $checkOutput = & $venvPython -m dual_forecast.cli cloud-check 2>&1
+    $checkExitCode = $LASTEXITCODE
+    $checkOutput | Write-Host
+    if ($checkExitCode -eq 0) {
+        Write-Host "Cloud model configuration verified."
+        return
+    }
+    if ($checkExitCode -eq 3) {
+        Write-Warning "Cloud gateway is temporarily unreachable. Keeping saved configuration and starting in offline-capable mode."
+        return
+    }
+
+    Write-Host "Cloud model configuration is missing or rejected."
+    Write-Host "Enter a new Volcengine VEI API Key to continue. The input is hidden and saved only in $projectRoot\.env."
+    & $venvPython -m dual_forecast.cli cloud-configure
+    if ($LASTEXITCODE -ne 0) { throw "Could not save cloud model configuration." }
+    $checkOutput = & $venvPython -m dual_forecast.cli cloud-check 2>&1
+    $checkExitCode = $LASTEXITCODE
+    $checkOutput | Write-Host
+    if ($checkExitCode -eq 3) {
+        Write-Warning "Cloud gateway is temporarily unreachable. Saved the Key and started in offline-capable mode."
+        return
+    }
+    if ($checkExitCode -ne 0) {
+        throw "The new cloud configuration could not be verified. Check the Key, model permission, and internet connection."
+    }
+    Write-Host "Cloud model configuration verified."
+}
+
+Initialize-CloudConfiguration
+
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $serialPorts = @(Get-CimInstance Win32_SerialPort -ErrorAction SilentlyContinue)
 if (-not $Wifi -and -not $EspSerialPort) {

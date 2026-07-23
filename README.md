@@ -90,17 +90,7 @@ cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
 
 手机与电脑连同一 Wi-Fi 后，在手机输入 `http://电脑IPv4:8000/dashboard`。Windows 防火墙弹窗只允许“专用网络”，不要在公共网络开启。无 Wi‑Fi 时可退回 USB：`.\start_dashboard.cmd -EspSerialPort COM3 -Lan`。
 
-启用真实火山引擎云端大模型时，在同一个 PowerShell 窗口先设置环境变量再启动：
-
-```powershell
-$env:AIOT_LLM_ENABLED="1"
-$env:VEI_API_KEY="替换为真实Key"
-$env:VEI_BASE_URL="https://ai-gateway.vei.volces.com/v1"
-$env:VEI_MODEL="doubao-1.5-thinking-pro"
-$env:AIOT_LLM_INTERVAL_MINUTES="15"
-$env:AIOT_DEMO_AUTO_EXECUTE="0"
-.\start_dashboard.cmd -EspSerialPort COM3
-```
+首次一键启动会检查火山引擎配置。没有 Key、Key 失效、模型不可用或网关不可达时，会在终端提示输入新的 VEI API Key（输入不回显），并保存到项目根目录的 `.env`。以后只需要运行同一条启动命令，不需要再次设置环境变量。`.env` 已被 Git 忽略，绝不能提交或发给他人；系统环境变量仍可覆盖其中配置，便于正式部署使用密钥管理服务。
 
 PowerShell 里不使用 `source .venv/bin/activate`；脚本直接调用 `.venv\Scripts\python.exe`，不会误用 Anaconda 或全局 Python。
 
@@ -108,12 +98,7 @@ PowerShell 里不使用 `source .venv/bin/activate`；脚本直接调用 `.venv\
 
 ```cmd
 cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
-set AIOT_LLM_ENABLED=1
-set VEI_API_KEY=替换为真实Key
-set VEI_BASE_URL=https://ai-gateway.vei.volces.com/v1
-set VEI_MODEL=doubao-1.5-thinking-pro
-set AIOT_DEMO_AUTO_EXECUTE=0
-start_dashboard.cmd -EspSerialPort COM3
+start_dashboard.cmd -Wifi -Lan
 ```
 
 ### macOS / Linux
@@ -133,16 +118,12 @@ cd /你的路径/AIoT--ModelPredition
 
 然后在手机中打开 `http://本机IPv4:8000/dashboard`。默认会自动发现 ESP32，不需要查看或填写它的 DHCP IP。只有网络启用“客户端隔离”并同时禁止局域网广播时，才改用显式 IP：`./start_dashboard.sh --wifi --esp-wifi-host 172.20.10.2 --lan`。macOS 防火墙若提示，允许 Python 在本地网络通信。备用 USB 模式为 `./start_dashboard.sh --serial-port /dev/cu.wchusbserial10 --lan`。
 
-启用真实云端模型：
+首次执行启动命令时，若没有可用的火山引擎 Key，终端会让你粘贴一次（输入不回显）。它会先用极小的 `Reply exactly OK.` 请求验证 Key、模型和网关；此检查不生成灌溉建议，也不会控制水阀。验证成功后信息保存在本机 `.env`，以后启动无需重复输入。
+
+需要主动换 Key 时，可单独运行：
 
 ```bash
-export AIOT_LLM_ENABLED=1
-export VEI_API_KEY='替换为真实Key'
-export VEI_BASE_URL='https://ai-gateway.vei.volces.com/v1'
-export VEI_MODEL='替换为控制台给出的模型名称或推理接入点ID'
-export AIOT_LLM_INTERVAL_MINUTES=15
-export AIOT_DEMO_AUTO_EXECUTE=0
-./start_dashboard.sh --wifi
+.venv/bin/python -m dual_forecast.cli cloud-configure
 ```
 
 停止：
@@ -151,7 +132,22 @@ export AIOT_DEMO_AUTO_EXECUTE=0
 ./stop_dashboard.sh
 ```
 
-`.env.example` 只作为变量清单，启动脚本不会自动读取它，避免无意间加载密钥。真实 Key 只放在本机环境变量或未提交的密钥管理系统中，不要写进源码、截图、SQLite 或 Git。
+`.env.example` 是变量清单。真实 `.env` 会被自动读取、优先级低于系统环境变量，并且已被 Git 忽略。真实 Key 只能放在本机 `.env` 或密钥管理系统中，不要写进源码、截图、SQLite 或 Git。`AIOT_DEMO_AUTO_EXECUTE` 仅为旧配置兼容项，不能再触发开阀；默认仍需要网页人工长按确认。
+
+### 让云端分析理解农田
+
+云端大模型只会依据本地服务整理的事实生成解释和建议，不能直接开阀。除实时数据、本地预测、风险事件和 1 小时/24 小时/7 天趋势外，可以在本机 `.env` 增加已知农田信息：
+
+```dotenv
+AIOT_FARM_CROP=番茄
+AIOT_FARM_GROWTH_STAGE=开花结果期
+AIOT_FARM_SOIL_TYPE=壤土
+AIOT_FARM_PLOT_AREA_M2=12
+AIOT_FARM_IRRIGATION_METHOD=滴灌
+AIOT_FARM_NOTES=下午避免灌溉，优先傍晚短时补水
+```
+
+改完后重新运行 `./start_dashboard.sh --wifi --lan`。这些字段只增强云端解释，不会更改 ESP32、本地阈值、最长开阀时间或人工长按确认。没有填写的字段会明确传给模型为“未知”，不会由模型自行猜测。当前没有接入天气服务，模型也会明确说明不能据此判断降雨或天气预报。
 
 ## 手动启动与健康检查
 
@@ -207,7 +203,19 @@ tail -f runtime/logs/esp32-receiver.out.log
 5. 串口接收器发送 `@COMMAND`，ESP32 验证 Schema、TTL、动作白名单、持续时间和最新传感器状态，再把 GPIO11 拉高。
 6. ESP32 返回 `@ACK`，网页显示 `OPEN`；达到持续时间后自动拉低 GPIO11并返回关闭 ACK。
 
-`AIOT_DEMO_AUTO_EXECUTE=1` 只用于受控演示：它跳过网页确认点击，但不会绕过任何本地安全规则。正常使用务必保持为 `0`。
+### 可选：AI 建议后的自动灌溉
+
+默认关闭。要让“本地预测 + 实时数据 → 云端 AI 建议 → 本地安全层 → ESP32 水阀”自动闭环，在本机 `.env` 写入并重启服务：
+
+```dotenv
+AIOT_AUTO_IRRIGATION_ENABLED=1
+AIOT_AUTO_IRRIGATION_MIN_CONFIDENCE=0.80
+AIOT_AUTO_IRRIGATION_REQUIRE_FORECAST_READY=1
+```
+
+自动模式下，AI 不能直接操作 GPIO。只有 `START_WATERING` 同时满足以下条件，电脑才会把命令加入 ESP32 队列：AI 置信度不低于阈值、ESP32 数据新鲜且全部有效、本地边缘判断为 `IRRIGATION_CANDIDATE`、本地预测状态为 `ok`、土壤湿度低于阈值、冷却时间/单次时长/每日总时长均符合限制，并在入队前再次复核。任一条件失败都会保留建议并写出原因，不开阀。云端不可用、模型输出错误或网络中断时固定为 `NO_OP`。
+
+`STOP_WATERING` 是保守动作：仍需有效 AI 决策和本地命令 TTL，但不因预测尚在预热而阻止关阀。所有自动下发会显示为 `auto_confirmed_waiting_device`，命令和 ESP32 `@ACK` 仍会保存到 SQLite。首次启用时建议先断开 24 V 水阀，只观察继电器指示灯、命令队列和 ACK。
 
 ### 串口协议示例
 

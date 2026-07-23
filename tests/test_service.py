@@ -83,6 +83,7 @@ def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):
     assert status.status_code == 200
     assert not status.json()["enabled"]
     assert status.json()["actuator"]["state"] == "CLOSED"
+    assert not status.json()["autoIrrigation"]["enabled"]
 
     analysis = client.post("/v1/cloud/analyze").json()
     assert analysis["finalAction"] == "NO_OP"

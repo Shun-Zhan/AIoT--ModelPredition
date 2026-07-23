@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import getpass
+import os
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import pandas as pd
 import uvicorn
 
 from .config import SETTINGS
+from .cloud import CloudConfigurationFailure, CloudFailure, CloudNetworkFailure, OpenAICompatibleGateway
 from .esp32_receiver import add_receiver_parser
 from .history import add_proxy_soil_moisture, load_hongqiao_zip, split_chronologically
 from .storage import Store
@@ -79,6 +82,54 @@ def export_latest(args):
     print(args.output)
 
 
+def _write_cloud_env(api_key: str) -> Path:
+    """Persist only the local cloud credentials and safe fixed defaults."""
+    if not api_key.strip():
+        raise SystemExit("VEI API Key cannot be empty")
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    content = "\n".join([
+        "# Local only. This file is ignored by Git; do not share it.",
+        "AIOT_LLM_ENABLED=1",
+        f"VEI_API_KEY={api_key.strip()}",
+        "VEI_BASE_URL=https://ai-gateway.vei.volces.com/v1",
+        "VEI_MODEL=doubao-1.5-thinking-pro",
+        "VEI_TIMEOUT_SECONDS=45",
+        "AIOT_LLM_INTERVAL_MINUTES=15",
+        "AIOT_DEMO_AUTO_EXECUTE=0",
+        "",
+    ])
+    env_path.write_text(content, encoding="utf-8")
+    return env_path
+
+
+def configure_cloud(args):
+    api_key = getpass.getpass("Paste Volcengine VEI API Key (input hidden): ").strip()
+    path = _write_cloud_env(api_key)
+    print(f"Saved local cloud configuration: {path}")
+    print("Cloud is enabled; automatic valve execution remains disabled.")
+
+
+def check_cloud(args):
+    gateway = OpenAICompatibleGateway(SETTINGS)
+    if not gateway.configured:
+        raise SystemExit("Cloud is not configured: VEI_API_KEY is missing or AIOT_LLM_ENABLED is disabled")
+    try:
+        call = gateway.health_check()
+    except CloudConfigurationFailure as exc:
+        print(f"Cloud check failed: {exc}")
+        raise SystemExit(2) from exc
+    except CloudNetworkFailure as exc:
+        print(f"Cloud check deferred: {exc}")
+        raise SystemExit(3) from exc
+    except CloudFailure as exc:
+        raise SystemExit(f"Cloud check failed: {exc}") from exc
+    print(json.dumps({
+        "ok": True,
+        "model": SETTINGS.gateway_model,
+        "latencyMs": call.latency_ms,
+    }, ensure_ascii=False))
+
+
 def serve(args):
     # Environment-independent factory configuration is intentionally simple:
     # CLI paths are passed through environment variables consumed before import.
@@ -114,6 +165,10 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("export-latest")
     p.add_argument("--output", default="outputs/latest_forecast.csv")
     p.set_defaults(func=export_latest)
+    p = sub.add_parser("cloud-configure")
+    p.set_defaults(func=configure_cloud)
+    p = sub.add_parser("cloud-check")
+    p.set_defaults(func=check_cloud)
     p = sub.add_parser("serve")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)

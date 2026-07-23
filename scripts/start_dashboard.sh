@@ -108,6 +108,39 @@ if ! "$venv_python" -c 'import serial, qrcode' >/dev/null 2>&1; then
   "$venv_python" -m pip install -r "$project_root/requirements.txt"
 fi
 
+configure_cloud_if_needed() {
+  local check_output check_rc
+  set +e
+  check_output="$("$venv_python" -m dual_forecast.cli cloud-check 2>&1)"
+  check_rc=$?
+  set -e
+  if [[ "$check_rc" -eq 0 ]]; then
+    echo "Cloud model configuration verified."
+    return
+  fi
+
+  # Keep a previously saved key when the Internet is briefly unavailable. The
+  # local prediction, dashboard and manual valve safety chain remain usable.
+  if [[ "$check_rc" -eq 3 ]]; then
+    echo "Cloud gateway is temporarily unreachable; keeping saved configuration and starting in offline-capable mode."
+    echo "$check_output"
+    return
+  fi
+
+  echo "Cloud model configuration is missing or rejected."
+  echo "$check_output"
+  echo "Enter a new Volcengine VEI API Key to continue. The input is hidden and saved only in $project_root/.env."
+  "$venv_python" -m dual_forecast.cli cloud-configure
+  if ! check_output="$("$venv_python" -m dual_forecast.cli cloud-check 2>&1)"; then
+    echo "$check_output" >&2
+    echo "The new cloud configuration could not be verified. Check the Key, model permission, and internet connection." >&2
+    exit 1
+  fi
+  echo "Cloud model configuration verified."
+}
+
+configure_cloud_if_needed
+
 mkdir -p "$log_dir"
 if [[ "$wifi" != true && -z "$serial_port" ]]; then
   ports=(/dev/cu.wchusbserial* /dev/cu.usbserial* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem*)

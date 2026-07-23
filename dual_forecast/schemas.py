@@ -145,6 +145,7 @@ class DecisionResult(BaseModel):
     confidence: float | None = None
     safetyReasons: list[str] = []
     humanConfirmed: bool = False
+    autoConfirmed: bool = False
     sentToDevice: bool = False
     executed: bool = False
     ack: dict[str, Any] | None = None

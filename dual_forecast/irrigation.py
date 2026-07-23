@@ -83,18 +83,30 @@ class IrrigationService:
 
     def current_context(self, request_id: str | None = None) -> DecisionContext:
         current = self.store.latest_live_snapshot() or self.store.latest_snapshot() or {}
-        frame = self.store.recent_frame(limit=720)
+        # At the default five-minute sampling interval 2016 points cover seven
+        # days. The cloud receives only compact summaries, not raw sensor rows.
+        seven_day_limit = max(720, int(7 * 24 * 60 / max(1, self.settings.sample_minutes)))
+        frame = self.store.recent_frame(limit=seven_day_limit)
         trends: dict[str, Any] = {"samples": int(len(frame)), "windows": {}}
         if not frame.empty:
             end = frame.index.max()
-            for label, hours in (("last1Hour", 1), ("last24Hours", 24)):
+            for label, hours in (("last1Hour", 1), ("last24Hours", 24), ("last7Days", 24 * 7)):
                 window = frame.loc[frame.index >= end - pd.Timedelta(hours=hours)]
                 summary: dict[str, Any] = {"samples": int(len(window))}
                 for column in ("air_temp_c", "rh_percent", "soil_temp_c", "soil_moisture_percent", "wind_ms", "solar_wm2", "pressure_kpa"):
                     if column in window:
                         series = pd.to_numeric(window[column], errors="coerce").dropna()
                         if not series.empty:
-                            summary[column] = {"latest": _json_value(series.iloc[-1]), "mean": round(float(series.mean()), 3), "min": round(float(series.min()), 3), "max": round(float(series.max()), 3)}
+                            values: dict[str, Any] = {
+                                "latest": _json_value(series.iloc[-1]), "mean": round(float(series.mean()), 3),
+                                "min": round(float(series.min()), 3), "max": round(float(series.max()), 3),
+                            }
+                            if len(series) >= 2:
+                                span_hours = max((series.index[-1] - series.index[0]).total_seconds() / 3600, 1 / 60)
+                                change = float(series.iloc[-1] - series.iloc[0])
+                                values["change"] = round(change, 3)
+                                values["changePerHour"] = round(change / span_hours, 3)
+                            summary[column] = values
                 trends["windows"][label] = summary
             trends["dataStart"] = frame.index.min().isoformat()
             trends["dataEnd"] = frame.index.max().isoformat()
@@ -133,6 +145,10 @@ class IrrigationService:
                 "wateringLast7Days": self.store.actuator_summary(seven_days_ago),
                 "recentReviewedDecisions": self.store.recent_decisions(limit=20),
                 "edgeRisk": edge.to_dict(),
+                "farmProfile": self.settings.farm_profile(),
+                # No weather provider is currently configured. This explicit
+                # marker prevents a model from presenting invented forecasts.
+                "weather": {"status": "not_configured", "instruction": "不得假设降雨、天气预报或地理位置"},
             },
         )
 
@@ -207,9 +223,50 @@ class IrrigationService:
         self.store.save_llm_call(context.requestId, "irrigation", context.model_dump(mode="json"),
                                  response=decision.model_dump(mode="json"), latency_ms=call.latency_ms,
                                  prompt_tokens=call.prompt_tokens, completion_tokens=call.completion_tokens)
-        return self.evaluate(decision, context, trigger=trigger, call=call, raw_output=call.content)
+        reviewed = self.evaluate(decision, context, trigger=trigger, call=call, raw_output=call.content)
+        return self.auto_confirm_if_eligible(reviewed)
 
-    def confirm(self, request_id: str) -> DecisionResult:
+    def auto_confirm_if_eligible(self, result: DecisionResult) -> DecisionResult:
+        """Queue an AI suggestion only when the explicit auto policy is met.
+
+        This is intentionally separate from :meth:`confirm`: a cloud response
+        is never a direct hardware command.  The method records why an enabled
+        automatic mode held a suggestion, so the dashboard remains auditable.
+        """
+        if not self.settings.auto_irrigation_enabled or result.status != "awaiting_confirmation":
+            return result
+
+        reasons: list[str] = []
+        if result.finalAction not in {IrrigationAction.START_WATERING, IrrigationAction.STOP_WATERING}:
+            reasons.append("automatic mode accepts only explicit start or stop actions")
+        if result.confidence is None or result.confidence < self.settings.auto_irrigation_min_confidence:
+            reasons.append(
+                f"model confidence is below automatic threshold {self.settings.auto_irrigation_min_confidence:.2f}"
+            )
+
+        current = self.current_context(result.requestId)
+        edge = self.assess_edge(current.current)
+        if result.finalAction == IrrigationAction.START_WATERING:
+            if not current.current.get("allSensorsValid"):
+                reasons.append("automatic start requires complete and fresh sensor data")
+            if not edge.data_freshness.get("fresh"):
+                reasons.append("automatic start requires fresh ESP32 telemetry")
+            if edge.risk_level != "IRRIGATION_CANDIDATE":
+                reasons.append("automatic start requires local IRRIGATION_CANDIDATE risk")
+            if self.settings.auto_irrigation_require_forecast_ready:
+                forecast = self.store.latest_forecast()
+                if forecast is None or forecast.status != "ok" or not forecast.forecast:
+                    reasons.append("automatic start requires a complete local forecast")
+
+        if reasons:
+            held = result.model_copy(update={
+                "safetyReasons": result.safetyReasons + ["automatic execution held: " + reason for reason in reasons],
+            })
+            self.store.save_decision(held, current.model_dump(mode="json"), result.reason)
+            return held
+        return self.confirm(result.requestId, automatic=True)
+
+    def confirm(self, request_id: str, *, automatic: bool = False) -> DecisionResult:
         result = self.store.get_decision(request_id)
         if result is None:
             raise KeyError(request_id)
@@ -246,16 +303,38 @@ class IrrigationService:
         command = {
             "schemaVersion": "1.0", "requestId": result.requestId,
             "action": result.finalAction.value, "durationSeconds": result.durationSeconds,
-            "reasonCode": result.reasonCode, "reason": "human-confirmed: " + result.reason,
+            "reasonCode": result.reasonCode,
+            "reason": ("local-auto-approved: " if automatic else "human-confirmed: ") + result.reason,
             "confidence": result.confidence or 0.0, "expiresAt": expires,
             "ttlSeconds": 30,
         }
         queued = self.store.enqueue_command(command)
         if not queued:
             return result
-        updated = result.model_copy(update={"status": "confirmed_waiting_device", "humanConfirmed": True})
-        self.store.save_decision(updated, {"confirmed": True, "command": command}, result.reason)
+        updated = result.model_copy(update={
+            "status": "auto_confirmed_waiting_device" if automatic else "confirmed_waiting_device",
+            "humanConfirmed": not automatic,
+            "autoConfirmed": automatic,
+        })
+        self.store.save_decision(updated, {"confirmed": not automatic, "autoConfirmed": automatic, "command": command}, result.reason)
         return updated
+
+    def cancel(self, request_id: str) -> DecisionResult:
+        """Dismiss an unconfirmed suggestion before any device command is queued."""
+        result = self.store.get_decision(request_id)
+        if result is None:
+            raise KeyError(request_id)
+        if result.status != "awaiting_confirmation":
+            return result
+        cancelled = result.model_copy(update={
+            "status": "cancelled_by_user",
+            "finalAction": IrrigationAction.NO_OP,
+            "durationSeconds": None,
+            "humanConfirmed": False,
+            "safetyReasons": result.safetyReasons + ["cancelled by user before device command was queued"],
+        })
+        self.store.save_decision(cancelled, {"cancelled": True}, result.reason)
+        return cancelled
 
     def chat(self, question: str) -> dict[str, Any]:
         context = self.current_context("chat-" + new_request_id())
@@ -263,6 +342,8 @@ class IrrigationService:
             "current": context.current, "trends": context.trends, "forecast": context.forecast,
             "wateringLast7Days": self.store.actuator_summary(datetime.now(timezone.utc) - timedelta(days=7)),
             "anomalies": self.store.anomaly_rows(limit=20),
+            "farmProfile": self.settings.farm_profile(),
+            "weather": {"status": "not_configured", "instruction": "未接入天气服务，不得推测天气或降雨"},
         }
         data_range = {"start": context.trends.get("dataStart"), "end": context.trends.get("dataEnd"), "samples": context.trends.get("samples", 0)}
         if not self.settings.llm_enabled:
