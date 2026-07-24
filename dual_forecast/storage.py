@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .et0 import fao56_hourly_et0_from_net_shortwave
 from .schemas import DecisionResult, ForecastResponse, IrrigationAction, SensorSnapshot
 
 
@@ -151,6 +152,15 @@ class Store:
             net_shortwave, solar_source = max(0.77 * incoming, 0.0), "default_albedo_fallback"
         else:
             net_shortwave, solar_source = max(incoming - reflected, 0.0), "measured_reflection"
+        et0_mm_per_hour = None
+        if payload.get("airOk") and payload.get("windOk") and net_shortwave is not None:
+            et0_mm_per_hour = fao56_hourly_et0_from_net_shortwave(
+                payload["air"]["temperatureC"],
+                payload["air"]["humidityPercent"],
+                payload["windSpeedMs"],
+                net_shortwave,
+                payload["airPressureHpa"] / 10.0,
+            )
         return {
             "receivedAt": payload["receivedAt"], "uptimeMs": payload["uptimeMs"],
             "windOk": payload["windOk"], "windSpeedMs": payload["windSpeedMs"],
@@ -162,6 +172,9 @@ class Store:
             "solarIncomingWm2": incoming,
             "solarReflectedWm2": reflected,
             "solarSource": solar_source,
+            "et0Ok": et0_mm_per_hour is not None,
+            "et0MmPerHour": et0_mm_per_hour,
+            "et0Method": "FAO-56 Penman-Monteith（小时估算）",
             "warnings": [],
         }
 
@@ -187,6 +200,18 @@ class Store:
             return None
 
         warnings = json.loads(row["warnings_json"] or "[]")
+        et0_mm_per_hour = None
+        if (
+            bool(row["air_ok"]) and bool(row["wind_ok"])
+            and row["solar_wm2"] is not None
+        ):
+            et0_mm_per_hour = fao56_hourly_et0_from_net_shortwave(
+                row["air_temp_c"],
+                row["rh_percent"],
+                row["wind_ms"],
+                row["solar_wm2"],
+                row["pressure_kpa"],
+            )
         return {
             "receivedAt": row["received_at"],
             "uptimeMs": row["uptime_ms"],
@@ -207,6 +232,9 @@ class Store:
             "solarOk": row["solar_wm2"] is not None,
             "solarRadiationWm2": row["solar_wm2"],
             "solarSource": row["solar_semantics"],
+            "et0Ok": et0_mm_per_hour is not None,
+            "et0MmPerHour": et0_mm_per_hour,
+            "et0Method": "FAO-56 Penman-Monteith（小时估算）",
             "warnings": warnings,
         }
 

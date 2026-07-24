@@ -59,11 +59,22 @@ def test_dashboard_exposes_latest_snapshot(tmp_path):
 
     page = client.get("/dashboard")
     assert page.status_code == 200
-    assert "AIoT 农场监控" in page.text
+    assert "AIoT 智慧农业监控" in page.text
 
     latest = client.get("/v1/dashboard/latest")
     assert latest.status_code == 200
-    assert latest.json()["snapshot"]["air"]["temperatureC"] == 24.0
+    snapshot = latest.json()["snapshot"]
+    assert snapshot["air"]["temperatureC"] == 24.0
+    assert snapshot["et0Ok"]
+    assert snapshot["et0MmPerHour"] > 0
+    assert snapshot["solarRadiationWm2"] == 200
+    assert snapshot["et0Method"].startswith("FAO-56")
+    assert "参考作物蒸散率（ET₀）" in page.text
+    assert "净短波辐射（Rns）" in page.text
+    edge = latest.json()["edge"]
+    assert edge["thresholds"]["irrigationSoilMoisturePercent"] == 30.0
+    assert edge["thresholds"]["unit"] == "%"
+    assert "无物理单位" in edge["riskScoreNote"]
 
 
 def test_live_telemetry_refreshes_dashboard_without_storing_model_sample(tmp_path):

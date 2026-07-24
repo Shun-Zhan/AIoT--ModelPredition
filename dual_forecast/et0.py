@@ -72,3 +72,28 @@ def fao56_hourly_et0(
     numerator = 0.408 * delta * (rn - soil_heat_flux_mj_m2_h) + gamma * (37.0 / (t + 273.0)) * u2 * (es - ea)
     denominator = delta + gamma * (1.0 + 0.34 * u2)
     return np.maximum(numerator / np.maximum(denominator, 1e-9), 0.0)
+
+
+def fao56_hourly_et0_from_net_shortwave(
+    temp_c: float,
+    rh_percent: float,
+    wind_ms: float,
+    net_shortwave_wm2: float,
+    pressure_kpa: float,
+) -> float:
+    """Return the current FAO-56 ET₀ estimate from observed net shortwave.
+
+    The dashboard has already combined the two solar probes into
+    Rns=Rs↓−Rs↑.  Pass that observation explicitly so the default albedo is
+    not applied a second time.  The result is an hourly rate in mm/hour.
+    """
+    return float(
+        fao56_hourly_et0(
+            temp_c,
+            rh_percent,
+            wind_ms,
+            net_shortwave_wm2,
+            pressure_kpa,
+            net_shortwave_wm2=net_shortwave_wm2,
+        )
+    )

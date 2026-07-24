@@ -1,6 +1,11 @@
 import numpy as np
 
-from dual_forecast.et0 import fao56_hourly_et0, pressure_kpa_from_elevation, relative_humidity_from_dewpoint
+from dual_forecast.et0 import (
+    fao56_hourly_et0,
+    fao56_hourly_et0_from_net_shortwave,
+    pressure_kpa_from_elevation,
+    relative_humidity_from_dewpoint,
+)
 
 
 def test_pressure_and_humidity_units():
@@ -26,3 +31,9 @@ def test_observed_net_shortwave_is_not_reduced_by_albedo_twice():
     observed_net = float(fao56_hourly_et0(25, 60, 2, 800, 101.3, net_shortwave_wm2=640))
     double_reduced = float(fao56_hourly_et0(25, 60, 2, 640, 101.3))
     assert observed_net > double_reduced
+
+
+def test_dashboard_et0_helper_uses_observed_net_shortwave():
+    direct = float(fao56_hourly_et0(25, 60, 2, 640, 101.3, net_shortwave_wm2=640))
+    dashboard = fao56_hourly_et0_from_net_shortwave(25, 60, 2, 640, 101.3)
+    assert dashboard == direct

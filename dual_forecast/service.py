@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, Response
 import qrcode
 
 from .config import SETTINGS, Settings
+from .et0 import fao56_hourly_et0_from_net_shortwave
 from .inference import ModelBundle, build_response
 from .irrigation import IrrigationService
 from .schemas import ChatRequest, ForecastResponse, SensorSnapshot
@@ -20,6 +21,15 @@ from .storage import Store
 def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> dict:
     """Convert an in-memory telemetry sample into the dashboard shape."""
     net_shortwave, solar_source = snapshot.net_shortwave_solar()
+    et0_mm_per_hour = None
+    if snapshot.airOk and snapshot.windOk and net_shortwave is not None:
+        et0_mm_per_hour = fao56_hourly_et0_from_net_shortwave(
+            snapshot.air.temperatureC,
+            snapshot.air.humidityPercent,
+            snapshot.windSpeedMs,
+            net_shortwave,
+            snapshot.airPressureHpa / 10.0,
+        )
     return {
         "receivedAt": received_at.isoformat(),
         "uptimeMs": snapshot.uptimeMs,
@@ -42,6 +52,9 @@ def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> di
         "solarIncomingWm2": snapshot.incoming_solar(),
         "solarReflectedWm2": snapshot.reflected_solar(),
         "solarSource": solar_source,
+        "et0Ok": et0_mm_per_hour is not None,
+        "et0MmPerHour": et0_mm_per_hour,
+        "et0Method": "FAO-56 Penman-Monteith（小时估算）",
         "edgePrediction": (
             snapshot.edgePrediction.model_dump() if snapshot.edgePrediction is not None else None
         ),
@@ -87,7 +100,18 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         # never alter the ESP32's sampling policy: otherwise refreshing the
         # dashboard while telemetry is stale can enqueue DEBUG, then the next
         # fresh packet enqueues another mode, causing avoidable config churn.
-        return {**assessment.to_dict(), "configQueued": False}
+        return {
+            **assessment.to_dict(),
+            "configQueued": False,
+            "thresholds": {
+                "irrigationSoilMoisturePercent": settings.irrigation_trigger_percent,
+                "irrigationTargetSoilMoisturePercent": settings.irrigation_target_percent,
+                "quantity": "土壤传感器含水率读数",
+                "unit": "%",
+                "basis": "默认工程初值；应按当地土壤、作物根区和传感器实测校准",
+            },
+            "riskScoreNote": "规则风险等级分，无物理单位；不是传感器测量值",
+        }
 
     def water_report() -> dict:
         now = datetime.now(timezone.utc)
@@ -221,6 +245,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       setValue('wind', s.windOk ? s.windSpeedMs : null, 'm/s', 1);
       setValue('soilTemp', s.soilOk ? soil.temperatureC : null, '°C', 1);
       setValue('soilMoist', s.soilOk ? soil.moisturePercent : null, '%', 1);
+      setValue('et0', s.et0Ok ? s.et0MmPerHour : null, 'mm/h', 3);
       setValue('solar', s.solarOk ? s.solarRadiationWm2 : null, 'W/m²', 0);
       setValue('solarIncoming', s.solarIncomingWm2, 'W/m²', 0);
       setValue('solarReflected', s.solarReflectedWm2, 'W/m²', 0);
@@ -229,6 +254,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         : s.solarSource === 'default_albedo_fallback'
           ? '反射探头无效，按默认反照率 0.23 估算'
           : '入射探头无效，不能用于 ET₀';
+      el('et0Note').textContent = s.et0Ok
+        ? (s.et0Method || 'FAO-56 Penman-Monteith（小时估算）')
+        : '温湿度、风速或太阳辐射无效，暂不计算';
       el('updated').textContent = '最近采集：' + s.receivedAt + '，设备运行 ' + Math.round((s.uptimeMs || 0) / 1000) + ' 秒';
 
       var forecast = data.forecast;
@@ -260,10 +288,29 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         el('edgePrediction').style.fontSize = '17px';
       }
       var edge = data.edge || {}, risk = edge.riskLevel || '--';
-      el('risk').textContent = risk + ' · ' + (has(edge.riskScore) ? edge.riskScore : '--') + '/100';
+      var riskLabels = {
+        NORMAL: '状态正常',
+        ATTENTION: '需要关注',
+        HIGH_EVAPOTRANSPIRATION: '高蒸散风险',
+        IRRIGATION_CANDIDATE: '灌溉候选'
+      };
+      el('risk').textContent = (riskLabels[risk] || risk) + ' · 风险等级分 ' + (has(edge.riskScore) ? edge.riskScore : '--') + '/100';
       el('risk').className = 'value ' + (risk === 'NORMAL' ? 'ok' : (risk === 'ATTENTION' ? 'warn' : 'bad'));
       el('riskReasons').textContent = (edge.reasons || []).join('；');
-      el('sampling').textContent = '推荐采样：' + (edge.recommendedSamplingMode || '--') + '（' + (edge.recommendedReadIntervalMs || '--') + ' ms）' + (data.samplingConfig ? '；设备配置：' + data.samplingConfig.status : '');
+      var thresholds = edge.thresholds || {};
+      el('riskThreshold').textContent = '灌溉触发条件：' + (thresholds.quantity || '土壤含水率') + ' < '
+        + number(thresholds.irrigationSoilMoisturePercent, 1) + (thresholds.unit || '%')
+        + '；目标值：' + number(thresholds.irrigationTargetSoilMoisturePercent, 1) + (thresholds.unit || '%')
+        + '。' + (thresholds.basis || '');
+      el('riskScoreNote').textContent = edge.riskScoreNote || '';
+      var samplingLabels = {
+        DEBUG: '故障诊断',
+        IRRIGATION_MONITORING: '灌溉监测',
+        NORMAL_MONITORING: '常规监测',
+        NIGHT_ECO: '夜间节能'
+      };
+      var samplingMode = edge.recommendedSamplingMode || '--';
+      el('sampling').textContent = '推荐采样：' + (samplingLabels[samplingMode] || samplingMode) + '（' + (edge.recommendedReadIntervalMs || '--') + ' ms）' + (data.samplingConfig ? '；设备配置：' + data.samplingConfig.status : '');
       var actuator = data.actuator || {};
       var fresh = edge.dataFreshness || {};
       el('valve').textContent = '水阀：' + (actuator.state || 'CLOSED') + '；数据新鲜度：' + (fresh.fresh ? '新鲜' : '需检查') + '（' + (has(fresh.ageSeconds) ? fresh.ageSeconds : '--') + ' 秒）';
@@ -538,7 +585,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>AIoT 农场监控</title>
+  <title>AIoT 智慧农业监控</title>
   <style>
     :root {
       color-scheme: light;
@@ -624,7 +671,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   </style>
 </head>
 <body>
-  <header><div><h1>AIoT 农场监控</h1><div class="muted">电脑端本地边缘网关 · ESP32 安全执行</div></div><div id="connection" class="muted">正在连接...</div></header>
+  <header><div><h1>AIoT 智慧农业监控</h1><div class="muted">电脑端本地边缘网关 · ESP32 安全执行</div></div><div id="connection" class="muted">正在连接...</div></header>
   <main>
     <section class="grid">
       <div class="card"><div class="label">空气温度</div><div id="airTemp" class="value">-- <span class="unit">°C</span></div></div>
@@ -633,11 +680,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card"><div class="label">平均风速</div><div id="wind" class="value">-- <span class="unit">m/s</span></div></div>
       <div class="card"><div class="label">土壤温度</div><div id="soilTemp" class="value">-- <span class="unit">°C</span></div></div>
       <div class="card"><div class="label">土壤湿度</div><div id="soilMoist" class="value">-- <span class="unit">%</span></div></div>
-      <div class="card"><div class="label">净短波辐射（ET₀）</div><div id="solar" class="value">-- <span class="unit">W/m²</span></div><div id="solarNote" class="meta"></div></div>
+      <div class="card"><div class="label">参考作物蒸散率（ET₀）</div><div id="et0" class="value">-- <span class="unit">mm/h</span></div><div id="et0Note" class="meta"></div></div>
+      <div class="card"><div class="label">净短波辐射（Rns）</div><div id="solar" class="value">-- <span class="unit">W/m²</span></div><div id="solarNote" class="meta"></div></div>
       <div class="card"><div class="label">入射短波（Solar 2）</div><div id="solarIncoming" class="value">-- <span class="unit">W/m²</span></div></div>
       <div class="card"><div class="label">反射短波（Solar 1）</div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
-    <section class="card wide mobile-full"><h2>移动巡检与边缘风险</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
+    <section class="card wide mobile-full"><h2>移动巡检与边缘风险</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="riskScoreNote" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
     <section class="card wide"><h2>预测模型（电脑端完整时序模型）</h2><div id="model" class="value" style="font-size:18px">等待数据...</div></section>
     <section class="card wide"><h2>ESP32 边缘预测（断网降级）</h2><div id="edgePrediction" class="meta">等待 ESP32 边缘预测数据...</div><div class="meta">仅作趋势与风险提示；不会直接打开水阀。</div></section>
     <section class="card wide"><h2>环境事件时间线</h2><div id="events" class="timeline muted">暂无事件</div></section>

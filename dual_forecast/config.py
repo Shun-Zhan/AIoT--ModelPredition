@@ -69,8 +69,8 @@ class Settings:
     max_watering_seconds: int = 60
     watering_cooldown_minutes: int = 15
     max_daily_watering_seconds: int = 600
-    irrigation_trigger_percent: float = 30.0
-    irrigation_target_percent: float = 75.0
+    irrigation_trigger_percent: float = float(os.getenv("AIOT_IRRIGATION_TRIGGER_PERCENT", "30"))
+    irrigation_target_percent: float = float(os.getenv("AIOT_IRRIGATION_TARGET_PERCENT", "75"))
     llm_min_interval_minutes: int = int(os.getenv("AIOT_LLM_INTERVAL_MINUTES", "15"))
     # Automatic irrigation is deliberately opt-in.  The cloud can recommend a
     # command, but the local computer remains the only component allowed to

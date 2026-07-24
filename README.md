@@ -44,6 +44,8 @@ flowchart LR
 | `HIGH_EVAPOTRANSPIRATION` | 土壤偏干 + 高温 + 强光 + 较高风速 + 预测证据 | 记录综合证据，建议高频监测和低频云端分析 |
 | `IRRIGATION_CANDIDATE` | 有效土壤湿度低于本地灌溉触发阈值 | 记录干旱候选；仍只产生建议，绝不无人值守开阀 |
 
+灌溉触发阈值对应土壤传感器的含水率读数，单位为 `%`；默认 `30%` 只是尚未完成田间标定时的工程初值，不是适用于所有土壤和作物的常数。正式部署应先校准传感器，再根据当地土壤的田间持水量 θFC、萎蔫点 θWP、作物根深和允许耗水比例 p 确定，可用 `θ触发 = θFC − p(θFC − θWP)` 作为起点，并结合实际胁迫表现复核。通过 `.env` 中的 `AIOT_IRRIGATION_TRIGGER_PERCENT` 和 `AIOT_IRRIGATION_TARGET_PERCENT` 设置现场值。页面的 `76/100` 等数值是便于排序和着色的规则风险等级分，没有物理单位，也不是模型概率。
+
 SQLite 的 `environment_events` 记录事件代码、严重度、发生时间、证据、建议动作和恢复状态，并使用冷却时间去重。当前事件包括 `SOIL_ABNORMALLY_DRY`、`HIGH_EVAPOTRANSPIRATION_RISK`、`NIGHT_STABLE`、`SENSOR_FAILURE`、`DATA_INTERRUPTION` 和 `VALVE_EXECUTION_FAILURE`。页面的事件时间线和接口可审计这些记录。
 
 | 采样模式 | 推荐间隔 | 使用条件 |

@@ -145,10 +145,13 @@ def assess_environment(
     soil_low = moisture is not None and moisture < settings.high_et_soil_percent
 
     if current.get("soilOk") and soil_dry:
-        events.append(EventAssessment("SOIL_ABNORMALLY_DRY", "high", "土壤湿度低于灌溉触发阈值",
+        events.append(EventAssessment("SOIL_ABNORMALLY_DRY", "high", "土壤含水率低于灌溉触发阈值",
                                       {"moisturePercent": moisture, "triggerPercent": settings.irrigation_trigger_percent},
                                       "形成灌溉候选，等待本地安全审核和人工长按确认"))
-        reasons.append(f"土壤湿度 {moisture:.1f}% 低于触发阈值")
+        reasons.append(
+            f"土壤含水率 {moisture:.1f}% < 灌溉触发阈值 "
+            f"{settings.irrigation_trigger_percent:.1f}%"
+        )
 
     high_et_conditions = {
         "soilLow": soil_low,

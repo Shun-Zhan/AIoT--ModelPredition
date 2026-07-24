@@ -36,6 +36,7 @@ def test_dry_soil_and_open_valve_never_recommends_night_mode():
     assessment = assess_environment(live(soil=20, temp=20, wind=0, solar=0), {"status": "warming_up"}, SETTINGS,
                                     actuator={"state": "OPEN"})
     assert assessment.risk_level == "IRRIGATION_CANDIDATE"
+    assert assessment.reasons[0] == "土壤含水率 20.0% < 灌溉触发阈值 30.0%"
     assert assessment.recommended_sampling_mode == SamplingMode.IRRIGATION_MONITORING
     assert assessment.recommended_read_interval_ms <= 5000
 
