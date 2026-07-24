@@ -262,6 +262,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   var analyzeStatusTimer = null;
   var lastRenderedDecisionId = '';
   var modeSwitchBusy = false;
+  var tcpLastReceivedAt = '';
+  var tcpPreviousPacketAt = null;
+  var tcpPacketCount = 0;
+  var tcpBytesReceived = 0;
+  var tcpRecentPackets = [];
 
   function el(id) { return document.getElementById(id); }
   function has(value) { return value !== null && value !== undefined; }
@@ -397,16 +402,96 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     connection.textContent = '实时数据：' + seconds + ' 秒前';
     connection.className = seconds <= 5 ? 'ok' : (seconds <= 20 ? 'warn' : 'bad');
   }
+  function utf8Length(value) {
+    try { return unescape(encodeURIComponent(value)).length; }
+    catch (error) { return value.length; }
+  }
+  function streamValue(label, value, unit) {
+    return label + '=' + (has(value) ? value : '--') + (unit || '');
+  }
+  function renderTcpStream(snapshot) {
+    if (!snapshot) {
+      el('tcpStatus').textContent = '等待数据';
+      el('tcpStatus').className = 'tcp-status warn';
+      el('tcpLastPacket').textContent = '--';
+      return;
+    }
+
+    var receivedAt = snapshot.receivedAt || '';
+    var receivedDate = new Date(receivedAt);
+    var ageSeconds = isNaN(receivedDate.getTime())
+      ? Infinity
+      : Math.max(0, Math.round((new Date().getTime() - receivedDate.getTime()) / 1000));
+    var tone = ageSeconds <= 5 ? 'ok' : (ageSeconds <= 20 ? 'warn' : 'bad');
+    var statusText = ageSeconds <= 5 ? '接收中' : (ageSeconds <= 20 ? '数据延迟' : '链路中断');
+    el('tcpStatus').textContent = statusText;
+    el('tcpStatus').className = 'tcp-status ' + tone;
+    el('tcpLastPacket').textContent = ageSeconds === Infinity ? '--' : ageSeconds + ' 秒前';
+
+    if (!receivedAt || receivedAt === tcpLastReceivedAt) return;
+
+    var packetText = JSON.stringify(snapshot);
+    var packetBytes = utf8Length(packetText);
+    var intervalSeconds = tcpPreviousPacketAt && !isNaN(receivedDate.getTime())
+      ? Math.max(0, (receivedDate.getTime() - tcpPreviousPacketAt.getTime()) / 1000)
+      : null;
+    tcpLastReceivedAt = receivedAt;
+    tcpPreviousPacketAt = receivedDate;
+    tcpPacketCount += 1;
+    tcpBytesReceived += packetBytes;
+
+    var air = snapshot.air || {}, soil = snapshot.soil || {};
+    tcpRecentPackets.unshift({
+      sequence: tcpPacketCount,
+      time: isNaN(receivedDate.getTime()) ? receivedAt : receivedDate.toLocaleTimeString('zh-CN', {hour12: false}),
+      bytes: packetBytes,
+      summary: [
+        streamValue('air', air.temperatureC, '°C'),
+        streamValue('rh', air.humidityPercent, '%'),
+        streamValue('soil', soil.moisturePercent, '%'),
+        streamValue('wind', snapshot.windSpeedMs, 'm/s'),
+        streamValue('solar', snapshot.solarRadiationWm2, 'W/m²')
+      ].join('  ')
+    });
+    if (tcpRecentPackets.length > 8) tcpRecentPackets.pop();
+
+    el('tcpPacketCount').textContent = tcpPacketCount;
+    el('tcpBytes').textContent = tcpBytesReceived < 1024
+      ? tcpBytesReceived + ' B'
+      : (tcpBytesReceived / 1024).toFixed(1) + ' KB';
+    el('tcpFrequency').textContent = intervalSeconds === null || intervalSeconds === 0
+      ? '计算中'
+      : (1 / intervalSeconds).toFixed(2) + ' Hz';
+
+    var feed = el('tcpFeed');
+    while (feed.firstChild) feed.removeChild(feed.firstChild);
+    for (var i = 0; i < tcpRecentPackets.length; i++) {
+      var packet = tcpRecentPackets[i];
+      var row = document.createElement('div');
+      row.className = 'tcp-packet' + (i === 0 ? ' newest' : '');
+      var meta = document.createElement('span');
+      meta.className = 'tcp-packet-meta';
+      meta.textContent = '#' + packet.sequence + '  ' + packet.time + '  ' + packet.bytes + ' B';
+      var payload = document.createElement('span');
+      payload.className = 'tcp-packet-payload';
+      payload.textContent = packet.summary;
+      row.appendChild(meta);
+      row.appendChild(payload);
+      feed.appendChild(row);
+    }
+  }
   function refresh() {
     request('GET', '/v1/dashboard/latest', null, function (data) {
       var s = data.snapshot;
       if (!s) {
         el('connection').textContent = '等待 ESP32 数据';
         el('connection').className = 'warn';
+        renderTcpStream(null);
         return;
       }
       lastSnapshotAt = new Date(s.receivedAt);
       renderFreshness();
+      renderTcpStream(s);
       var air = s.air || {}, soil = s.soil || {};
       var allSensorNames = [
         '空气温湿度传感器', '大气压力传感器', '风速传感器',
@@ -537,13 +622,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       el('sampling').textContent = '推荐采样：' + (samplingLabels[samplingMode] || samplingMode) + '（' + (edge.recommendedReadIntervalMs || '--') + ' ms）' + (data.samplingConfig ? '；设备配置：' + data.samplingConfig.status : '');
       var actuator = data.actuator || {};
       el('valve').textContent = '水阀：' + (actuator.state || 'CLOSED') + '；数据新鲜度：' + (fresh.fresh ? '新鲜' : '需检查') + '（' + (has(fresh.ageSeconds) ? fresh.ageSeconds : '--') + ' 秒）';
-      var report = data.waterReport || {}, day = report.last24Hours || {}, week = report.last7Days || {};
-      var reportText = '24h：' + (day.wateringCount || 0) + ' 次 / ' + (day.wateringSeconds || 0) + ' 秒；7d：' + (week.wateringCount || 0) + ' 次 / ' + (week.wateringSeconds || 0) + ' 秒。';
-      reportText += report.estimatedLiters === null || !has(report.estimatedLiters) ? '未配置阀门流量，无法估算用水量。' : '估算用水量 ' + report.estimatedLiters + ' L。';
-      el('report').textContent = reportText + ' ' + (report.historyStatus || '');
     }, function (message) {
       el('connection').textContent = '数据读取失败：' + message;
       el('connection').className = 'bad';
+      el('tcpStatus').textContent = '读取失败';
+      el('tcpStatus').className = 'tcp-status bad';
     });
   }
   function setStatusBadge(id, text, tone) {
@@ -1009,16 +1092,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     debugHoldProgressTimer = setInterval(updateDebugProgress, 50);
     debugHoldTimer = setTimeout(sendDebugOpen, 1500);
   }
-  function setQr() {
-    var address = window.location.protocol + '//' + window.location.host + '/dashboard';
-    el('address').textContent = address;
-    var qr = el('qr');
-    qr.src = '/v1/dashboard/qr?url=' + encodeURIComponent(address) + '&_=' + new Date().getTime();
-    qr.onerror = function () {
-      qr.style.display = 'none';
-      el('address').textContent = address + '（二维码生成失败，请复制此地址）';
-    };
-  }
   el('analyze').onclick = function () {
     if (analyzeBusy) return;
     analyzeBusy = true;
@@ -1161,12 +1234,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(new SpeechSynthesisUtterance(latestAnswer || el('answer').textContent));
   };
-  el('copy').onclick = function () {
-    var address = el('address').textContent.replace('（二维码生成失败，请复制此地址）', '');
-    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(address);
-    else { el('address').textContent = address + '（请长按复制）'; }
-  };
-  setQr(); refresh(); refreshCloud();
+  refresh(); refreshCloud();
   window.setInterval(refresh, 2000);
   window.setInterval(refreshCloud, 5000);
   window.setInterval(renderFreshness, 1000);
@@ -1296,7 +1364,30 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     input::placeholder { color: #7b8490; opacity: 1; }
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .row button { margin-right: 0; }
-    .qr { width: 132px; height: 132px; padding: 9px; background: #fff; border-radius: 16px; box-shadow: var(--shadow-small); }
+    .tcp-card { overflow: hidden; }
+    .tcp-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 16px; }
+    .tcp-heading h2 { margin-bottom: 3px; }
+    .tcp-status { position: relative; flex: 0 0 auto; padding: 7px 12px 7px 27px; border-radius: 999px; box-shadow: var(--shadow-inset); font-size: 12px; font-weight: 750; }
+    .tcp-status::before { content: ""; position: absolute; left: 11px; top: 50%; width: 8px; height: 8px; margin-top: -4px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 4px rgba(107, 114, 128, .12); }
+    .tcp-status.ok::before { animation: tcpPulse 1.6s ease-out infinite; }
+    @keyframes tcpPulse {
+      0% { box-shadow: 0 0 0 0 rgba(22, 123, 114, .35); }
+      70%, 100% { box-shadow: 0 0 0 8px rgba(22, 123, 114, 0); }
+    }
+    .tcp-route { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .tcp-node { padding: 7px 10px; border-radius: 12px; box-shadow: var(--shadow-inset); color: var(--text); }
+    .tcp-arrow { color: var(--success); font-size: 16px; }
+    .tcp-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 15px; }
+    .tcp-metric { min-width: 0; padding: 12px 13px; border-radius: 16px; box-shadow: var(--shadow-inset); }
+    .tcp-metric-label { color: var(--muted); font-size: 11px; font-weight: 650; }
+    .tcp-metric-value { margin-top: 5px; color: var(--text); font-size: 18px; font-weight: 780; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tcp-feed { height: 224px; padding: 8px 12px; overflow: hidden; border-radius: 18px; background: #26313a; box-shadow: var(--shadow-inset-deep); color: #dce7e5; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    .tcp-empty { padding: 18px 4px; color: #91a09f; font-size: 12px; }
+    .tcp-packet { position: relative; display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px; padding: 6px 4px; border-bottom: 1px solid rgba(220, 231, 229, .08); font-size: 11px; line-height: 1.35; opacity: .72; }
+    .tcp-packet.newest { color: #fff; opacity: 1; }
+    .tcp-packet.newest::before { content: ""; width: 5px; height: 5px; margin: 5px 0 0 -1px; border-radius: 50%; background: #55d6be; position: absolute; }
+    .tcp-packet-meta { color: #8fc9be; padding-left: 10px; white-space: nowrap; }
+    .tcp-packet-payload { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .hold { min-width: 180px; color: #fff; }
     .formal-confirm { background: var(--success); box-shadow: 7px 7px 14px rgba(22, 123, 114, .28), -5px -5px 12px rgba(255, 255, 255, .56); }
     .formal-confirm:hover:not(:disabled) { color: #fff; background: #126b64; }
@@ -1318,7 +1409,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       .card { padding: 16px; border-radius: 24px; }
       .value { font-size: 21px; }
       .mobile-full { grid-column: 1 / -1; }
-      .qr { width: 112px; height: 112px; }
       .desktop-only { display: none; }
       .row { align-items: stretch; }
       .row input { flex-basis: 100%; }
@@ -1331,6 +1421,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       .mode-card { align-items: stretch; flex-direction: column; }
       .mode-control { width: 100%; }
       .mode-option { flex: 1 1 50%; min-width: 0; }
+      .tcp-heading { align-items: flex-start; }
+      .tcp-route { flex-wrap: wrap; }
+      .tcp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .tcp-feed { height: 248px; }
+      .tcp-packet { grid-template-columns: 1fr; gap: 2px; }
+      .tcp-packet-payload { padding-left: 10px; }
     }
   </style>
 </head>
@@ -1437,10 +1533,32 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       </div>
     </section>
     <section class="card wide"><h2>自然语言问答（可选语音）</h2><div class="row"><input id="question" placeholder="例如：今天需要调整灌溉计划吗？"><button id="ask">提问</button><button id="voice" class="secondary">开始说话</button><button id="speak" class="secondary">朗读回答</button></div><div id="voiceStatus" class="meta"></div><div id="answer" class="muted" style="margin-top:12px;white-space:pre-line"></div></section>
-    <section class="card wide"><h2>手机入口</h2><div class="row"><img id="qr" class="qr" alt="当前页面二维码"><div><div id="address" class="meta"></div><button id="copy" class="secondary">复制访问地址</button><div class="meta">二维码由浏览器按当前地址生成；若手机不能访问，请让电脑与手机在同一 Wi‑Fi，并以 --host 0.0.0.0 启动服务。</div></div></div></section>
-    <section class="card wide"><h2>节水与运行报告</h2><div id="report" class="meta">数据积累中</div></section><div id="updated" class="muted">尚未收到 ESP32 数据</div>
+    <section class="card wide tcp-card" aria-labelledby="tcpStreamTitle">
+      <div class="tcp-heading">
+        <div>
+          <h2 id="tcpStreamTitle">Wi-Fi TCP 实时数据流</h2>
+          <div class="meta">ESP32 遥测包随采集数据实时刷新</div>
+        </div>
+        <div id="tcpStatus" class="tcp-status warn" aria-live="polite">等待数据</div>
+      </div>
+      <div class="tcp-route" aria-label="数据链路">
+        <span class="tcp-node">ESP32 传感器</span><span class="tcp-arrow">→</span>
+        <span class="tcp-node">Wi-Fi · TCP 3333</span><span class="tcp-arrow">→</span>
+        <span class="tcp-node">本机 Dashboard</span>
+      </div>
+      <div class="tcp-metrics">
+        <div class="tcp-metric"><div class="tcp-metric-label">最近数据包</div><div id="tcpLastPacket" class="tcp-metric-value">--</div></div>
+        <div class="tcp-metric"><div class="tcp-metric-label">页面会话接收</div><div id="tcpPacketCount" class="tcp-metric-value">0</div></div>
+        <div class="tcp-metric"><div class="tcp-metric-label">累计数据量</div><div id="tcpBytes" class="tcp-metric-value">0 B</div></div>
+        <div class="tcp-metric"><div class="tcp-metric-label">实时刷新频率</div><div id="tcpFrequency" class="tcp-metric-value">计算中</div></div>
+      </div>
+      <div id="tcpFeed" class="tcp-feed" role="log" aria-live="polite" aria-label="最近接收的 TCP 遥测数据包">
+        <div class="tcp-empty">等待 ESP32 通过 Wi-Fi TCP 发送遥测数据…</div>
+      </div>
+    </section>
+    <div id="updated" class="muted">尚未收到 ESP32 数据</div>
   </main>
-<script defer src="/v1/dashboard/app.js?v=20260724-sensor-status"></script>
+<script defer src="/v1/dashboard/app.js?v=20260725-tcp-stream"></script>
 </body></html>"""
 
     @app.get("/health")

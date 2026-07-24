@@ -199,8 +199,8 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "setAnalyzeState" in app_js.text
     assert "/cancel" in app_js.text
     assert "pointerdown" in app_js.text
-    assert "window.location.protocol" in app_js.text
-    assert "/v1/dashboard/qr?url=" in app_js.text
+    assert "renderTcpStream" in app_js.text
+    assert "tcpRecentPackets" in app_js.text
     assert "存在传感器离线" in app_js.text
     assert "长时间没收到数据" in app_js.text
     assert "allSensorNames" in app_js.text
@@ -213,6 +213,11 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "el('valve').hidden = sensorOffline" in app_js.text
     assert "action-button" in html
     assert "<h2>设备状态</h2>" in html
+    assert "Wi-Fi TCP 实时数据流" in html
+    assert "Wi-Fi · TCP 3333" in html
+    assert 'id="tcpFeed"' in html
+    assert "<h2>手机入口</h2>" not in html
+    assert "<h2>节水与运行报告</h2>" not in html
     assert "设备状态与环境风险" not in html
     assert "环境事件时间线" not in html
     assert 'id="events"' not in html
