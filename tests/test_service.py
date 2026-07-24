@@ -59,7 +59,7 @@ def test_dashboard_exposes_latest_snapshot(tmp_path):
 
     page = client.get("/dashboard")
     assert page.status_code == 200
-    assert "AIoT 智慧农业监控" in page.text
+    assert "AIoT 智慧灌溉监控" in page.text
 
     latest = client.get("/v1/dashboard/latest")
     assert latest.status_code == 200

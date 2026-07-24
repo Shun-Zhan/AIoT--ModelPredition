@@ -110,7 +110,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                 "unit": "%",
                 "basis": "默认工程初值；应按当地土壤、作物根区和传感器实测校准",
             },
-            "riskScoreNote": "规则风险等级分，无物理单位；不是传感器测量值",
+            "riskScoreNote": "规则风险等级，无物理单位；不是传感器测量值",
         }
 
     def water_report() -> dict:
@@ -203,6 +203,70 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   function setValue(id, value, unit, digits) {
     el(id).innerHTML = number(value, has(digits) ? digits : 1) + ' <span class="unit">' + unit + '</span>';
   }
+  function forecastChart(points, key, digits, color, unit, label) {
+    var values = [], i;
+    for (i = 0; i < points.length; i++) {
+      var raw = Number(points[i][key]);
+      if (isFinite(raw)) values.push(raw);
+    }
+    if (!values.length) return '<text x="320" y="110" text-anchor="middle" class="chart-empty">暂无预测数据</text>';
+
+    var width = 640, height = 220;
+    var left = 58, right = 18, top = 18, bottom = 38;
+    var plotWidth = width - left - right, plotHeight = height - top - bottom;
+    var minimum = Math.min.apply(Math, values), maximum = Math.max.apply(Math, values);
+    var padding = Math.max((maximum - minimum) * 0.16, key === 'et0Mm' ? 0.002 : 0.4);
+    var yMin = Math.max(key === 'et0Mm' ? 0 : -Infinity, minimum - padding);
+    var yMax = maximum + padding;
+    if (yMax === yMin) yMax = yMin + 1;
+    var svg = [], coords = [];
+    for (i = 0; i < 5; i++) {
+      var gridY = top + plotHeight * i / 4;
+      var tickValue = yMax - (yMax - yMin) * i / 4;
+      svg.push('<line x1="' + left + '" y1="' + gridY.toFixed(1) + '" x2="' + (width - right) + '" y2="' + gridY.toFixed(1) + '" class="chart-grid"/>');
+      svg.push('<text x="' + (left - 9) + '" y="' + (gridY + 4).toFixed(1) + '" text-anchor="end" class="chart-axis">' + tickValue.toFixed(digits) + '</text>');
+    }
+    for (i = 0; i < values.length; i++) {
+      var x = left + (values.length === 1 ? plotWidth / 2 : plotWidth * i / (values.length - 1));
+      var y = top + (yMax - values[i]) / (yMax - yMin) * plotHeight;
+      coords.push(x.toFixed(1) + ',' + y.toFixed(1));
+    }
+    svg.push('<polyline points="' + coords.join(' ') + '" fill="none" stroke="' + color + '" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>');
+    for (i = 0; i < values.length; i++) {
+      var parts = coords[i].split(',');
+      svg.push('<circle cx="' + parts[0] + '" cy="' + parts[1] + '" r="4.5" fill="' + color + '" class="chart-point"><title>未来 ' + ((i + 1) * 5) + ' 分钟：' + values[i].toFixed(digits) + ' ' + unit + '</title></circle>');
+    }
+    var xTicks = [0, Math.floor((values.length - 1) / 2), values.length - 1];
+    var seen = {};
+    for (i = 0; i < xTicks.length; i++) {
+      var tick = xTicks[i];
+      if (seen[tick]) continue;
+      seen[tick] = true;
+      var tickX = left + (values.length === 1 ? plotWidth / 2 : plotWidth * tick / (values.length - 1));
+      svg.push('<text x="' + tickX.toFixed(1) + '" y="' + (height - 12) + '" text-anchor="middle" class="chart-axis">+' + ((tick + 1) * 5) + ' 分钟</text>');
+    }
+    svg.push('<text x="15" y="' + (top + plotHeight / 2) + '" text-anchor="middle" transform="rotate(-90 15 ' + (top + plotHeight / 2) + ')" class="chart-unit">' + label + '（' + unit + '）</text>');
+    return svg.join('');
+  }
+  function renderForecastCharts(points) {
+    var charts = el('forecastCharts');
+    var empty = el('forecastEmpty');
+    if (!points || !points.length) {
+      charts.hidden = true;
+      empty.hidden = false;
+      el('forecastSummary').hidden = true;
+      return;
+    }
+    empty.hidden = true;
+    charts.hidden = false;
+    el('forecastSummary').hidden = false;
+    el('et0ForecastChart').innerHTML = forecastChart(points, 'et0Mm', 3, '#6C63FF', 'mm', 'ET₀');
+    el('soilForecastChart').innerHTML = forecastChart(points, 'soilMoisturePercent', 1, '#167B72', '%', '土壤湿度');
+    var first = points[0], last = points[points.length - 1];
+    el('forecastSummary').textContent =
+      '未来 1 小时累计 ET₀：' + number(points.reduce(function (sum, point) { return sum + Number(point.et0Mm || 0); }, 0), 3) + ' mm'
+      + '　·　土壤湿度：' + number(first.soilMoisturePercent, 1) + '% → ' + number(last.soilMoisturePercent, 1) + '%';
+  }
   function request(method, path, body, success, failure) {
     var xhr = new XMLHttpRequest();
     var separator = path.indexOf('?') === -1 ? '?' : '&';
@@ -239,6 +303,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       lastSnapshotAt = new Date(s.receivedAt);
       renderFreshness();
       var air = s.air || {}, soil = s.soil || {};
+      var sensorIssues = [];
+      if (!s.airOk) sensorIssues.push('空气温湿度传感器');
+      if (!s.soilOk || !has(soil.moisturePercent) || Number(soil.moisturePercent) <= 0) sensorIssues.push('土壤湿度传感器');
+      if (!s.windOk) sensorIssues.push('风速传感器');
+      if (s.solarSource === 'incoming_invalid') sensorIssues.push('入射太阳辐射传感器');
+      else if (s.solarSource === 'default_albedo_fallback') sensorIssues.push('反射太阳辐射传感器');
       setValue('airTemp', s.airOk ? air.temperatureC : null, '°C', 1);
       setValue('airRh', s.airOk ? air.humidityPercent : null, '%RH', 1);
       setValue('pressure', s.airPressureHpa, 'hPa', 0);
@@ -261,28 +331,49 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
       var forecast = data.forecast;
       if (forecast) {
-        var first = forecast.forecast && forecast.forecast.length ? forecast.forecast[0] : null;
+        var forecastPoints = forecast.forecast || [];
         var forecastStatus = forecast.status || '--';
         if (forecastStatus === 'warming_up') forecastStatus = '连续完整数据积累中';
         else if (forecastStatus === 'ok') forecastStatus = '预测正常';
         else if (forecastStatus === 'model_unavailable') forecastStatus = '模型未就绪';
         var modelText = '状态：' + forecastStatus + '\n连续完整样本：' + (forecast.availableSamples || 0) + '/' + (forecast.requiredSamples || '--');
-        if (first) modelText += '\n下一时段 ET₀：' + number(first.et0Mm, 3) + ' mm，预测土壤湿度：' + number(first.soilMoisturePercent, 1) + ' %';
         el('model').textContent = modelText;
-        el('model').className = forecast.status === 'ok' ? 'value ok' : 'value warn';
+        el('model').className = forecast.status === 'ok' ? 'model-status ok' : 'model-status warn';
+        renderForecastCharts(forecastPoints);
+      } else {
+        el('model').textContent = '状态：等待预测数据';
+        el('model').className = 'model-status warn';
+        renderForecastCharts([]);
       }
       var edgePrediction = s.edgePrediction;
-      if (!edgePrediction) {
+      if (sensorIssues.length) {
+        el('edgePrediction').textContent = '传感器异常：' + sensorIssues.join('、') + '。请检查接线或探头状态，ESP32 趋势估计暂不作为判断依据。';
+        el('edgePrediction').className = 'value bad';
+        el('edgePrediction').style.fontSize = '17px';
+      } else if (!edgePrediction) {
         el('edgePrediction').textContent = '等待 ESP32 边缘预测数据...';
         el('edgePrediction').className = 'meta';
       } else if (!edgePrediction.valid) {
-        el('edgePrediction').textContent = '状态：传感器不完整，ESP32 本地预测暂停。';
+        el('edgePrediction').textContent = 'ESP32 暂时无法生成土壤趋势，请检查传感器数据。';
         el('edgePrediction').className = 'meta warn';
       } else {
-        var edgeText = '模式：ESP32 轻量离线降级\n';
-        edgeText += '30 分钟后土壤湿度：' + number(edgePrediction.predictedSoilMoisture30mPercent, 1) + ' %\n';
+        var edgeRiskLabels = {
+          NORMAL: '正常',
+          ATTENTION: '需要关注',
+          DRY_RISK: '土壤干燥风险',
+          SENSOR_INVALID: '传感器数据异常'
+        };
+        var edgeReasonLabels = {
+          stable_soil: '土壤湿度趋势稳定',
+          low_soil_moisture: '土壤湿度过低',
+          rapid_drying: '土壤正在快速变干',
+          soil_moisture_declining: '土壤湿度持续下降',
+          sensor_invalid: '传感器数据不完整'
+        };
+        var edgeText = '预计 30 分钟后土壤湿度：' + number(edgePrediction.predictedSoilMoisture30mPercent, 1) + ' %\n';
         edgeText += '预计干燥速率：' + number(edgePrediction.dryingRatePercentPerHour, 3) + ' %/h\n';
-        edgeText += '风险：' + (edgePrediction.riskLevel || '--') + '（' + (edgePrediction.reason || '--') + '）';
+        edgeText += '趋势判断：' + (edgeRiskLabels[edgePrediction.riskLevel] || edgePrediction.riskLevel || '--')
+          + '（' + (edgeReasonLabels[edgePrediction.reason] || edgePrediction.reason || '--') + '）';
         el('edgePrediction').textContent = edgeText;
         el('edgePrediction').className = 'value ' + (edgePrediction.riskLevel === 'NORMAL' ? 'ok' : (edgePrediction.riskLevel === 'ATTENTION' ? 'warn' : 'bad'));
         el('edgePrediction').style.fontSize = '17px';
@@ -294,15 +385,16 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         HIGH_EVAPOTRANSPIRATION: '高蒸散风险',
         IRRIGATION_CANDIDATE: '灌溉候选'
       };
-      el('risk').textContent = (riskLabels[risk] || risk) + ' · 风险等级分 ' + (has(edge.riskScore) ? edge.riskScore : '--') + '/100';
-      el('risk').className = 'value ' + (risk === 'NORMAL' ? 'ok' : (risk === 'ATTENTION' ? 'warn' : 'bad'));
+      el('risk').textContent = sensorIssues.length
+        ? '传感器异常：' + sensorIssues.join('、')
+        : '传感器数据正常 · ' + (riskLabels[risk] || risk);
+      el('risk').className = 'value ' + (sensorIssues.length ? 'bad' : (risk === 'NORMAL' ? 'ok' : (risk === 'ATTENTION' ? 'warn' : 'bad')));
       el('riskReasons').textContent = (edge.reasons || []).join('；');
       var thresholds = edge.thresholds || {};
       el('riskThreshold').textContent = '灌溉触发条件：' + (thresholds.quantity || '土壤含水率') + ' < '
         + number(thresholds.irrigationSoilMoisturePercent, 1) + (thresholds.unit || '%')
         + '；目标值：' + number(thresholds.irrigationTargetSoilMoisturePercent, 1) + (thresholds.unit || '%')
         + '。' + (thresholds.basis || '');
-      el('riskScoreNote').textContent = edge.riskScoreNote || '';
       var samplingLabels = {
         DEBUG: '故障诊断',
         IRRIGATION_MONITORING: '灌溉监测',
@@ -585,7 +677,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>AIoT 智慧农业监控</title>
+  <title>AIoT 智慧灌溉监控</title>
   <style>
     :root {
       color-scheme: light;
@@ -609,7 +701,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     * { box-sizing: border-box; }
     body { margin: 0; min-width: 320px; background: var(--bg); color: var(--text); }
     header { max-width: 1160px; margin: auto; padding: 26px 24px 20px; display: flex; justify-content: space-between; gap: 16px; align-items: center; }
-    h1 { margin: 0; font-size: 25px; font-weight: 750; letter-spacing: 0; }
+    h1 { margin: 0; font-size: 34px; font-weight: 780; letter-spacing: 0; }
     h2 { margin: 0 0 12px; font-size: 17px; font-weight: 700; letter-spacing: 0; }
     .muted, .meta { color: var(--muted); font-size: 13px; line-height: 1.55; }
     main { padding: 0 24px 34px; max-width: 1160px; margin: auto; }
@@ -624,6 +716,20 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .bad { color: var(--danger); font-weight: 700; }
     .pill { display: inline-block; margin: 4px 4px 0 0; padding: 6px 10px; border-radius: 999px; background: var(--bg); color: var(--text); box-shadow: var(--shadow-inset); font-size: 13px; }
     .timeline { max-height: 190px; overflow: auto; padding: 12px; border-radius: 16px; box-shadow: var(--shadow-inset); white-space: pre-line; line-height: 1.6; }
+    .model-status { margin: 0 0 16px; color: var(--muted); font-size: 13px; line-height: 1.6; white-space: pre-line; }
+    .forecast-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .forecast-panel { min-width: 0; padding: 15px 14px 10px; border-radius: 22px; box-shadow: var(--shadow-inset); }
+    .forecast-panel-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 4px 8px; font-size: 14px; font-weight: 750; }
+    .forecast-legend { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; font-weight: 600; }
+    .forecast-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
+    .forecast-dot.soil { background: var(--success); }
+    .forecast-svg { display: block; width: 100%; height: auto; min-height: 190px; overflow: visible; }
+    .chart-grid { stroke: rgba(107, 114, 128, .22); stroke-width: 1; stroke-dasharray: 4 5; }
+    .chart-axis, .chart-unit, .chart-empty { fill: var(--muted); font-size: 11px; font-family: inherit; }
+    .chart-unit { font-size: 10px; font-weight: 650; }
+    .chart-point { stroke: var(--bg); stroke-width: 2; }
+    .forecast-summary { margin-top: 14px; padding: 11px 14px; border-radius: 15px; box-shadow: var(--shadow-inset); color: var(--text); font-size: 13px; font-weight: 650; text-align: center; }
+    .forecast-empty { padding: 34px 18px; border-radius: 20px; box-shadow: var(--shadow-inset); color: var(--muted); text-align: center; font-size: 14px; }
     button {
       min-height: 44px; margin: 10px 8px 0 0; padding: 10px 15px; border: 0; border-radius: 16px;
       color: var(--accent); background: var(--bg); box-shadow: var(--shadow-small); cursor: pointer; touch-action: manipulation;
@@ -657,7 +763,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     }
     @media (max-width: 620px) {
       header { padding: 20px 16px 18px; align-items: flex-start; flex-direction: column; }
-      h1 { font-size: 21px; }
+      h1 { font-size: 28px; }
       main { padding: 0 16px 26px; }
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .card { padding: 16px; border-radius: 24px; }
@@ -667,11 +773,13 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       .desktop-only { display: none; }
       .row { align-items: stretch; }
       .row input { flex-basis: 100%; }
+      .forecast-charts { grid-template-columns: 1fr; }
+      .forecast-svg { min-height: 165px; }
     }
   </style>
 </head>
 <body>
-  <header><div><h1>AIoT 智慧农业监控</h1><div class="muted">电脑端本地边缘网关 · ESP32 安全执行</div></div><div id="connection" class="muted">正在连接...</div></header>
+  <header><div><h1>AIoT 智慧灌溉监控</h1></div><div id="connection" class="muted">正在连接...</div></header>
   <main>
     <section class="grid">
       <div class="card"><div class="label">空气温度</div><div id="airTemp" class="value">-- <span class="unit">°C</span></div></div>
@@ -685,16 +793,31 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card"><div class="label">入射短波（Solar 2）</div><div id="solarIncoming" class="value">-- <span class="unit">W/m²</span></div></div>
       <div class="card"><div class="label">反射短波（Solar 1）</div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
-    <section class="card wide mobile-full"><h2>移动巡检与边缘风险</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="riskScoreNote" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
-    <section class="card wide"><h2>预测模型（电脑端完整时序模型）</h2><div id="model" class="value" style="font-size:18px">等待数据...</div></section>
-    <section class="card wide"><h2>ESP32 边缘预测（断网降级）</h2><div id="edgePrediction" class="meta">等待 ESP32 边缘预测数据...</div><div class="meta">仅作趋势与风险提示；不会直接打开水阀。</div></section>
+    <section class="card wide mobile-full"><h2>设备状态与环境风险</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
+    <section class="card wide">
+      <h2>未来 1 小时预测</h2>
+      <div id="model" class="model-status">等待数据...</div>
+      <div id="forecastEmpty" class="forecast-empty">需要连续 288 个五分钟数据点，模型完成预热后显示预测曲线。</div>
+      <div id="forecastCharts" class="forecast-charts" hidden>
+        <div class="forecast-panel">
+          <div class="forecast-panel-title"><span>ET₀ 预测</span><span class="forecast-legend"><span class="forecast-dot"></span>N-BEATS</span></div>
+          <svg id="et0ForecastChart" class="forecast-svg" viewBox="0 0 640 220" role="img" aria-label="未来一小时 ET₀ 预测曲线"></svg>
+        </div>
+        <div class="forecast-panel">
+          <div class="forecast-panel-title"><span>土壤湿度预测</span><span class="forecast-legend"><span class="forecast-dot soil"></span>LSTM</span></div>
+          <svg id="soilForecastChart" class="forecast-svg" viewBox="0 0 640 220" role="img" aria-label="未来一小时土壤湿度预测曲线"></svg>
+        </div>
+      </div>
+      <div id="forecastSummary" class="forecast-summary" hidden></div>
+    </section>
+    <section class="card wide"><h2>ESP32 未来 30 分钟土壤趋势</h2><div id="edgePrediction" class="meta">等待 ESP32 趋势数据...</div><div class="meta">ESP32 根据当前传感器数据做轻量估算，辅助判断土壤是否继续变干。</div></section>
     <section class="card wide"><h2>环境事件时间线</h2><div id="events" class="timeline muted">暂无事件</div></section>
     <section class="card wide"><h2>云端增强与水阀安全层</h2><div id="cloud" class="meta">正在读取状态...</div><button id="analyze" class="action-button" type="button" aria-busy="false">请求一次分析</button><button id="confirm" class="hold" type="button" hidden>长按 1.5 秒确认灌溉</button><button id="cancel" class="secondary" type="button" hidden>取消待确认建议</button><div id="analyzeStatus" class="meta" aria-live="polite"></div><div id="confirmStatus" class="meta" aria-live="polite"></div><div class="meta">长按仅是交互确认；后端仍会重新校验传感器新鲜度、湿度、冷却时间和日限额。</div></section>
     <section class="card wide"><h2>自然语言问答（可选语音）</h2><div class="row"><input id="question" placeholder="例如：今天需要调整灌溉计划吗？"><button id="ask">提问</button><button id="voice" class="secondary">开始说话</button><button id="speak" class="secondary">朗读回答</button></div><div id="voiceStatus" class="meta"></div><div id="answer" class="muted" style="margin-top:12px;white-space:pre-line"></div></section>
     <section class="card wide"><h2>手机入口</h2><div class="row"><img id="qr" class="qr" alt="当前页面二维码"><div><div id="address" class="meta"></div><button id="copy" class="secondary">复制访问地址</button><div class="meta">二维码由浏览器按当前地址生成；若手机不能访问，请让电脑与手机在同一 Wi‑Fi，并以 --host 0.0.0.0 启动服务。</div></div></div></section>
     <section class="card wide"><h2>节水与运行报告</h2><div id="report" class="meta">数据积累中</div></section><div id="updated" class="muted">尚未收到 ESP32 数据</div>
   </main>
-<script defer src="/v1/dashboard/app.js?v=20260723-action-feedback"></script>
+<script defer src="/v1/dashboard/app.js?v=20260724-sensor-status"></script>
 </body></html>"""
 
     @app.get("/health")

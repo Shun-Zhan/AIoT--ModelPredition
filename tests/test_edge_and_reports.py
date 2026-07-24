@@ -124,6 +124,18 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "/v1/dashboard/qr?url=" in app_js.text
     assert "action-button" in html
     assert "analyzeStatus" in html
+    assert "et0ForecastChart" in html
+    assert "soilForecastChart" in html
+    assert "未来一小时 ET₀ 预测曲线" in html
+    assert "forecastChart(points" in app_js.text
+    assert "renderForecastCharts(forecastPoints)" in app_js.text
+    assert "电脑端本地边缘网关 · ESP32 安全执行" not in html
+    assert "font-size: 34px" in html
+    assert "riskScoreNote" not in html
+    assert "风险等级 " not in app_js.text
+    assert "传感器异常：" in app_js.text
+    assert "土壤湿度传感器" in app_js.text
+    assert "ESP32 未来 30 分钟土壤趋势" in html
     assert "#E0E5EC" in html
     assert "--shadow-extruded" in html
     assert "prefers-reduced-motion" in html
