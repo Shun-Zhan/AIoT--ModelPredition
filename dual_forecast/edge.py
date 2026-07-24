@@ -73,6 +73,13 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+def soil_moisture_is_valid(current: dict[str, Any]) -> bool:
+    """Treat the disconnected-probe sentinel of 0% as invalid telemetry."""
+    soil = current.get("soil") if isinstance(current.get("soil"), dict) else {}
+    moisture = _as_float(soil.get("moisturePercent"))
+    return bool(current.get("soilOk") and moisture is not None and 0 < moisture <= 100)
+
+
 def _forecast_evidence(forecast: dict[str, Any], settings: Settings) -> dict[str, Any]:
     points = forecast.get("forecast") if isinstance(forecast, dict) else None
     status = forecast.get("status", "unavailable") if isinstance(forecast, dict) else "unavailable"
@@ -167,7 +174,7 @@ def assess_environment(
         "receivedAt": received_text,
     }
     failed = [name for name, ok in (
-        ("air", current.get("airOk")), ("soil", current.get("soilOk")),
+        ("air", current.get("airOk")), ("soil", soil_moisture_is_valid(current)),
         ("wind", current.get("windOk")), ("solar", current.get("solarOk")),
     ) if not ok]
     pressure = _as_float(current.get("airPressureHpa"))

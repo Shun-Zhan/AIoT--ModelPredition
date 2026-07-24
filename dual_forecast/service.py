@@ -197,6 +197,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   var voiceGotResult = false;
   var analyzeBusy = false;
   var analyzeStatusTimer = null;
+  var lastRenderedDecisionId = '';
 
   function el(id) { return document.getElementById(id); }
   function has(value) { return value !== null && value !== undefined; }
@@ -249,6 +250,43 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       svg.push('<text x="' + tickX.toFixed(1) + '" y="' + (height - 12) + '" text-anchor="middle" class="chart-axis">+' + ((tick + 1) * 5) + ' 分钟</text>');
     }
     svg.push('<text x="15" y="' + (top + plotHeight / 2) + '" text-anchor="middle" transform="rotate(-90 15 ' + (top + plotHeight / 2) + ')" class="chart-unit">' + label + '（' + unit + '）</text>');
+    return svg.join('');
+  }
+  function edgeTrendChart(currentMoisture, predictedMoisture) {
+    var current = Number(currentMoisture), predicted = Number(predictedMoisture);
+    if (!isFinite(current) || !isFinite(predicted)) {
+      return '<text x="320" y="100" text-anchor="middle" class="chart-empty">暂无趋势数据</text>';
+    }
+    var values = [], minutes = [0, 10, 20, 30], i;
+    for (i = 0; i < minutes.length; i++) {
+      values.push(current + (predicted - current) * minutes[i] / 30);
+    }
+    var width = 640, height = 200;
+    var left = 58, right = 18, top = 18, bottom = 38;
+    var plotWidth = width - left - right, plotHeight = height - top - bottom;
+    var minimum = Math.min.apply(Math, values), maximum = Math.max.apply(Math, values);
+    var padding = Math.max((maximum - minimum) * 0.2, 0.4);
+    var yMin = Math.max(0, minimum - padding), yMax = Math.min(100, maximum + padding);
+    if (yMax === yMin) yMax = Math.min(100, yMin + 1);
+    var svg = [], coords = [];
+    for (i = 0; i < 4; i++) {
+      var gridY = top + plotHeight * i / 3;
+      var tickValue = yMax - (yMax - yMin) * i / 3;
+      svg.push('<line x1="' + left + '" y1="' + gridY.toFixed(1) + '" x2="' + (width - right) + '" y2="' + gridY.toFixed(1) + '" class="chart-grid"/>');
+      svg.push('<text x="' + (left - 9) + '" y="' + (gridY + 4).toFixed(1) + '" text-anchor="end" class="chart-axis">' + tickValue.toFixed(1) + '</text>');
+    }
+    for (i = 0; i < values.length; i++) {
+      var x = left + plotWidth * i / (values.length - 1);
+      var y = top + (yMax - values[i]) / (yMax - yMin) * plotHeight;
+      coords.push(x.toFixed(1) + ',' + y.toFixed(1));
+    }
+    svg.push('<polyline points="' + coords.join(' ') + '" fill="none" stroke="#167B72" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>');
+    for (i = 0; i < values.length; i++) {
+      var parts = coords[i].split(',');
+      svg.push('<circle cx="' + parts[0] + '" cy="' + parts[1] + '" r="5" fill="#167B72" class="chart-point"><title>' + (minutes[i] ? '+' + minutes[i] + ' 分钟' : '当前') + '：' + values[i].toFixed(1) + ' %</title></circle>');
+      svg.push('<text x="' + parts[0] + '" y="' + (height - 12) + '" text-anchor="middle" class="chart-axis">' + (minutes[i] ? '+' + minutes[i] + ' 分钟' : '当前') + '</text>');
+    }
+    svg.push('<text x="15" y="' + (top + plotHeight / 2) + '" text-anchor="middle" transform="rotate(-90 15 ' + (top + plotHeight / 2) + ')" class="chart-unit">土壤湿度（%）</text>');
     return svg.join('');
   }
   function renderForecastCharts(points) {
@@ -306,12 +344,17 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       lastSnapshotAt = new Date(s.receivedAt);
       renderFreshness();
       var air = s.air || {}, soil = s.soil || {};
+      var allSensorNames = [
+        '空气温湿度传感器', '大气压力传感器', '风速传感器',
+        '土壤温湿度传感器', '入射太阳辐射传感器', '反射太阳辐射传感器'
+      ];
       var sensorIssues = [];
-      if (!s.airOk) sensorIssues.push('空气温湿度传感器');
-      if (!s.soilOk || !has(soil.moisturePercent) || Number(soil.moisturePercent) <= 0) sensorIssues.push('土壤湿度传感器');
-      if (!s.windOk) sensorIssues.push('风速传感器');
-      if (s.solarSource === 'incoming_invalid') sensorIssues.push('入射太阳辐射传感器');
-      else if (s.solarSource === 'default_albedo_fallback') sensorIssues.push('反射太阳辐射传感器');
+      if (!s.airOk || !has(air.temperatureC) || !has(air.humidityPercent)) sensorIssues.push('空气温湿度传感器');
+      if (!has(s.airPressureHpa) || Number(s.airPressureHpa) <= 0) sensorIssues.push('大气压力传感器');
+      if (!s.windOk || !has(s.windSpeedMs)) sensorIssues.push('风速传感器');
+      if (!s.soilOk || !has(soil.temperatureC) || !has(soil.moisturePercent) || Number(soil.moisturePercent) <= 0) sensorIssues.push('土壤温湿度传感器');
+      if (s.solarSource === 'incoming_invalid' || !has(s.solarIncomingWm2)) sensorIssues.push('入射太阳辐射传感器');
+      if (s.solarSource === 'default_albedo_fallback' || !has(s.solarReflectedWm2)) sensorIssues.push('反射太阳辐射传感器');
       setValue('airTemp', s.airOk ? air.temperatureC : null, '°C', 1);
       setValue('airRh', s.airOk ? air.humidityPercent : null, '%RH', 1);
       setValue('pressure', s.airPressureHpa, 'hPa', 0);
@@ -353,12 +396,15 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         el('edgePrediction').textContent = '传感器异常：' + sensorIssues.join('、') + '。请检查接线或探头状态，ESP32 趋势估计暂不作为判断依据。';
         el('edgePrediction').className = 'value bad';
         el('edgePrediction').style.fontSize = '17px';
+        el('edgeTrendPanel').hidden = true;
       } else if (!edgePrediction) {
         el('edgePrediction').textContent = '等待 ESP32 边缘预测数据...';
         el('edgePrediction').className = 'meta';
+        el('edgeTrendPanel').hidden = true;
       } else if (!edgePrediction.valid) {
         el('edgePrediction').textContent = 'ESP32 暂时无法生成土壤趋势，请检查传感器数据。';
         el('edgePrediction').className = 'meta warn';
+        el('edgeTrendPanel').hidden = true;
       } else {
         var edgeRiskLabels = {
           NORMAL: '正常',
@@ -373,13 +419,21 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
           soil_moisture_declining: '土壤湿度持续下降',
           sensor_invalid: '传感器数据不完整'
         };
-        var edgeText = '预计 30 分钟后土壤湿度：' + number(edgePrediction.predictedSoilMoisture30mPercent, 1) + ' %\n';
-        edgeText += '预计干燥速率：' + number(edgePrediction.dryingRatePercentPerHour, 3) + ' %/h\n';
+        var currentMoisture = Number(soil.moisturePercent);
+        var predictedMoisture = Number(edgePrediction.predictedSoilMoisture30mPercent);
+        var moistureChange = predictedMoisture - currentMoisture;
+        var changeText = (moistureChange > 0 ? '+' : '') + number(moistureChange, 1);
+        var edgeText = '当前土壤湿度：' + number(currentMoisture, 1) + '%　→　30 分钟后：'
+          + number(predictedMoisture, 1) + '%\n';
+        edgeText += '预计变化：' + changeText + ' 个百分点　·　干燥速率：'
+          + number(edgePrediction.dryingRatePercentPerHour, 3) + ' %/h\n';
         edgeText += '趋势判断：' + (edgeRiskLabels[edgePrediction.riskLevel] || edgePrediction.riskLevel || '--')
           + '（' + (edgeReasonLabels[edgePrediction.reason] || edgePrediction.reason || '--') + '）';
         el('edgePrediction').textContent = edgeText;
         el('edgePrediction').className = 'value ' + (edgePrediction.riskLevel === 'NORMAL' ? 'ok' : (edgePrediction.riskLevel === 'ATTENTION' ? 'warn' : 'bad'));
         el('edgePrediction').style.fontSize = '17px';
+        el('edgeTrendChart').innerHTML = edgeTrendChart(currentMoisture, predictedMoisture);
+        el('edgeTrendPanel').hidden = false;
       }
       var edge = data.edge || {}, risk = edge.riskLevel || '--';
       var riskLabels = {
@@ -388,11 +442,19 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         HIGH_EVAPOTRANSPIRATION: '高蒸散风险',
         IRRIGATION_CANDIDATE: '灌溉候选'
       };
-      el('risk').textContent = sensorIssues.length
-        ? '传感器异常：' + sensorIssues.join('、')
+      var fresh = edge.dataFreshness || {};
+      var sensorOffline = sensorIssues.length > 0 || fresh.fresh === false;
+      var offlineSensors = fresh.fresh === false ? allSensorNames.slice() : sensorIssues.slice();
+      el('risk').textContent = sensorOffline
+        ? '存在传感器离线'
         : '传感器数据正常 · ' + (riskLabels[risk] || risk);
-      el('risk').className = 'value ' + (sensorIssues.length ? 'bad' : (risk === 'NORMAL' ? 'ok' : (risk === 'ATTENTION' ? 'warn' : 'bad')));
-      el('riskReasons').textContent = (edge.reasons || []).join('；');
+      el('risk').className = 'value ' + (sensorOffline ? 'bad' : (risk === 'NORMAL' ? 'ok' : (risk === 'ATTENTION' ? 'warn' : 'bad')));
+      el('riskReasons').textContent = sensorOffline
+        ? offlineSensors.join('、') + '长时间没收到数据'
+        : (edge.reasons || []).join('；');
+      el('riskThreshold').hidden = sensorOffline;
+      el('sampling').hidden = sensorOffline;
+      el('valve').hidden = sensorOffline;
       var thresholds = edge.thresholds || {};
       el('riskThreshold').textContent = '预测灌溉分段：严重干燥 < '
         + number(thresholds.irrigationSevereDryPercent, 1) + (thresholds.unit || '%')
@@ -410,13 +472,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       var samplingMode = edge.recommendedSamplingMode || '--';
       el('sampling').textContent = '推荐采样：' + (samplingLabels[samplingMode] || samplingMode) + '（' + (edge.recommendedReadIntervalMs || '--') + ' ms）' + (data.samplingConfig ? '；设备配置：' + data.samplingConfig.status : '');
       var actuator = data.actuator || {};
-      var fresh = edge.dataFreshness || {};
       el('valve').textContent = '水阀：' + (actuator.state || 'CLOSED') + '；数据新鲜度：' + (fresh.fresh ? '新鲜' : '需检查') + '（' + (has(fresh.ageSeconds) ? fresh.ageSeconds : '--') + ' 秒）';
-      var events = data.events || [], eventText = [];
-      for (var i = 0; i < events.length && i < 8; i++) {
-        eventText.push((events[i].resolved ? '已恢复' : '进行中') + ' [' + events[i].severity + '] ' + events[i].code + '\n' + events[i].message + ' · ' + events[i].occurredAt);
-      }
-      el('events').textContent = eventText.length ? eventText.join('\n\n') : '暂无事件';
       var report = data.waterReport || {}, day = report.last24Hours || {}, week = report.last7Days || {};
       var reportText = '24h：' + (day.wateringCount || 0) + ' 次 / ' + (day.wateringSeconds || 0) + ' 秒；7d：' + (week.wateringCount || 0) + ' 次 / ' + (week.wateringSeconds || 0) + ' 秒。';
       reportText += report.estimatedLiters === null || !has(report.estimatedLiters) ? '未配置阀门流量，无法估算用水量。' : '估算用水量 ' + report.estimatedLiters + ' L。';
@@ -426,19 +482,187 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       el('connection').className = 'bad';
     });
   }
+  function setStatusBadge(id, text, tone) {
+    var badge = el(id);
+    badge.textContent = text;
+    badge.className = 'status-badge' + (tone ? ' ' + tone : '');
+  }
+  function actionLabel(action) {
+    return {
+      START_WATERING: '建议灌溉',
+      STOP_WATERING: '建议停止灌溉',
+      NO_OP: '暂不灌溉'
+    }[action] || '暂无明确建议';
+  }
+  function decisionStatusLabel(status) {
+    return {
+      none: '尚未分析',
+      disabled: '云端未启用',
+      gateway_error: '云端分析失败',
+      suggested: '分析完成',
+      awaiting_confirmation: '等待人工确认',
+      rejected: '本地安全审核未通过',
+      rejected_on_confirmation: '确认时安全审核未通过',
+      confirmed_waiting_device: '已确认，等待设备执行',
+      auto_confirmed_waiting_device: '已自动确认，等待设备执行',
+      executed: '水阀已执行',
+      completed: '灌溉已完成',
+      cancelled_by_user: '已取消'
+    }[status] || '状态待确认';
+  }
+  function decisionStatusTone(status) {
+    if (status === 'rejected' || status === 'rejected_on_confirmation' || status === 'gateway_error') return 'bad';
+    if (status === 'awaiting_confirmation' || status === 'confirmed_waiting_device' || status === 'auto_confirmed_waiting_device') return 'warn';
+    if (status === 'suggested' || status === 'executed' || status === 'completed') return 'ok';
+    return '';
+  }
+  function isGovernanceOnlyDecision(decision) {
+    if (!decision || (decision.proposedAction || decision.finalAction) !== 'NO_OP') return false;
+    var code = String(decision.reasonCode || '').toUpperCase();
+    var reason = String(decision.reason || '').toLowerCase();
+    var codeMarkers = [
+      'CANNOT_DIRECT_CONTROL', 'DIRECT_HARDWARE', 'HARDWARE_CONTROL',
+      'HARDWARE_PERMISSION', 'MANUAL_CONFIRM', 'AUTO_MODE',
+      'AUTOMATIC_MODE', 'AUTHORIZATION_REQUIRED'
+    ];
+    var reasonMarkers = [
+      '云端不允许直接控制', '云端不能直接控制', '无权直接控制',
+      '需要人工确认或', '人工确认或部署者', '启用自动模式后下发',
+      'cannot directly control hardware', 'manual confirmation or automatic mode'
+    ];
+    for (var i = 0; i < codeMarkers.length; i++) {
+      if (code.indexOf(codeMarkers[i]) !== -1) return true;
+    }
+    for (var j = 0; j < reasonMarkers.length; j++) {
+      if (reason.indexOf(reasonMarkers[j].toLowerCase()) !== -1) return true;
+    }
+    return false;
+  }
+  function translateSafetyReason(reason) {
+    var raw = String(reason || '');
+    if (raw.indexOf('automatic execution held: ') === 0) {
+      return '自动执行已暂停：' + translateSafetyReason(raw.substring(26));
+    }
+    var translations = [
+      ['AIOT_LLM_ENABLED is false', '云端分析功能未启用'],
+      ['model used execution authority as the irrigation recommendation reason', '云端把执行权限误作灌溉依据，结果已被系统拒绝'],
+      ['required sensor data is incomplete or stale', '必需传感器数据不完整或已经过期'],
+      ['required sensor data is incomplete', '必需传感器数据不完整'],
+      ['current sensor data is incomplete or stale', '当前传感器数据不完整或已经过期'],
+      ['local predictive irrigation candidate criteria are not met', '未满足本地预测灌溉候选条件'],
+      ['soil moisture is already at or above target', '当前土壤湿度已经达到或超过目标值'],
+      ['current soil moisture is at or above target', '当前土壤湿度已经达到或超过目标值'],
+      ['duration exceeds local limit', '建议灌溉时长超过本地单次上限'],
+      ['valve is already open', '水阀已经处于开启状态'],
+      ['watering cooldown is active', '灌溉冷却时间尚未结束'],
+      ['daily watering limit would be exceeded', '执行后将超过每日灌溉安全上限'],
+      ['model confidence is below local threshold', '云端置信度低于本地审核阈值'],
+      ['decision has expired', '云端建议已经过期'],
+      ['decision expiry exceeds local limit', '云端建议有效期超过本地允许范围'],
+      ['model requestId does not match local requestId', '云端请求标识与本地请求不一致'],
+      ['suggestion expired before human confirmation', '建议在人工确认前已经过期'],
+      ['automatic mode accepts only explicit start or stop actions', '自动模式只接受明确的开启或停止灌溉动作'],
+      ['automatic start requires complete and fresh sensor data', '自动灌溉需要完整且新鲜的传感器数据'],
+      ['automatic start requires fresh ESP32 telemetry', '自动灌溉需要新鲜的 ESP32 实时数据'],
+      ['automatic start requires local IRRIGATION_CANDIDATE risk', '自动灌溉需要本地判定为灌溉候选'],
+      ['automatic start requires a complete local forecast', '自动灌溉需要完整的本地一小时预测']
+    ];
+    for (var i = 0; i < translations.length; i++) {
+      if (raw.indexOf(translations[i][0]) !== -1) return translations[i][1];
+    }
+    if (raw.indexOf('model confidence is below automatic threshold') !== -1) {
+      return '云端置信度低于自动灌溉阈值';
+    }
+    return raw;
+  }
+  function formatDecisionTime(value) {
+    if (!value) return '--';
+    var parsed = new Date(value);
+    return isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString('zh-CN', {hour12: false});
+  }
+  function renderDecision(decision) {
+    var empty = el('decisionEmpty'), result = el('decisionResult');
+    if (!decision) {
+      empty.hidden = false;
+      result.hidden = true;
+      el('decisionNextStep').hidden = true;
+      return;
+    }
+    empty.hidden = true;
+    result.hidden = false;
+    var proposed = decision.proposedAction || decision.finalAction || 'NO_OP';
+    var finalAction = decision.finalAction || 'NO_OP';
+    var invalidGovernance = isGovernanceOnlyDecision(decision);
+    var blocked = finalAction === 'NO_OP' && proposed !== 'NO_OP';
+    var actionText = invalidGovernance ? '结果无效' : (blocked ? '不执行灌溉' : actionLabel(proposed));
+    var actionTone = invalidGovernance || blocked || decision.status === 'rejected' || decision.status === 'rejected_on_confirmation'
+      || decision.status === 'gateway_error' ? 'bad' : (proposed === 'START_WATERING' ? 'warn' : 'ok');
+    el('decisionAction').textContent = actionText;
+    el('decisionAction').className = 'decision-action ' + actionTone;
+    el('decisionStatus').textContent = invalidGovernance ? '请重新分析' : decisionStatusLabel(decision.status);
+    el('decisionStatus').className = 'decision-status ' + (invalidGovernance ? 'bad' : decisionStatusTone(decision.status));
+    if (invalidGovernance) {
+      el('decisionOutcome').textContent = '该历史结果混淆了灌溉建议与硬件执行权限，系统不会采用。';
+    } else if (blocked) {
+      el('decisionOutcome').textContent = '云端原建议：' + actionLabel(proposed) + '；本地最终动作：不执行灌溉';
+    } else if (proposed !== finalAction) {
+      el('decisionOutcome').textContent = '云端建议：' + actionLabel(proposed) + '；本地最终动作：' + actionLabel(finalAction);
+    } else if (finalAction === 'NO_OP') {
+      el('decisionOutcome').textContent = '本地审核结果：无需执行水阀动作';
+    } else {
+      el('decisionOutcome').textContent = '本地审核结果：' + actionLabel(finalAction);
+    }
+    el('decisionReason').textContent = invalidGovernance
+      ? '请点击“请求一次分析”，重新获取仅依据传感器、预测和灌溉必要性生成的结论。'
+      : (decision.reason || '云端未返回具体原因');
+
+    var safetyReasons = decision.safetyReasons || [];
+    var safetyBox = el('decisionSafetyBox'), safetyList = el('decisionSafetyList');
+    safetyList.textContent = '';
+    safetyBox.hidden = !safetyReasons.length;
+    for (var i = 0; i < safetyReasons.length; i++) {
+      var item = document.createElement('li');
+      item.textContent = translateSafetyReason(safetyReasons[i]);
+      safetyList.appendChild(item);
+    }
+
+    var technical = [];
+    if (has(decision.confidence)) technical.push('置信度：' + Math.round(Number(decision.confidence) * 100) + '%');
+    if (decision.reasonCode) technical.push('原因代码：' + decision.reasonCode);
+    if (decision.durationSeconds) technical.push('建议时长：' + decision.durationSeconds + ' 秒');
+    if (decision.requestId) technical.push('请求 ID：' + decision.requestId);
+    if (decision.evaluatedAt) technical.push('分析时间：' + formatDecisionTime(decision.evaluatedAt));
+    if (has(decision.latencyMs)) technical.push('云端耗时：' + decision.latencyMs + ' ms');
+    el('decisionTechnical').textContent = technical.length ? technical.join('\n') : '暂无额外技术信息';
+    if (lastRenderedDecisionId !== decision.requestId) {
+      el('decisionDetails').open = false;
+      lastRenderedDecisionId = decision.requestId || '';
+    }
+  }
   function refreshCloud() {
     request('GET', '/v1/cloud/status', null, function (data) {
       var decision = data.decision, actuator = data.actuator || {};
       var confirm = el('confirm');
-      var text = '云端：' + (data.enabled ? '已启用' : '离线/未启用') + '，水阀：' + (actuator.state || 'OFF');
       var automatic = data.autoIrrigation || {};
-      text += '\n自动灌溉：' + (automatic.enabled ? '已启用（本地安全审核）' : '关闭（需要人工确认）');
-      if (automatic.enabled) text += '；最低置信度：' + number(automatic.minConfidence, 2);
-      if (decision) text += '\n建议：' + (decision.proposedAction || decision.finalAction) + '；状态：' + decision.status + '\n原因：' + decision.reason;
-      el('cloud').textContent = text;
+      setStatusBadge('cloudConnectionBadge', data.enabled ? '云端：已连接' : '云端：未启用', data.enabled ? 'ok' : 'bad');
+      setStatusBadge('cloudValveBadge', actuator.state === 'OPEN' ? '水阀：已开启' : '水阀：已关闭', actuator.state === 'OPEN' ? 'warn' : 'ok');
+      setStatusBadge(
+        'cloudAutoBadge',
+        automatic.enabled
+          ? '自动灌溉：已开启（置信度 ≥ ' + Math.round(Number(automatic.minConfidence || 0) * 100) + '%）'
+          : '自动灌溉：需人工确认',
+        automatic.enabled ? 'warn' : ''
+      );
+      el('cloudAvailability').hidden = !!data.enabled;
+      el('cloudAvailability').textContent = data.enabled
+        ? ''
+        : '云端分析当前未启用；本地传感器监测、预测和水阀安全保护仍正常运行。';
+      renderDecision(decision);
+
       var awaiting = !!(decision && decision.status === 'awaiting_confirmation');
       confirm.hidden = !awaiting;
       el('cancel').hidden = !awaiting;
+      el('decisionNextStep').hidden = !awaiting;
       confirm.setAttribute('data-id', decision ? decision.requestId : '');
       if (awaiting && longPressDecisionId && longPressDecisionId !== decision.requestId && !longPressStartedAt) {
         longPressTriggered = false;
@@ -446,7 +670,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       }
       if (awaiting && !longPressStartedAt && !longPressTriggered) {
         resetConfirmButton();
-        setConfirmStatus('建议已通过本地安全审核；持续按住满 1.5 秒才会发送开阀命令。', 'meta');
+        setConfirmStatus('建议已通过本地安全审核，等待人工确认。', 'warn');
       } else if (!awaiting && !longPressStartedAt) {
         resetConfirmButton();
         if (decision && decision.status === 'confirmed_waiting_device') {
@@ -455,13 +679,24 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
           setConfirmStatus('自动模式已通过本地安全审核并发送命令，正在等待 ESP32 执行回执。', 'warn');
         } else if (decision && decision.status === 'executed') {
           setConfirmStatus('ESP32 已返回执行回执，水阀状态已更新。', 'ok');
+        } else if (decision && decision.status === 'completed') {
+          setConfirmStatus('本次灌溉已经完成，水阀已关闭。', 'ok');
         } else if (decision && decision.status === 'cancelled_by_user') {
           setConfirmStatus('已取消本次建议，未向 ESP32 发送任何开阀命令。', 'meta');
         } else if (decision && decision.status === 'rejected_on_confirmation') {
           setConfirmStatus('确认时的本地安全复核未通过，未发送开阀命令。', 'bad');
+        } else {
+          setConfirmStatus('', 'meta');
         }
       }
-    }, function () { el('cloud').textContent = '云端状态不可用，但本地传感器与预测不受影响。'; });
+    }, function () {
+      setStatusBadge('cloudConnectionBadge', '云端：状态不可用', 'bad');
+      el('cloudAvailability').hidden = false;
+      el('cloudAvailability').textContent = '无法读取云端状态；本地传感器监测、预测和水阀安全保护仍正常运行。';
+      el('confirm').hidden = true;
+      el('cancel').hidden = true;
+      el('decisionNextStep').hidden = true;
+    });
   }
   function setConfirmStatus(text, className) {
     var status = el('confirmStatus');
@@ -562,7 +797,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     setAnalyzeState('loading', '正在向云端提交当前传感器、趋势和预测摘要…');
     request('POST', '/v1/cloud/analyze', {}, function (result) {
       var action = result.proposedAction || result.finalAction || 'NO_OP';
-      finishAnalyze('success', '分析已完成：' + action + '。结果已更新到上方状态。');
+      finishAnalyze('success', '分析已完成：' + actionLabel(action) + '。结论和原因已更新。');
       refreshCloud();
     }, function (message) {
       finishAnalyze('error', '分析请求失败：' + message + '。本地监测与水阀安全链路未受影响。');
@@ -721,7 +956,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .warn { color: var(--warning); font-weight: 700; }
     .bad { color: var(--danger); font-weight: 700; }
     .pill { display: inline-block; margin: 4px 4px 0 0; padding: 6px 10px; border-radius: 999px; background: var(--bg); color: var(--text); box-shadow: var(--shadow-inset); font-size: 13px; }
-    .timeline { max-height: 190px; overflow: auto; padding: 12px; border-radius: 16px; box-shadow: var(--shadow-inset); white-space: pre-line; line-height: 1.6; }
     .model-status { margin: 0 0 16px; color: var(--muted); font-size: 13px; line-height: 1.6; white-space: pre-line; }
     .forecast-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
     .forecast-panel { min-width: 0; padding: 15px 14px 10px; border-radius: 22px; box-shadow: var(--shadow-inset); }
@@ -730,12 +964,43 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .forecast-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
     .forecast-dot.soil { background: var(--success); }
     .forecast-svg { display: block; width: 100%; height: auto; min-height: 190px; overflow: visible; }
+    .edge-trend-panel { margin-top: 16px; }
+    .edge-trend-svg { min-height: 170px; }
     .chart-grid { stroke: rgba(107, 114, 128, .22); stroke-width: 1; stroke-dasharray: 4 5; }
     .chart-axis, .chart-unit, .chart-empty { fill: var(--muted); font-size: 11px; font-family: inherit; }
     .chart-unit { font-size: 10px; font-weight: 650; }
     .chart-point { stroke: var(--bg); stroke-width: 2; }
     .forecast-summary { margin-top: 14px; padding: 11px 14px; border-radius: 15px; box-shadow: var(--shadow-inset); color: var(--text); font-size: 13px; font-weight: 650; text-align: center; }
     .forecast-empty { padding: 34px 18px; border-radius: 20px; box-shadow: var(--shadow-inset); color: var(--muted); text-align: center; font-size: 14px; }
+    .cloud-status-row { display: flex; flex-wrap: wrap; gap: 9px; margin-bottom: 16px; }
+    .status-badge { display: inline-flex; align-items: center; min-height: 30px; padding: 6px 11px; border-radius: 999px; box-shadow: var(--shadow-inset); color: var(--muted); font-size: 12px; font-weight: 700; }
+    .status-badge.ok { color: var(--success); }
+    .status-badge.warn { color: var(--warning); }
+    .status-badge.bad { color: var(--danger); }
+    .cloud-alert { margin-bottom: 14px; padding: 11px 14px; border-radius: 14px; color: var(--danger); box-shadow: var(--shadow-inset); font-size: 13px; font-weight: 700; }
+    .decision-empty { padding: 28px 18px; border-radius: 20px; box-shadow: var(--shadow-inset); color: var(--muted); text-align: center; line-height: 1.7; }
+    .decision-result { display: grid; gap: 14px; }
+    .decision-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 17px 18px; border-radius: 20px; box-shadow: var(--shadow-inset); }
+    .decision-eyebrow, .decision-section-title { color: var(--muted); font-size: 12px; font-weight: 700; }
+    .decision-action { margin-top: 5px; color: var(--text); font-size: 29px; font-weight: 800; line-height: 1.2; }
+    .decision-action.ok { color: var(--success); }
+    .decision-action.warn { color: var(--warning); }
+    .decision-action.bad { color: var(--danger); }
+    .decision-status { flex: 0 0 auto; padding: 7px 11px; border-radius: 999px; color: var(--muted); box-shadow: var(--shadow-inset); font-size: 12px; font-weight: 750; }
+    .decision-status.ok { color: var(--success); }
+    .decision-status.warn { color: var(--warning); }
+    .decision-status.bad { color: var(--danger); }
+    .decision-outcome { margin-top: 8px; color: var(--muted); font-size: 13px; line-height: 1.55; }
+    .decision-reason-box, .decision-safety-box { padding: 15px 17px; border-radius: 18px; box-shadow: var(--shadow-inset); }
+    .decision-reason { margin-top: 7px; color: var(--text); font-size: 16px; font-weight: 680; line-height: 1.65; }
+    .decision-safety-box { color: var(--danger); }
+    .decision-safety-list { margin: 7px 0 0; padding-left: 20px; line-height: 1.65; font-size: 13px; }
+    .decision-next-step { padding: 14px 16px; border-radius: 17px; color: var(--warning); box-shadow: var(--shadow-inset); font-size: 13px; font-weight: 700; line-height: 1.6; }
+    .decision-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .decision-actions button { margin-right: 0; }
+    .decision-details { border-radius: 16px; box-shadow: var(--shadow-inset); color: var(--muted); font-size: 13px; }
+    .decision-details summary { padding: 12px 15px; cursor: pointer; color: var(--text); font-weight: 700; }
+    .decision-technical { padding: 0 15px 14px; white-space: pre-line; line-height: 1.65; }
     button {
       min-height: 44px; margin: 10px 8px 0 0; padding: 10px 15px; border: 0; border-radius: 16px;
       color: var(--accent); background: var(--bg); box-shadow: var(--shadow-small); cursor: pointer; touch-action: manipulation;
@@ -781,6 +1046,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       .row input { flex-basis: 100%; }
       .forecast-charts { grid-template-columns: 1fr; }
       .forecast-svg { min-height: 165px; }
+      .decision-head { flex-direction: column; }
+      .decision-action { font-size: 25px; }
+      .decision-actions { align-items: stretch; }
+      .decision-actions button { flex: 1 1 180px; }
     }
   </style>
 </head>
@@ -799,7 +1068,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card"><div class="label">入射短波（Solar 2）</div><div id="solarIncoming" class="value">-- <span class="unit">W/m²</span></div></div>
       <div class="card"><div class="label">反射短波（Solar 1）</div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
-    <section class="card wide mobile-full"><h2>设备状态与环境风险</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
+    <section class="card wide mobile-full"><h2>设备状态</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
     <section class="card wide">
       <h2>未来 1 小时预测</h2>
       <div id="model" class="model-status">等待数据...</div>
@@ -816,9 +1085,55 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       </div>
       <div id="forecastSummary" class="forecast-summary" hidden></div>
     </section>
-    <section class="card wide"><h2>ESP32 未来 30 分钟土壤趋势</h2><div id="edgePrediction" class="meta">等待 ESP32 趋势数据...</div><div class="meta">ESP32 根据当前传感器数据做轻量估算，辅助判断土壤是否继续变干。</div></section>
-    <section class="card wide"><h2>环境事件时间线</h2><div id="events" class="timeline muted">暂无事件</div></section>
-    <section class="card wide"><h2>云端增强与水阀安全层</h2><div id="cloud" class="meta">正在读取状态...</div><button id="analyze" class="action-button" type="button" aria-busy="false">请求一次分析</button><button id="confirm" class="hold" type="button" hidden>长按 1.5 秒确认灌溉</button><button id="cancel" class="secondary" type="button" hidden>取消待确认建议</button><div id="analyzeStatus" class="meta" aria-live="polite"></div><div id="confirmStatus" class="meta" aria-live="polite"></div><div class="meta">长按仅是交互确认；后端仍会重新校验传感器新鲜度、湿度、冷却时间和日限额。</div></section>
+    <section class="card wide">
+      <h2>ESP32 未来 30 分钟土壤趋势</h2>
+      <div id="edgePrediction" class="meta">等待 ESP32 趋势数据...</div>
+      <div id="edgeTrendPanel" class="forecast-panel edge-trend-panel" hidden>
+        <div class="forecast-panel-title"><span>土壤湿度趋势</span><span class="forecast-legend"><span class="forecast-dot soil"></span>ESP32 线性趋势估计</span></div>
+        <svg id="edgeTrendChart" class="forecast-svg edge-trend-svg" viewBox="0 0 640 200" role="img" aria-label="ESP32未来30分钟土壤湿度趋势曲线"></svg>
+        <div class="meta">曲线由当前实测值与 30 分钟预测值线性连接，用于展示变化方向，不代表新增的中间模型预测点。</div>
+      </div>
+    </section>
+    <section class="card wide">
+      <h2>云端分析决策</h2>
+      <div class="cloud-status-row" aria-label="云端分析运行状态">
+        <span id="cloudConnectionBadge" class="status-badge">云端：读取中</span>
+        <span id="cloudValveBadge" class="status-badge">水阀：读取中</span>
+        <span id="cloudAutoBadge" class="status-badge">自动灌溉：读取中</span>
+      </div>
+      <div id="cloudAvailability" class="cloud-alert" hidden></div>
+      <div id="decisionEmpty" class="decision-empty">尚未进行云端分析。点击下方按钮后，将结合当前传感器、历史趋势和本地预测给出建议。</div>
+      <div id="decisionResult" class="decision-result" aria-live="polite" hidden>
+        <div class="decision-head">
+          <div>
+            <div class="decision-eyebrow">分析结论</div>
+            <div id="decisionAction" class="decision-action">--</div>
+            <div id="decisionOutcome" class="decision-outcome"></div>
+          </div>
+          <span id="decisionStatus" class="decision-status">--</span>
+        </div>
+        <div class="decision-reason-box">
+          <div class="decision-section-title">云端判断原因</div>
+          <div id="decisionReason" class="decision-reason">--</div>
+        </div>
+        <div id="decisionSafetyBox" class="decision-safety-box" hidden>
+          <div class="decision-section-title">本地安全审核</div>
+          <ul id="decisionSafetyList" class="decision-safety-list"></ul>
+        </div>
+        <details id="decisionDetails" class="decision-details">
+          <summary>查看技术详情</summary>
+          <div id="decisionTechnical" class="decision-technical"></div>
+        </details>
+      </div>
+      <div id="decisionNextStep" class="decision-next-step" hidden>该建议已通过当前安全审核。如需执行，请持续按住确认按钮 1.5 秒；下发前系统还会再次检查传感器、湿度、冷却时间和每日限额。</div>
+      <div class="decision-actions">
+        <button id="analyze" class="action-button" type="button" aria-busy="false">请求一次分析</button>
+        <button id="confirm" class="hold" type="button" hidden>长按 1.5 秒确认灌溉</button>
+        <button id="cancel" class="secondary" type="button" hidden>取消待确认建议</button>
+      </div>
+      <div id="analyzeStatus" class="meta" aria-live="polite"></div>
+      <div id="confirmStatus" class="meta" aria-live="polite"></div>
+    </section>
     <section class="card wide"><h2>自然语言问答（可选语音）</h2><div class="row"><input id="question" placeholder="例如：今天需要调整灌溉计划吗？"><button id="ask">提问</button><button id="voice" class="secondary">开始说话</button><button id="speak" class="secondary">朗读回答</button></div><div id="voiceStatus" class="meta"></div><div id="answer" class="muted" style="margin-top:12px;white-space:pre-line"></div></section>
     <section class="card wide"><h2>手机入口</h2><div class="row"><img id="qr" class="qr" alt="当前页面二维码"><div><div id="address" class="meta"></div><button id="copy" class="secondary">复制访问地址</button><div class="meta">二维码由浏览器按当前地址生成；若手机不能访问，请让电脑与手机在同一 Wi‑Fi，并以 --host 0.0.0.0 启动服务。</div></div></div></section>
     <section class="card wide"><h2>节水与运行报告</h2><div id="report" class="meta">数据积累中</div></section><div id="updated" class="muted">尚未收到 ESP32 数据</div>

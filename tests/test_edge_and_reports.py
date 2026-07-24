@@ -118,6 +118,15 @@ def test_stale_or_failed_sensor_causes_attention_and_event():
     assert {event.code for event in assessment.events} >= {"SENSOR_FAILURE", "DATA_INTERRUPTION"}
 
 
+def test_zero_soil_moisture_is_a_disconnected_sensor_not_severe_dryness():
+    assessment = assess_environment(live(soil=0), forecast(end_soil=0, et0=0.5), SETTINGS)
+
+    assert assessment.risk_level == "ATTENTION"
+    assert not assessment.irrigation_candidate["eligible"]
+    failure = next(event for event in assessment.events if event.code == "SENSOR_FAILURE")
+    assert "soil" in failure.evidence["failed"]
+
+
 def test_environment_event_cooldown_and_recovery(tmp_path):
     store = Store(tmp_path / "edge.sqlite")
     assert store.record_environment_event("SOIL_ABNORMALLY_DRY", "high", "dry", {}, "check", cooldown_seconds=300)
@@ -192,7 +201,46 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "pointerdown" in app_js.text
     assert "window.location.protocol" in app_js.text
     assert "/v1/dashboard/qr?url=" in app_js.text
+    assert "存在传感器离线" in app_js.text
+    assert "长时间没收到数据" in app_js.text
+    assert "allSensorNames" in app_js.text
+    assert "大气压力传感器" in app_js.text
+    assert "土壤温湿度传感器" in app_js.text
+    assert "入射太阳辐射传感器" in app_js.text
+    assert "反射太阳辐射传感器" in app_js.text
+    assert "el('riskThreshold').hidden = sensorOffline" in app_js.text
+    assert "el('sampling').hidden = sensorOffline" in app_js.text
+    assert "el('valve').hidden = sensorOffline" in app_js.text
     assert "action-button" in html
+    assert "<h2>设备状态</h2>" in html
+    assert "设备状态与环境风险" not in html
+    assert "环境事件时间线" not in html
+    assert 'id="events"' not in html
+    assert "<h2>云端分析决策</h2>" in html
+    assert "云端增强与水阀安全层" not in html
+    assert 'id="cloudConnectionBadge"' in html
+    assert 'id="decisionAction"' in html
+    assert 'id="decisionReason"' in html
+    assert 'id="decisionSafetyBox"' in html
+    assert 'id="decisionDetails"' in html
+    assert 'id="decisionNextStep"' in html
+    assert "云端判断原因" in html
+    assert "本地安全审核" in html
+    assert "查看技术详情" in html
+    assert "建议灌溉" in app_js.text
+    assert "建议停止灌溉" in app_js.text
+    assert "暂不灌溉" in app_js.text
+    assert "等待人工确认" in app_js.text
+    assert "本地安全审核未通过" in app_js.text
+    assert "已确认，等待设备执行" in app_js.text
+    assert "灌溉已完成" in app_js.text
+    assert "云端分析功能未启用" in app_js.text
+    assert "translateSafetyReason" in app_js.text
+    assert "isGovernanceOnlyDecision" in app_js.text
+    assert "该历史结果混淆了灌溉建议与硬件执行权限" in app_js.text
+    assert "云端把执行权限误作灌溉依据，结果已被系统拒绝" in app_js.text
+    assert "未满足本地预测灌溉候选条件" in app_js.text
+    assert "el('decisionNextStep').hidden = !awaiting" in app_js.text
     assert "analyzeStatus" in html
     assert "et0ForecastChart" in html
     assert "soilForecastChart" in html
@@ -204,8 +252,14 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "riskScoreNote" not in html
     assert "风险等级 " not in app_js.text
     assert "传感器异常：" in app_js.text
-    assert "土壤湿度传感器" in app_js.text
+    assert "土壤温湿度传感器" in app_js.text
     assert "ESP32 未来 30 分钟土壤趋势" in html
+    assert "edgeTrendChart" in app_js.text
+    assert "当前土壤湿度：" in app_js.text
+    assert "预计变化：" in app_js.text
+    assert "ESP32 线性趋势估计" in html
+    assert "ESP32未来30分钟土壤湿度趋势曲线" in html
+    assert "不代表新增的中间模型预测点" in html
     assert "#E0E5EC" in html
     assert "--shadow-extruded" in html
     assert "prefers-reduced-motion" in html

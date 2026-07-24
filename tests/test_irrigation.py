@@ -77,6 +77,41 @@ def test_expired_and_incomplete_sensor_decisions_are_rejected(tmp_path):
     assert any("incomplete" in item for item in invalid.safetyReasons)
 
 
+def test_zero_soil_moisture_cannot_become_or_execute_a_candidate(tmp_path):
+    svc, store = service(tmp_path)
+    store.save_live_snapshot(snapshot(moisture=0), datetime.now(timezone.utc))
+    context = svc.current_context("request-zero-soil")
+
+    assert not context.current["allSensorsValid"]
+    assert context.constraints["edgeRisk"]["riskLevel"] == "ATTENTION"
+    result = svc.evaluate(decision("request-zero-soil"), context, trigger="test")
+    assert result.status == "rejected"
+    assert result.finalAction == IrrigationAction.NO_OP
+    assert any("incomplete" in reason for reason in result.safetyReasons)
+    assert store.claim_pending_commands() == []
+
+
+def test_governance_only_historical_decisions_are_not_sent_back_to_cloud(tmp_path):
+    svc, store = service(tmp_path)
+    bad = svc.evaluate(
+        decision("request-history-governance", action=IrrigationAction.NO_OP),
+        svc.current_context("request-history-governance"),
+        trigger="test",
+    )
+    stored = bad.model_copy(update={
+        "reasonCode": "CLOUD_CANNOT_DIRECT_CONTROL_HARDWARE",
+        "reason": "云端不允许直接控制灌溉硬件，需要人工确认或启用自动模式",
+    })
+    store.save_decision(stored, {}, None)
+
+    context = svc.current_context("request-after-history")
+
+    assert all(
+        item["requestId"] != "request-history-governance"
+        for item in context.constraints["recentReviewedDecisions"]
+    )
+
+
 def test_manual_start_cannot_bypass_predictive_candidate(tmp_path):
     svc, store = service(tmp_path)
     store.save_live_snapshot(snapshot(moisture=40), datetime.now(timezone.utc))

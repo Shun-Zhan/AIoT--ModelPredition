@@ -7,9 +7,15 @@ from typing import Any
 
 import pandas as pd
 
-from .cloud import CloudCall, CloudFailure, OpenAICompatibleGateway, new_request_id
+from .cloud import (
+    CloudCall,
+    CloudFailure,
+    OpenAICompatibleGateway,
+    is_execution_governance_reason,
+    new_request_id,
+)
 from .config import Settings
-from .edge import RiskAssessment, assess_environment
+from .edge import RiskAssessment, assess_environment, soil_moisture_is_valid
 from .schemas import DecisionContext, DecisionResult, IrrigationAction, IrrigationDecision
 from .storage import Store
 
@@ -145,7 +151,7 @@ class IrrigationService:
         if received_at:
             received = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
             fresh = datetime.now(timezone.utc) - received <= timedelta(seconds=self.settings.data_stale_seconds)
-        all_valid = bool(current and fresh and current.get("airOk") and current.get("soilOk") and
+        all_valid = bool(current and fresh and current.get("airOk") and soil_moisture_is_valid(current) and
                          current.get("windOk") and current.get("solarOk") and
                          current.get("airPressureHpa", 0) > 0)
         current = dict(current)
@@ -155,6 +161,14 @@ class IrrigationService:
         anomalies = [{"code": event.code, "severity": event.severity, "message": event.message,
                       "details": event.evidence} for event in edge.events]
         seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        recent_decisions = [
+            item for item in self.store.recent_decisions(limit=20)
+            if not is_execution_governance_reason(
+                action=str(item.get("proposedAction") or item.get("finalAction") or ""),
+                reason_code=str(item.get("reasonCode") or ""),
+                reason=str(item.get("reason") or ""),
+            )
+        ]
         return DecisionContext(
             schemaVersion="1.0",
             requestId=request_id or new_request_id("analysis"),
@@ -174,7 +188,7 @@ class IrrigationService:
                 "activeAnomalies": anomalies,
                 "recentAnomalies": self.store.anomaly_rows(limit=20),
                 "wateringLast7Days": self.store.actuator_summary(seven_days_ago),
-                "recentReviewedDecisions": self.store.recent_decisions(limit=20),
+                "recentReviewedDecisions": recent_decisions,
                 "edgeRisk": edge.to_dict(),
                 "farmProfile": self.settings.farm_profile(),
                 # No weather provider is currently configured. This explicit

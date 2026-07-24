@@ -80,6 +80,73 @@ def test_gateway_instructs_model_not_to_invent_weather_or_farm_facts(monkeypatch
     system_prompt = captured["messages"][0]["content"]
     assert "不得声称知道天气" in system_prompt
     assert "缺失字段必须明确视为未知" in system_prompt
+    assert "自动模式关闭，也应返回 START_WATERING" in system_prompt
+    assert "不能是执行权限或确认流程" in system_prompt
+
+
+def test_gateway_retries_when_no_op_uses_hardware_authority_as_reason(monkeypatch):
+    settings = replace(SETTINGS, llm_enabled=True, gateway_base_url="https://fake.invalid/v1", gateway_model="fake")
+    client = OpenAICompatibleGateway(settings, api_key="test-only")
+    captured_messages: list[list[dict[str, str]]] = []
+
+    class SequenceResponse(FakeResponse):
+        def __init__(self, governance_reason: bool):
+            self.governance_reason = governance_reason
+
+        def read(self):
+            decision = {
+                "schemaVersion": "1.0",
+                "requestId": context().requestId,
+                "action": "NO_OP",
+                "durationSeconds": None,
+                "reasonCode": (
+                    "CLOUD_CANNOT_DIRECT_CONTROL_HARDWARE"
+                    if self.governance_reason else "SENSOR_DATA_INCOMPLETE"
+                ),
+                "reason": (
+                    "云端不允许直接控制灌溉硬件，需要人工确认或启用自动模式"
+                    if self.governance_reason else "当前传感器数据不完整，无法确认灌溉必要性"
+                ),
+                "confidence": 0.9,
+                "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(decision)}}]}).encode()
+
+    responses = iter([SequenceResponse(True), SequenceResponse(False)])
+
+    def fake_urlopen(request, timeout):
+        captured_messages.append(json.loads(request.data.decode())["messages"])
+        return next(responses)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    decision, _ = client.irrigation_decision(context())
+
+    assert decision.reasonCode == "SENSOR_DATA_INCOMPLETE"
+    assert len(captured_messages) == 2
+    assert "上一回答无效" in captured_messages[1][-1]["content"]
+
+
+def test_gateway_rejects_repeated_hardware_authority_no_op(monkeypatch):
+    settings = replace(SETTINGS, llm_enabled=True, gateway_base_url="https://fake.invalid/v1", gateway_model="fake")
+    client = OpenAICompatibleGateway(settings, api_key="test-only")
+
+    class GovernanceResponse(FakeResponse):
+        def read(self):
+            decision = {
+                "schemaVersion": "1.0",
+                "requestId": context().requestId,
+                "action": "NO_OP",
+                "durationSeconds": None,
+                "reasonCode": "MANUAL_CONFIRMATION_REQUIRED",
+                "reason": "需要人工确认或部署者启用自动模式后才能下发",
+                "confidence": 1.0,
+                "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(decision)}}]}).encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: GovernanceResponse())
+    with pytest.raises(CloudFailure, match="execution authority"):
+        client.irrigation_decision(context())
 
 
 def test_gateway_accepts_strict_json_wrapped_in_markdown(monkeypatch):

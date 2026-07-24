@@ -28,7 +28,54 @@ weather.status 为 not_configured 时，不得声称知道天气、降雨、地�
 durationSeconds、reasonCode、reason、confidence、expiresAt；action 只能为
 START_WATERING、STOP_WATERING、NO_OP。不要使用 Markdown 代码围栏，不要添加额外字段。
 只有 constraints.edgeRisk.riskLevel 为 IRRIGATION_CANDIDATE 时才可建议 START_WATERING；
-数据不完整、传感器异常或没有明确必要时必须返回 NO_OP。云端不能直接控制硬件；动作仅可由本地安全层在人工确认或部署者显式启用自动模式后下发。"""
+数据不完整、传感器异常或没有明确必要时必须返回 NO_OP。
+action 表示“基于环境数据给出的灌溉建议”，不是直接控制硬件的命令。是否需要人工确认、
+是否启用自动模式以及云端没有硬件控制权，都不得影响 action，也不得作为 reasonCode 或 reason。
+例如：环境与预测支持灌溉时，即使自动模式关闭，也应返回 START_WATERING，之后由本地安全层决定是否下发。
+NO_OP 的原因必须是明确的环境、传感器、预测或灌溉必要性依据，不能是执行权限或确认流程。"""
+
+
+_GOVERNANCE_REASON_CODE_MARKERS = (
+    "CANNOT_DIRECT_CONTROL",
+    "DIRECT_HARDWARE",
+    "HARDWARE_CONTROL",
+    "HARDWARE_PERMISSION",
+    "MANUAL_CONFIRM",
+    "AUTO_MODE",
+    "AUTOMATIC_MODE",
+    "AUTHORIZATION_REQUIRED",
+)
+_GOVERNANCE_REASON_TEXT_MARKERS = (
+    "云端不允许直接控制",
+    "云端不能直接控制",
+    "无权直接控制",
+    "需要人工确认或",
+    "人工确认或部署者",
+    "启用自动模式后下发",
+    "cannot directly control hardware",
+    "manual confirmation or automatic mode",
+)
+
+
+def is_execution_governance_reason(*, action: str, reason_code: str, reason: str) -> bool:
+    """Detect a recommendation that incorrectly uses execution governance."""
+    if action != "NO_OP":
+        return False
+    code = reason_code.upper()
+    reason_text = reason.lower()
+    return (
+        any(marker in code for marker in _GOVERNANCE_REASON_CODE_MARKERS)
+        or any(marker.lower() in reason_text for marker in _GOVERNANCE_REASON_TEXT_MARKERS)
+    )
+
+
+def _is_execution_governance_no_op(decision: IrrigationDecision) -> bool:
+    """Reject a NO_OP that confuses recommendation with execution authority."""
+    return is_execution_governance_reason(
+        action=decision.action.value,
+        reason_code=decision.reasonCode,
+        reason=decision.reason,
+    )
 
 
 class CloudFailure(RuntimeError):
@@ -124,35 +171,55 @@ class OpenAICompatibleGateway:
             "- action 为 START_WATERING 时，durationSeconds 必须是 1 到 60 的整数\n"
             "- confidence 必须是 0.0 到 1.0 之间的 JSON 数字，绝不能是 null\n"
             "- reasonCode 只能包含大写字母、数字和下划线\n"
+            "- action 只表示是否建议灌溉；人工确认、自动模式和硬件控制权限不得作为 NO_OP 的理由\n"
             "只输出一个 JSON 对象；不要解释，不要 Markdown。"
         )
-        call = self._call([
+        messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": context.model_dump_json()},
             {"role": "user", "content": contract},
-        ], max_tokens=600)
-        # Some OpenAI-compatible models still wrap an otherwise valid object
-        # in a Markdown fence or one sentence of explanation.  Accept only a
-        # JSON *object* found in that wrapper, then keep the Pydantic schema
-        # validation strict: no extra fields, no malformed actions and no
-        # missing safety metadata can pass through this compatibility layer.
-        decoder = json.JSONDecoder()
-        validation_error: ValueError | None = None
-        for offset, character in enumerate(call.content):
-            if character != "{":
+        ]
+        last_validation_error: ValueError | None = None
+        for attempt in range(2):
+            call = self._call(messages, max_tokens=600)
+            # Some OpenAI-compatible models still wrap an otherwise valid
+            # object in Markdown. Accept the object but keep schema validation
+            # strict, then separately reject recommendation/authority confusion.
+            decoder = json.JSONDecoder()
+            decision: IrrigationDecision | None = None
+            for offset, character in enumerate(call.content):
+                if character != "{":
+                    continue
+                try:
+                    candidate, _ = decoder.raw_decode(call.content[offset:])
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(candidate, dict):
+                    continue
+                try:
+                    decision = IrrigationDecision.model_validate(candidate)
+                    break
+                except ValueError as exc:
+                    last_validation_error = exc
+            if decision is None:
+                raise CloudFailure("model output is not the required irrigation JSON") from last_validation_error
+            if not _is_execution_governance_no_op(decision):
+                return decision, call
+            if attempt == 0:
+                messages.extend([
+                    {"role": "assistant", "content": call.content},
+                    {"role": "user", "content": (
+                        "上一回答无效：你把云端硬件权限、人工确认或自动模式当成了 NO_OP 的理由。"
+                        "请重新只根据 current、trends、forecast 和 constraints.edgeRisk 判断是否建议灌溉。"
+                        "action 是建议而非硬件命令；若环境依据支持灌溉，应返回 START_WATERING，"
+                        "本地安全层会另行决定是否执行。NO_OP 必须给出具体的数据或环境依据。"
+                        "仍须遵守原输出合约，只输出 JSON。"
+                    )},
+                ])
                 continue
-            try:
-                candidate, _ = decoder.raw_decode(call.content[offset:])
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(candidate, dict):
-                continue
-            try:
-                return IrrigationDecision.model_validate(candidate), call
-            except ValueError as exc:
-                validation_error = exc
+            raise CloudFailure("model used execution authority as the irrigation recommendation reason")
 
-        raise CloudFailure("model output is not the required irrigation JSON") from validation_error
+        raise CloudFailure("model did not return a usable irrigation recommendation")
 
     def chat(self, question: str, context: dict[str, Any]) -> CloudCall:
         return self._call([
