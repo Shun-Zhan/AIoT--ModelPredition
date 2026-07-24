@@ -74,6 +74,11 @@ def test_dashboard_exposes_latest_snapshot(tmp_path):
     assert snapshot["et0Method"].startswith("FAO-56")
     assert "参考作物蒸散率（ET₀）" in page.text
     assert "净短波辐射（Rns）" in page.text
+    assert "sensor-card" in page.text
+    assert "🌡️" in page.text
+    assert "💧" in page.text
+    assert "🌱" in page.text
+    assert "☀️" in page.text
     edge = latest.json()["edge"]
     assert edge["thresholds"]["irrigationSoilMoisturePercent"] == 30.0
     assert edge["thresholds"]["unit"] == "%"
@@ -158,7 +163,9 @@ def test_automatic_mode_worker_calls_ai_on_automatic_interval(tmp_path, monkeypa
     monkeypatch.setattr(service_module, "AUTO_ANALYSIS_INTERVAL_SECONDS", 0.05)
     monkeypatch.setattr(IrrigationService, "analyze", record_analysis)
 
-    with TestClient(create_app(settings)):
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/v1/cloud/status").json()["operationMode"] == "semi_automatic"
+        assert client.post("/v1/operation-mode", json={"mode": "automatic"}).status_code == 200
         assert called.wait(1)
 
     assert triggers[0] == "automatic_minute"

@@ -235,17 +235,18 @@ tail -f runtime/logs/esp32-receiver.out.log
 
 ### 半自动 / 全自动灌溉模式
 
-Dashboard 顶部可直接切换运行模式，选择会保存到本地 SQLite，刷新页面或重启服务后仍然保持：
+Dashboard 顶部可直接切换运行模式。刷新页面会保持当前选择；每次重新启动服务时都会安全地恢复为半自动模式：
 
 - **半自动模式**：AI 生成建议并经过本地审核；正式开阀仍需人工长按 1.5 秒确认。
 - **全自动模式**：每 60 秒调用一次 AI 决策。建议通过本地审核和自动模式门槛后直接进入 ESP32 命令队列，无需人工确认。
 
-默认使用半自动模式。也可以在一个全新的数据库尚未保存页面选择时，用 `.env` 配置初始模式：
+需要全自动运行时，在本次服务启动后从 Dashboard 手动切换。以下 `.env` 项用于配置全自动执行门槛，不会改变“重启后默认半自动”的行为：
 
 ```dotenv
 AIOT_AUTO_IRRIGATION_ENABLED=1
 AIOT_AUTO_IRRIGATION_MIN_CONFIDENCE=0.80
 AIOT_AUTO_IRRIGATION_REQUIRE_FORECAST_READY=1
+AIOT_WATERING_COOLDOWN_MINUTES=15
 ```
 
 全自动模式下，AI 不能直接操作 GPIO。只有 `START_WATERING` 同时满足以下条件，电脑才会把命令加入 ESP32 队列：AI 置信度不低于阈值、ESP32 数据新鲜且全部有效、本地分段预测规则判断为 `IRRIGATION_CANDIDATE`、自动模式要求的预测已就绪、冷却时间/单次时长/每日总时长均符合限制，并在入队前再次复核。任一条件失败都会记录为暂停或拒绝，不显示可绕过自动门槛的人工确认按钮，并在下一分钟重新分析。云端不可用、模型输出错误或网络中断时不会开阀。

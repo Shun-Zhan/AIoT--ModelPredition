@@ -34,12 +34,12 @@ class IrrigationService:
         self.store = store
         self.settings = settings
         self.gateway = gateway or OpenAICompatibleGateway(settings)
-        persisted_mode = self.store.get_runtime_setting("operation_mode")
-        self._operation_mode = (
-            persisted_mode
-            if persisted_mode in {"semi_automatic", "automatic"}
-            else ("automatic" if settings.auto_irrigation_enabled else "semi_automatic")
-        )
+        # A new service process always starts in the safer semi-automatic mode.
+        # Operators can still switch to automatic mode from the dashboard for
+        # the current run, but a restart must never resume unattended actuation
+        # merely because the previous process was left in automatic mode.
+        self._operation_mode = "semi_automatic"
+        self.store.set_runtime_setting("operation_mode", self._operation_mode)
         self._analysis_lock = threading.Lock()
 
     @property

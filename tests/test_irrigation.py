@@ -485,7 +485,7 @@ def test_auto_irrigation_never_bypasses_fresh_sensor_gate(tmp_path):
     assert store.claim_pending_commands() == []
 
 
-def test_operation_mode_is_persisted_and_auto_hold_cannot_be_manually_confirmed(tmp_path):
+def test_operation_mode_resets_to_semi_automatic_and_auto_hold_cannot_be_manually_confirmed(tmp_path):
     svc, store = service(tmp_path, enabled=True)
     svc.gateway = StartWateringGateway()
     svc.set_operation_mode("automatic")
@@ -497,8 +497,8 @@ def test_operation_mode_is_persisted_and_auto_hold_cannot_be_manually_confirmed(
     assert store.claim_pending_commands() == []
 
     restored = IrrigationService(store, svc.settings)
-    assert restored.operation_mode == "automatic"
-    restored.set_operation_mode("semi_automatic")
+    assert restored.operation_mode == "semi_automatic"
+    restored.set_operation_mode("automatic")
     assert IrrigationService(store, svc.settings).operation_mode == "semi_automatic"
 
 

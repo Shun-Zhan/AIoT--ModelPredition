@@ -67,7 +67,7 @@ class Settings:
     gateway_timeout_seconds: float = float(os.getenv("VEI_TIMEOUT_SECONDS", "45"))
     actuator_mode: str = os.getenv("AIOT_ACTUATOR_MODE", "serial")
     max_watering_seconds: int = 60
-    watering_cooldown_minutes: int = 15
+    watering_cooldown_minutes: int = int(os.getenv("AIOT_WATERING_COOLDOWN_MINUTES", "15"))
     max_daily_watering_seconds: int = 600
     irrigation_severe_dry_percent: float = float(os.getenv("AIOT_IRRIGATION_SEVERE_DRY_PERCENT", "20"))
     irrigation_trigger_percent: float = float(os.getenv("AIOT_IRRIGATION_TRIGGER_PERCENT", "30"))
@@ -122,6 +122,8 @@ class Settings:
             )
         if self.irrigation_high_et0_1h_mm < 0:
             raise ValueError("irrigation_high_et0_1h_mm must be non-negative")
+        if self.watering_cooldown_minutes < 0:
+            raise ValueError("watering_cooldown_minutes must be non-negative")
 
     @property
     def required_samples(self) -> int:

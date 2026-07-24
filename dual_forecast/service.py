@@ -1273,7 +1273,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     h2 { margin: 0 0 12px; font-size: 17px; font-weight: 700; letter-spacing: 0; }
     .muted, .meta { color: var(--muted); font-size: 13px; line-height: 1.55; }
     main { padding: 0 24px 34px; max-width: 1160px; margin: auto; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 18px; }
     .card { min-height: 70px; padding: 20px; background: var(--bg); border: 0; border-radius: 32px; box-shadow: var(--shadow-extruded); }
     .wide { margin-top: 20px; }
     .mode-card { margin-bottom: 20px; padding: 17px 20px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
@@ -1291,6 +1291,38 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .label { color: var(--muted); font-size: 13px; font-weight: 600; }
     .value { margin-top: 9px; font-size: 25px; font-weight: 750; letter-spacing: 0; color: var(--text); }
     .unit { font-size: 13px; color: var(--muted); font-weight: 500; }
+    .sensor-card {
+      position: relative; min-height: 126px; overflow: hidden; isolation: isolate;
+      border: 1px solid rgba(255, 255, 255, .32);
+      transition: transform 180ms ease, box-shadow 220ms ease;
+    }
+    .sensor-card::before {
+      content: ""; position: absolute; z-index: -1; right: -34px; bottom: -48px;
+      width: 120px; height: 120px; border-radius: 50%; background: var(--sensor-glow);
+      filter: blur(2px); opacity: .72;
+    }
+    .sensor-card::after {
+      content: ""; position: absolute; top: 0; left: 28px; width: 42px; height: 4px;
+      border-radius: 0 0 6px 6px; background: var(--sensor-accent); opacity: .8;
+    }
+    .sensor-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-extruded-hover); }
+    .sensor-card-head { display: flex; align-items: center; gap: 10px; min-height: 34px; }
+    .sensor-icon {
+      display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center;
+      width: 34px; height: 34px; border-radius: 12px; background: var(--sensor-icon-bg);
+      box-shadow: var(--shadow-small); font-size: 18px; line-height: 1;
+    }
+    .sensor-card .label { line-height: 1.35; }
+    .sensor-card .value { margin-top: 14px; font-size: 29px; line-height: 1.1; }
+    .sensor-note { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .sensor-air { --sensor-accent: #de7356; --sensor-glow: rgba(222, 115, 86, .18); --sensor-icon-bg: rgba(255, 225, 215, .7); }
+    .sensor-water { --sensor-accent: #4f91c6; --sensor-glow: rgba(79, 145, 198, .18); --sensor-icon-bg: rgba(214, 235, 250, .72); }
+    .sensor-pressure { --sensor-accent: #7b72c8; --sensor-glow: rgba(123, 114, 200, .17); --sensor-icon-bg: rgba(226, 222, 250, .72); }
+    .sensor-wind { --sensor-accent: #43a39a; --sensor-glow: rgba(67, 163, 154, .17); --sensor-icon-bg: rgba(210, 240, 235, .72); }
+    .sensor-soil { --sensor-accent: #987047; --sensor-glow: rgba(152, 112, 71, .17); --sensor-icon-bg: rgba(238, 225, 205, .74); }
+    .sensor-plant { --sensor-accent: #4b9968; --sensor-glow: rgba(75, 153, 104, .17); --sensor-icon-bg: rgba(213, 239, 220, .72); }
+    .sensor-sun { --sensor-accent: #d49b27; --sensor-glow: rgba(212, 155, 39, .18); --sensor-icon-bg: rgba(252, 236, 190, .76); }
+    .sensor-reflect { --sensor-accent: #6e8ead; --sensor-glow: rgba(110, 142, 173, .17); --sensor-icon-bg: rgba(220, 233, 243, .74); }
     .ok { color: var(--success); font-weight: 700; }
     .warn { color: var(--warning); font-weight: 700; }
     .bad { color: var(--danger); font-weight: 700; }
@@ -1401,6 +1433,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
     }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
     @media (max-width: 620px) {
       header { padding: 20px 16px 18px; align-items: flex-start; flex-direction: column; }
       h1 { font-size: 28px; }
@@ -1408,6 +1443,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .card { padding: 16px; border-radius: 24px; }
       .value { font-size: 21px; }
+      .sensor-card { min-height: 118px; }
+      .sensor-card .value { font-size: 24px; }
+      .sensor-icon { width: 31px; height: 31px; border-radius: 11px; font-size: 16px; }
       .mobile-full { grid-column: 1 / -1; }
       .desktop-only { display: none; }
       .row { align-items: stretch; }
@@ -1446,16 +1484,16 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       </div>
     </section>
     <section class="grid">
-      <div class="card"><div class="label">空气温度</div><div id="airTemp" class="value">-- <span class="unit">°C</span></div></div>
-      <div class="card"><div class="label">空气湿度</div><div id="airRh" class="value">-- <span class="unit">%RH</span></div></div>
-      <div class="card"><div class="label">大气压力</div><div id="pressure" class="value">-- <span class="unit">hPa</span></div></div>
-      <div class="card"><div class="label">平均风速</div><div id="wind" class="value">-- <span class="unit">m/s</span></div></div>
-      <div class="card"><div class="label">土壤温度</div><div id="soilTemp" class="value">-- <span class="unit">°C</span></div></div>
-      <div class="card"><div class="label">土壤湿度</div><div id="soilMoist" class="value">-- <span class="unit">%</span></div></div>
-      <div class="card"><div class="label">参考作物蒸散率（ET₀）</div><div id="et0" class="value">-- <span class="unit">mm/h</span></div><div id="et0Note" class="meta"></div></div>
-      <div class="card"><div class="label">净短波辐射（Rns）</div><div id="solar" class="value">-- <span class="unit">W/m²</span></div><div id="solarNote" class="meta"></div></div>
-      <div class="card"><div class="label">入射短波（Solar 2）</div><div id="solarIncoming" class="value">-- <span class="unit">W/m²</span></div></div>
-      <div class="card"><div class="label">反射短波（Solar 1）</div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
+      <div class="card sensor-card sensor-air"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">🌡️</span><div class="label">空气温度</div></div><div id="airTemp" class="value">-- <span class="unit">°C</span></div></div>
+      <div class="card sensor-card sensor-water"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">💧</span><div class="label">空气湿度</div></div><div id="airRh" class="value">-- <span class="unit">%RH</span></div></div>
+      <div class="card sensor-card sensor-pressure"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">🧭</span><div class="label">大气压力</div></div><div id="pressure" class="value">-- <span class="unit">hPa</span></div></div>
+      <div class="card sensor-card sensor-wind"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">💨</span><div class="label">平均风速</div></div><div id="wind" class="value">-- <span class="unit">m/s</span></div></div>
+      <div class="card sensor-card sensor-soil"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">🌱</span><div class="label">土壤温度</div></div><div id="soilTemp" class="value">-- <span class="unit">°C</span></div></div>
+      <div class="card sensor-card sensor-plant"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">🪴</span><div class="label">土壤湿度</div></div><div id="soilMoist" class="value">-- <span class="unit">%</span></div></div>
+      <div class="card sensor-card sensor-water"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">♨️</span><div class="label">参考作物蒸散率（ET₀）</div></div><div id="et0" class="value">-- <span class="unit">mm/h</span></div><div id="et0Note" class="sensor-note"></div></div>
+      <div class="card sensor-card sensor-sun"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">🌤️</span><div class="label">净短波辐射（Rns）</div></div><div id="solar" class="value">-- <span class="unit">W/m²</span></div><div id="solarNote" class="sensor-note"></div></div>
+      <div class="card sensor-card sensor-sun"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">☀️</span><div class="label">入射短波（Solar 2）</div></div><div id="solarIncoming" class="value">-- <span class="unit">W/m²</span></div></div>
+      <div class="card sensor-card sensor-reflect"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">↗️</span><div class="label">反射短波（Solar 1）</div></div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
     <section class="card wide mobile-full"><h2>设备状态</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
     <section class="card wide">
