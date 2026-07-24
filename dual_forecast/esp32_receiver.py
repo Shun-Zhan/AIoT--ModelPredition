@@ -23,6 +23,8 @@ DISCOVERY_PREFIX = b"AIOT_DISCOVERY "
 # Some phone hotspots block local UDP broadcast even though ESP32 TCP and
 # mDNS traffic are permitted.  The firmware advertises this stable hostname.
 MDNS_FALLBACK_HOST = "esp32-sensors.local"
+DEFAULT_DATABASE = "runtime/forecast.sqlite3"
+FAST_TEST_DATABASE = "runtime/forecast-fast-test.sqlite3"
 
 
 # Telemetry is always posted to a service on this same computer.  Do not let a
@@ -138,6 +140,19 @@ class _ReceiverState:
     last_display_diagnostic: tuple[bool, int, bool] | None = None
 
 
+def _prediction_interval_seconds(args: argparse.Namespace) -> float:
+    interval = args.fast_test_interval_seconds if args.fast_test else args.min_interval_seconds
+    if interval <= 0:
+        raise ValueError("prediction submission interval must be greater than zero")
+    return float(interval)
+
+
+def _receiver_database(args: argparse.Namespace) -> str:
+    if args.fast_test and args.database == DEFAULT_DATABASE:
+        return FAST_TEST_DATABASE
+    return str(args.database)
+
+
 @dataclass(frozen=True)
 class Esp32Endpoint:
     """One locally announced ESP32 TCP endpoint."""
@@ -248,7 +263,7 @@ def _handle_telemetry_message(
         print("Live dashboard updated from ESP32 telemetry.")
         state.last_live_log_at = now
 
-    if now - state.last_submit_at < args.min_interval_seconds:
+    if now - state.last_submit_at < _prediction_interval_seconds(args):
         return
 
     if not snapshot_is_complete_for_prediction(snapshot):
@@ -336,7 +351,7 @@ def _send_heartbeat(connection: Any) -> None:
 def receive_esp32(args: argparse.Namespace) -> None:
     """Keep one TCP connection to ESP32 and forward sampled messages to FastAPI."""
     state = _ReceiverState()
-    store = Store(args.database)
+    store = Store(_receiver_database(args))
     use_auto_discovery = args.esp_host.casefold() == AUTO_DISCOVERY_HOST
     discovery_socket: socket.socket | None = None
 
@@ -437,7 +452,7 @@ def receive_esp32_serial(args: argparse.Namespace) -> None:
         raise SystemExit("pyserial is required; run: python -m pip install -r requirements.txt") from exc
 
     state = _ReceiverState()
-    store = Store(args.database)
+    store = Store(_receiver_database(args))
     while True:
         try:
             print(f"Opening ESP32 USB serial port {args.serial_port} at {args.baudrate} baud ...")
@@ -485,7 +500,7 @@ def receive_esp32_serial(args: argparse.Namespace) -> None:
 def _add_submission_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--database",
-        default="runtime/forecast.sqlite3",
+        default=DEFAULT_DATABASE,
         help="SQLite command queue and ACK database",
     )
     parser.add_argument(
@@ -506,6 +521,17 @@ def _add_submission_options(parser: argparse.ArgumentParser) -> None:
             "minimum interval between complete snapshots (default: 30 seconds). "
             "The inference pipeline still aggregates these into five-minute model intervals."
         ),
+    )
+    parser.add_argument(
+        "--fast-test",
+        action="store_true",
+        help="submit high-frequency samples for use with 'serve --fast-test'",
+    )
+    parser.add_argument(
+        "--fast-test-interval-seconds",
+        type=float,
+        default=5.0,
+        help="submission interval used by --fast-test; defaults to 5 seconds",
     )
     parser.add_argument(
         "--fallback-air-pressure-hpa",

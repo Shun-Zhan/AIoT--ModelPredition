@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import numpy as np
@@ -52,3 +53,19 @@ def test_long_gap_is_skipped_and_restarts_clean_window_progress():
     assert 0 < response.availableSamples < 288
     assert any("incomplete intervals were skipped" in warning for warning in response.warnings)
     assert not response.forecast
+
+
+def test_fast_mode_returns_prediction_after_24_high_frequency_samples():
+    class FastFakeModels(FakeModels):
+        def predict_soil(self, features):
+            assert len(features) == 24
+            return np.linspace(55, 53, 12)
+
+    settings = replace(SETTINGS, fast_test_mode=True, fast_test_samples=24)
+    frame = live_frame().iloc[:24].copy()
+    response = build_response(frame, FastFakeModels(), settings)
+    assert response.status == "ok"
+    assert response.requiredSamples == 24
+    assert response.availableSamples == 24
+    assert len(response.forecast) == 12
+    assert any("FAST_TEST_MODE" in warning for warning in response.warnings)

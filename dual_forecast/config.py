@@ -43,6 +43,10 @@ def optional_float_env(name: str) -> float | None:
 class Settings:
     sample_minutes: int = 5
     live_window: int = 288
+    # Fast mode is enabled only by the explicit CLI flag. It must never be
+    # activated accidentally by a persistent deployment environment.
+    fast_test_mode: bool = False
+    fast_test_samples: int = 24
     forecast_steps: int = 12
     et0_window_hours: int = 24
     short_gap_steps: int = 3
@@ -103,6 +107,14 @@ class Settings:
     farm_plot_area_m2: float | None = optional_float_env("AIOT_FARM_PLOT_AREA_M2")
     farm_irrigation_method: str = os.getenv("AIOT_FARM_IRRIGATION_METHOD", "").strip()
     farm_notes: str = os.getenv("AIOT_FARM_NOTES", "").strip()
+
+    def __post_init__(self) -> None:
+        if self.fast_test_samples < 2:
+            raise ValueError("fast_test_samples must be at least 2")
+
+    @property
+    def required_samples(self) -> int:
+        return self.fast_test_samples if self.fast_test_mode else self.live_window
 
     def to_dict(self) -> dict:
         data = asdict(self)

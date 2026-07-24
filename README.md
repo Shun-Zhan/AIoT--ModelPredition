@@ -176,9 +176,30 @@ curl http://127.0.0.1:8000/health
 
 ### 手机移动巡检与二维码
 
-在以 `--lan` / `-Lan` 显式启动后，用电脑浏览器打开 Dashboard。页面二维码由本机 `GET /v1/dashboard/qr` 生成为 SVG，二维码内容使用浏览器正在访问的地址，**不调用第三方二维码网站，也不把临时 IP 写入源码**。手机扫二维码前应确认二者在同一 Wi-Fi；如果二维码不能识别局域网 IP，复制页面显示的地址并手动把主机名替换为电脑 IPv4。
+在以 `--lan` / `-Lan` 显式启动后，用电脑浏览器打开 Dashboard。页面二维码由本机 `GET /v1/dashboard/qr` 生成为 PNG，二维码内容使用浏览器正在访问的地址，**不调用第三方二维码网站，也不把临时 IP 写入源码**。手机扫二维码前应确认二者在同一 Wi-Fi；如果二维码不能识别局域网 IP，复制页面显示的地址并手动把主机名替换为电脑 IPv4。
 
 手机页面包含实时传感器、边缘风险、采样状态、水阀状态、最近事件、报告摘要、文本问答和可选语音能力提示。Web Speech API / SpeechSynthesis 不可用时自动退回文字问答，页面与本地报告不依赖外网。页面的“确认灌溉”必须长按 1.5 秒，随后仍调用后端安全审核；摇一摇、语音、手势均不能直接开阀。
+
+### 快速测试模式
+
+正式模式需要 288 个五分钟点（约 24 小时）。仅验证采集、预测、决策和接口链路时，可以开启
+快速测试模式：默认每 5 秒提交一次，收集 24 个点后开始预测，约 2 分钟可看到结果。
+
+```bash
+# 终端 1
+make serve-fast
+
+# 终端 2
+make receive-fast
+```
+
+`make receive-fast` 默认使用 USB 串口，可通过 `SERIAL_PORT=/dev/cu.xxx make receive-fast`
+指定端口。Wi-Fi 自动发现模式使用 `make receive-fast-wifi`。
+
+也可以直接运行 `dual-forecast serve --fast-test --fast-test-samples 24` 和
+`dual-forecast receive-esp32-serial --serial-port /dev/cu.xxx --fast-test --fast-test-interval-seconds 5`。
+快速模式会在预测警告中显示 `FAST_TEST_MODE`。它把高频样本视为模型时间步，只用于验证
+端到端流程，不能用于评价模型精度或替代正式的五分钟采样结果。
 
 Windows 查看接收日志：
 

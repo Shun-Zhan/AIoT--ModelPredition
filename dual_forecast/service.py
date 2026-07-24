@@ -638,7 +638,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "modelsReady": models.ready}
+        return {
+            "status": "ok",
+            "modelsReady": models.ready,
+            "fastTestMode": settings.fast_test_mode,
+            "requiredSamples": settings.required_samples,
+        }
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard():
@@ -677,6 +682,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             "actuator": irrigation.last_device_state,
             "samplingConfig": store.sampling_config_status(),
             "waterReport": water_report(),
+            "fastTest": {
+                "enabled": settings.fast_test_mode,
+                "requiredSamples": settings.required_samples,
+            },
         }
 
     @app.post("/v1/telemetry/live")

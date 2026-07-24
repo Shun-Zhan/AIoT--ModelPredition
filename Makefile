@@ -4,7 +4,7 @@ VENV_PYTHON := $(VENV)/bin/python
 VENV_FORECAST := $(VENV)/bin/dual-forecast
 SERIAL_PORT ?= /dev/cu.wchusbserial10
 
-.PHONY: setup test serve receive
+.PHONY: setup test serve receive serve-fast receive-fast receive-fast-wifi
 
 $(VENV_PYTHON):
 	$(PYTHON) -m venv $(VENV)
@@ -22,3 +22,12 @@ serve: setup
 
 receive: setup
 	$(VENV_FORECAST) receive-esp32-serial --serial-port $(SERIAL_PORT)
+
+serve-fast: setup
+	$(VENV_FORECAST) serve --host 127.0.0.1 --port 8000 --fast-test
+
+receive-fast: setup
+	$(VENV_FORECAST) receive-esp32-serial --serial-port $(SERIAL_PORT) --fast-test
+
+receive-fast-wifi: setup
+	$(VENV_FORECAST) receive-esp32 --fast-test
