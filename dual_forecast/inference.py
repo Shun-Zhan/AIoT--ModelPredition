@@ -150,6 +150,7 @@ def build_response(raw: pd.DataFrame, models: ModelBundle, settings: Settings) -
                 window.wind_ms,
                 window.solar_wm2,
                 window.pressure_kpa,
+                net_shortwave_wm2=window.solar_wm2,
             )
         )
         source_positions = np.linspace(0.0, 1.0, len(et0_input))
@@ -157,7 +158,10 @@ def build_response(raw: pd.DataFrame, models: ModelBundle, settings: Settings) -
         et0_input = np.interp(target_positions, source_positions, et0_input)
     else:
         hourly = window.resample("1h").mean().dropna()
-        hourly["et0_mm"] = fao56_hourly_et0(hourly.air_temp_c, hourly.rh_percent, hourly.wind_ms, hourly.solar_wm2, hourly.pressure_kpa)
+        hourly["et0_mm"] = fao56_hourly_et0(
+            hourly.air_temp_c, hourly.rh_percent, hourly.wind_ms, hourly.solar_wm2,
+            hourly.pressure_kpa, net_shortwave_wm2=hourly.solar_wm2,
+        )
         if len(hourly) < settings.et0_window_hours:
             return ForecastResponse(status="warming_up", generatedAt=now, requiredSamples=required, availableSamples=available, warnings=warnings + ["24 complete hourly aggregates are required"])
         et0_input = hourly.et0_mm.iloc[-settings.et0_window_hours:].to_numpy()

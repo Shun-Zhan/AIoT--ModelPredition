@@ -35,7 +35,8 @@ class Store:
               received_at TEXT PRIMARY KEY, uptime_ms INTEGER NOT NULL, wind_voltage REAL,
               wind_ms REAL, air_temp_c REAL, rh_percent REAL, soil_temp_c REAL,
               soil_moisture_percent REAL, solar_wm2 REAL, pressure_kpa REAL,
-              air_ok INTEGER, soil_ok INTEGER, wind_ok INTEGER, warnings_json TEXT NOT NULL
+              air_ok INTEGER, soil_ok INTEGER, wind_ok INTEGER, warnings_json TEXT NOT NULL,
+              solar_semantics TEXT NOT NULL DEFAULT 'net_shortwave_v1'
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_uptime ON snapshots(uptime_ms);
             CREATE TABLE IF NOT EXISTS forecasts (
@@ -86,9 +87,21 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_environment_events_open ON environment_events(code, resolved_at);
             CREATE INDEX IF NOT EXISTS idx_device_config_queue_status ON device_config_queue(status, queued_at);
             """)
+            # Older databases stored an average of sensors 1 and 2 in
+            # solar_wm2. New samples store Rns=Rs↓−Rs↑. Keep legacy records
+            # intact, but exclude them from new ET₀/model windows.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(snapshots)")}
+            if "solar_semantics" not in columns:
+                conn.execute(
+                    "ALTER TABLE snapshots ADD COLUMN solar_semantics TEXT NOT NULL DEFAULT 'legacy_mean'"
+                )
 
     def insert_snapshot(self, snapshot: SensorSnapshot, received_at: datetime, warnings: list[str]) -> bool:
-        solar = snapshot.solar_mean()
+        solar, solar_source = snapshot.net_shortwave_solar()
+        if solar_source == "default_albedo_fallback":
+            warnings.append("reflection solar sensor invalid; using default albedo 0.23")
+        elif solar_source == "incoming_invalid":
+            warnings.append("incoming solar sensor invalid; ET0 sample skipped")
         row = (
             received_at.isoformat(), snapshot.uptimeMs, snapshot.windVoltage,
             snapshot.windSpeedMs if snapshot.windOk else None,
@@ -97,7 +110,7 @@ class Store:
             snapshot.soil.temperatureC if snapshot.soilOk else None,
             snapshot.soil.moisturePercent if snapshot.soilOk else None,
             solar, snapshot.airPressureHpa / 10.0, int(snapshot.airOk), int(snapshot.soilOk),
-            int(snapshot.windOk), json.dumps(warnings),
+            int(snapshot.windOk), json.dumps(warnings), "net_shortwave_v1",
         )
         with self.connection() as conn:
             duplicate = conn.execute(
@@ -106,7 +119,15 @@ class Store:
             ).fetchone()
             if duplicate:
                 return False
-            conn.execute("INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+            conn.execute(
+                """INSERT INTO snapshots (
+                    received_at, uptime_ms, wind_voltage, wind_ms, air_temp_c,
+                    rh_percent, soil_temp_c, soil_moisture_percent, solar_wm2,
+                    pressure_kpa, air_ok, soil_ok, wind_ok, warnings_json,
+                    solar_semantics
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                row,
+            )
             return True
 
     def save_live_snapshot(self, snapshot: SensorSnapshot, received_at: datetime) -> None:
@@ -122,25 +143,34 @@ class Store:
         if not row:
             return None
         payload = json.loads(row[0])
-        solar_values = []
-        if payload.get("solar1Ok"):
-            solar_values.append(float(payload["solarRadiation1Wm2"]))
-        if payload.get("solar2Ok"):
-            solar_values.append(float(payload["solarRadiation2Wm2"]))
+        incoming = float(payload["solarRadiation2Wm2"]) if payload.get("solar2Ok") else None
+        reflected = float(payload["solarRadiation1Wm2"]) if payload.get("solar1Ok") else None
+        if incoming is None:
+            net_shortwave, solar_source = None, "incoming_invalid"
+        elif reflected is None:
+            net_shortwave, solar_source = max(0.77 * incoming, 0.0), "default_albedo_fallback"
+        else:
+            net_shortwave, solar_source = max(incoming - reflected, 0.0), "measured_reflection"
         return {
             "receivedAt": payload["receivedAt"], "uptimeMs": payload["uptimeMs"],
             "windOk": payload["windOk"], "windSpeedMs": payload["windSpeedMs"],
             "windVoltage": payload["windVoltage"], "airOk": payload["airOk"],
             "air": payload["air"], "airPressureHpa": payload["airPressureHpa"],
             "soilOk": payload["soilOk"], "soil": payload["soil"],
-            "solarOk": bool(solar_values),
-            "solarRadiationWm2": sum(solar_values) / len(solar_values) if solar_values else None,
+            "solarOk": incoming is not None,
+            "solarRadiationWm2": net_shortwave,
+            "solarIncomingWm2": incoming,
+            "solarReflectedWm2": reflected,
+            "solarSource": solar_source,
             "warnings": [],
         }
 
     def recent_frame(self, limit: int = 10000) -> pd.DataFrame:
         with self.connection() as conn:
-            rows = conn.execute("SELECT * FROM snapshots ORDER BY received_at DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM snapshots WHERE solar_semantics='net_shortwave_v1' "
+                "ORDER BY received_at DESC LIMIT ?", (limit,),
+            ).fetchall()
         if not rows:
             return pd.DataFrame()
         frame = pd.DataFrame([dict(row) for row in reversed(rows)])
@@ -176,6 +206,7 @@ class Store:
             },
             "solarOk": row["solar_wm2"] is not None,
             "solarRadiationWm2": row["solar_wm2"],
+            "solarSource": row["solar_semantics"],
             "warnings": warnings,
         }
 

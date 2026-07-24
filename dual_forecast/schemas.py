@@ -65,13 +65,29 @@ class SensorSnapshot(BaseModel):
             raise ValueError("receivedAt must include a timezone")
         return value
 
-    def solar_mean(self) -> float | None:
-        values: list[float] = []
-        if self.solar1Ok:
-            values.append(float(self.solarRadiation1Wm2))
-        if self.solar2Ok:
-            values.append(float(self.solarRadiation2Wm2))
-        return sum(values) / len(values) if values else None
+    def incoming_solar(self) -> float | None:
+        """Incoming shortwave radiation Rs↓, measured by solar sensor 2."""
+        return float(self.solarRadiation2Wm2) if self.solar2Ok else None
+
+    def reflected_solar(self) -> float | None:
+        """Reflected shortwave radiation Rs↑, measured by solar sensor 1."""
+        return float(self.solarRadiation1Wm2) if self.solar1Ok else None
+
+    def net_shortwave_solar(self) -> tuple[float | None, str]:
+        """Return net shortwave Rns and its provenance.
+
+        ET₀ needs incoming energy after reflection.  Sensor 1 is a reflected
+        radiation probe, not a second incoming-radiation probe, so averaging
+        the two readings would be physically wrong.  When that probe is
+        unavailable we retain the FAO default albedo fallback α=0.23.
+        """
+        incoming = self.incoming_solar()
+        if incoming is None:
+            return None, "incoming_invalid"
+        reflected = self.reflected_solar()
+        if reflected is None:
+            return max(0.77 * incoming, 0.0), "default_albedo_fallback"
+        return max(incoming - reflected, 0.0), "measured_reflection"
 
 
 class ForecastPoint(BaseModel):

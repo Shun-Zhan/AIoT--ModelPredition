@@ -21,12 +21,16 @@ def payload(i=0, *, solar1=True, solar2=True):
     }
 
 
-def test_schema_solar_mean_and_pressure_alias():
+def test_schema_uses_solar2_as_incoming_and_solar1_as_reflection():
     snap = SensorSnapshot.model_validate(payload())
-    assert snap.solar_mean() == 500
+    assert snap.incoming_solar() == 600
+    assert snap.reflected_solar() == 400
+    assert snap.net_shortwave_solar() == (200, "measured_reflection")
     assert snap.airPressureHpa == 1013
     snap = SensorSnapshot.model_validate(payload(solar2=False))
-    assert snap.solar_mean() == 400
+    assert snap.net_shortwave_solar() == (None, "incoming_invalid")
+    snap = SensorSnapshot.model_validate(payload(solar1=False))
+    assert snap.net_shortwave_solar() == (462, "default_albedo_fallback")
 
 
 def test_service_warms_up_and_latest_is_missing(tmp_path):

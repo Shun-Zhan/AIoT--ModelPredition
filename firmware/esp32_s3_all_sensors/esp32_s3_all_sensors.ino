@@ -5,8 +5,8 @@
     1. Selectable AHT20 or DHT11 air temperature/humidity sensor
     2. HW-611 / BMP280 or BME280 air pressure sensor over I2C
     3. ZH-SOIL7 soil sensor over RS485 / Modbus-RTU, 9600 8N1
-    4. SN-300AL-RA-N01 solar radiation sensor 1 over RS485 / Modbus-RTU, 4800 8N1
-    5. SN-300AL-RA-N01 solar radiation sensor 2 over RS485 / Modbus-RTU, 4800 8N1
+    4. SN-300AL-RA-N01 solar sensor 1: reflected shortwave Rs↑, RS485/Modbus
+    5. SN-300AL-RA-N01 solar sensor 2: incoming shortwave Rs↓, RS485/Modbus
     6. Two analog wind speed sensors on GPIO9 and GPIO6 / ADC1
 
   Important:
@@ -129,7 +129,11 @@ static const uint32_t DISPLAY_HANDSHAKE_INTERVAL_MS = 3000;
 
 // -------------------- Analog wind speed --------------------
 
-// GPIO9 is ADC1, so it remains usable while Wi-Fi is active.
+// GPIO6 is the only wind sensor enabled in the current hardware build.
+// Keep the wind1 fields in telemetry as disabled for PC-side protocol
+// compatibility; GPIO9 is intentionally not configured or sampled.
+static const bool WIND_1_ENABLED = false;
+static const bool WIND_2_ENABLED = true;
 static const uint8_t WIND_1_ADC_PIN = 9;
 static const uint8_t WIND_2_ADC_PIN = 6;
 static const uint8_t WIND_ADC_RESOLUTION_BITS = 12;
@@ -1235,20 +1239,8 @@ void updateDisplay(const SensorSnapshot &snapshot) {
     windSpeed /= windCount;
   }
 
-  const bool solarOk = snapshot.solar1Ok || snapshot.solar2Ok;
-  float solarRadiation = 0.0f;
-  uint8_t solarCount = 0;
-  if (snapshot.solar1Ok) {
-    solarRadiation += snapshot.solarRadiation1Wm2;
-    ++solarCount;
-  }
-  if (snapshot.solar2Ok) {
-    solarRadiation += snapshot.solarRadiation2Wm2;
-    ++solarCount;
-  }
-  if (solarCount > 0) {
-    solarRadiation /= solarCount;
-  }
+  const bool solarOk = snapshot.solar2Ok;
+  const float solarRadiation = netShortwaveRadiation(snapshot);
 
   if (!displayInitialized) {
     displaySetBackground(background);
@@ -1267,7 +1259,7 @@ void updateDisplay(const SensorSnapshot &snapshot) {
   displayPrintValue(400, 145, "WIND AVG", windOk, "%.2f m/s", windSpeed);
   displayPrintValue(30, 200, "SOIL TEMP", snapshot.soilOk, "%.1f C", snapshot.soil.temperatureC);
   displayPrintValue(400, 200, "SOIL MOIST", snapshot.soilOk, "%.1f %%", snapshot.soil.moisturePercent);
-  displayPrintValue(30, 255, "SOLAR AVG", solarOk, "%.0f W/m2", solarRadiation);
+  displayPrintValue(30, 255, "SOLAR NET", solarOk, "%.0f W/m2", solarRadiation);
 
   char modelLine[96];
   displayClearTextArea(30, 330, 720);
@@ -1804,24 +1796,28 @@ float averageWindSpeed(const SensorSnapshot &snapshot) {
   return count > 0 ? total / count : 0.0f;
 }
 
-float averageSolarRadiation(const SensorSnapshot &snapshot) {
-  uint32_t total = 0;
-  uint8_t count = 0;
-  if (snapshot.solar1Ok) {
-    total += snapshot.solarRadiation1Wm2;
-    ++count;
+float incomingSolarRadiation(const SensorSnapshot &snapshot) {
+  return snapshot.solar2Ok ? static_cast<float>(snapshot.solarRadiation2Wm2) : 0.0f;
+}
+
+float netShortwaveRadiation(const SensorSnapshot &snapshot) {
+  // Solar 2 measures Rs↓ (incoming); Solar 1 measures Rs↑ (reflection).
+  // If only Solar 2 is available, use FAO's default albedo α=0.23 rather
+  // than pretending the missing reflected value was zero.
+  const float incoming = incomingSolarRadiation(snapshot);
+  if (!snapshot.solar2Ok) {
+    return 0.0f;
   }
-  if (snapshot.solar2Ok) {
-    total += snapshot.solarRadiation2Wm2;
-    ++count;
+  if (!snapshot.solar1Ok) {
+    return incoming * 0.77f;
   }
-  return count > 0 ? static_cast<float>(total) / count : 0.0f;
+  return max(incoming - static_cast<float>(snapshot.solarRadiation1Wm2), 0.0f);
 }
 
 EdgePrediction updateEdgePrediction(const SensorSnapshot &snapshot) {
   const bool inputsValid = snapshot.airOk && snapshot.soilOk &&
                            snapshot.AirPressure > 0 &&
-                           (snapshot.solar1Ok || snapshot.solar2Ok);
+                           snapshot.solar2Ok;
   if (!inputsValid) {
     return {false, 0.0f, 0.0f, "SENSOR_INVALID", "sensor_invalid", millis()};
   }
@@ -1829,7 +1825,7 @@ EdgePrediction updateEdgePrediction(const SensorSnapshot &snapshot) {
   const uint32_t now = snapshot.uptimeMs;
   if (!latestEdgePrediction.valid ||
       now - lastEdgePredictionMs >= EDGE_PREDICTION_INTERVAL_MS) {
-    const float solarWm2 = averageSolarRadiation(snapshot);
+    const float solarWm2 = netShortwaveRadiation(snapshot);
     const float windMs = averageWindSpeed(snapshot);
     const float temperatureC = snapshot.air.temperatureC;
     const float humidityPct = constrain(snapshot.air.humidityPercent, 0.0f, 100.0f);
@@ -1899,7 +1895,7 @@ void sendTelemetry(const SensorSnapshot &snapshot,
       "\"air_pressure_hpa\":%u,"
       "\"air\":{\"ok\":%s,\"temperature_c\":%.2f,\"humidity_pct\":%.2f},"
       "\"soil\":{\"ok\":%s,\"temperature_c\":%.1f,\"moisture_pct\":%.1f},"
-      "\"solar\":{\"sensor_1\":{\"ok\":%s,\"radiation_w_m2\":%u},\"sensor_2\":{\"ok\":%s,\"radiation_w_m2\":%u}},"
+      "\"solar\":{\"sensor_1_role\":\"reflected_shortwave\",\"sensor_1\":{\"ok\":%s,\"radiation_w_m2\":%u},\"sensor_2_role\":\"incoming_shortwave\",\"sensor_2\":{\"ok\":%s,\"radiation_w_m2\":%u}},"
       "\"edge_prediction\":{\"valid\":%s,\"mode\":\"edge_fallback\",\"predicted_soil_moisture_30m_pct\":%.1f,"
       "\"drying_rate_pct_per_h\":%.3f,\"risk_level\":\"%s\",\"reason\":\"%s\",\"updated_uptime_ms\":%lu},"
       "\"display\":{\"enabled\":%s,\"rx_bytes\":%lu,\"handshake_ok\":%s}}\n",
@@ -1970,8 +1966,12 @@ void setup() {
   setupRs485DirectionPin(SOLAR_RS485_DE_RE_PIN);
 
   analogReadResolution(WIND_ADC_RESOLUTION_BITS);
-  analogSetPinAttenuation(WIND_1_ADC_PIN, ADC_11db);
-  analogSetPinAttenuation(WIND_2_ADC_PIN, ADC_11db);
+  if (WIND_1_ENABLED) {
+    analogSetPinAttenuation(WIND_1_ADC_PIN, ADC_11db);
+  }
+  if (WIND_2_ENABLED) {
+    analogSetPinAttenuation(WIND_2_ADC_PIN, ADC_11db);
+  }
 
   SoilSerial.begin(SOIL_BAUD, SERIAL_8N1, SOIL_RS485_RX_PIN, SOIL_RS485_TX_PIN);
   SolarSerial.begin(SOLAR_BAUD, SERIAL_8N1, SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN);
@@ -1985,8 +1985,9 @@ void setup() {
   Serial.println();
   Serial.println("Combined IOT sensor reader started");
   Serial.printf("Water valve relay: GPIO%d HIGH=ON; boot state CLOSED\n", VALVE_RELAY_PIN);
-  Serial.printf("Wind speed 1/2: ADC GPIO%d/GPIO%d, voltage gain %.3f\n",
-                WIND_1_ADC_PIN, WIND_2_ADC_PIN, WIND_SENSOR_VOLTAGE_GAIN);
+  Serial.printf("Wind speed: %s GPIO%d, voltage gain %.3f\n",
+                WIND_2_ENABLED ? "ADC" : "disabled", WIND_2_ADC_PIN,
+                WIND_SENSOR_VOLTAGE_GAIN);
   if (AIR_SENSOR_TYPE == AIR_SENSOR_DHT11) {
     Serial.printf("Air sensor: DHT11 DATA=GPIO%d\n", DHT11_DATA_PIN);
   } else {
@@ -2053,22 +2054,22 @@ void loop() {
   SensorSnapshot snapshot = {};
   snapshot.uptimeMs = millis();
 
-  snapshot.wind1Ok =
-      readWindSpeed(WIND_1_ADC_PIN, snapshot.wind1Voltage, snapshot.wind1SpeedMs);
-  if (snapshot.wind1Ok) {
-    Serial.printf("Wind 1 voltage: %.3f V\n", snapshot.wind1Voltage);
-    Serial.printf("Wind 1 speed: %.2f m/s\n", snapshot.wind1SpeedMs);
-  } else {
-    Serial.println("Wind speed sensor 1 read failed.");
+  if (WIND_1_ENABLED) {
+    snapshot.wind1Ok =
+        readWindSpeed(WIND_1_ADC_PIN, snapshot.wind1Voltage, snapshot.wind1SpeedMs);
   }
 
-  snapshot.wind2Ok =
-      readWindSpeed(WIND_2_ADC_PIN, snapshot.wind2Voltage, snapshot.wind2SpeedMs);
+  if (WIND_2_ENABLED) {
+    snapshot.wind2Ok =
+        readWindSpeed(WIND_2_ADC_PIN, snapshot.wind2Voltage, snapshot.wind2SpeedMs);
+  }
   if (snapshot.wind2Ok) {
-    Serial.printf("Wind 2 voltage: %.3f V\n", snapshot.wind2Voltage);
-    Serial.printf("Wind 2 speed: %.2f m/s\n", snapshot.wind2SpeedMs);
+    Serial.printf("Wind (GPIO%d) voltage: %.3f V\n", WIND_2_ADC_PIN,
+                  snapshot.wind2Voltage);
+    Serial.printf("Wind (GPIO%d) speed: %.2f m/s\n", WIND_2_ADC_PIN,
+                  snapshot.wind2SpeedMs);
   } else {
-    Serial.println("Wind speed sensor 2 read failed.");
+    Serial.printf("Wind speed sensor on GPIO%d read failed.\n", WIND_2_ADC_PIN);
   }
 
   if (readBmp280Pressure(snapshot.AirPressure)) {
@@ -2106,9 +2107,9 @@ void loop() {
 
   snapshot.solar1Ok = readSolarRadiation(SOLAR_1_ADDR, snapshot.solarRadiation1Wm2);
   if (snapshot.solar1Ok) {
-    Serial.printf("Solar radiation 1: %u W/m2\n", snapshot.solarRadiation1Wm2);
+    Serial.printf("Solar reflected (sensor 1): %u W/m2\n", snapshot.solarRadiation1Wm2);
   } else {
-    Serial.println("Solar radiation sensor 1 read failed.");
+    Serial.println("Solar reflected sensor 1 read failed.");
   }
   serviceWifi();
   serviceWifiProvisioning();
@@ -2117,15 +2118,20 @@ void loop() {
 
   snapshot.solar2Ok = readSolarRadiation(SOLAR_2_ADDR, snapshot.solarRadiation2Wm2);
   if (snapshot.solar2Ok) {
-    Serial.printf("Solar radiation 2: %u W/m2\n", snapshot.solarRadiation2Wm2);
+    Serial.printf("Solar incoming (sensor 2): %u W/m2\n", snapshot.solarRadiation2Wm2);
   } else {
-    Serial.println("Solar radiation sensor 2 read failed.");
+    Serial.println("Solar incoming sensor 2 read failed.");
+  }
+
+  if (snapshot.solar2Ok) {
+    Serial.printf("Solar net shortwave: %.0f W/m2 (%s)\n", netShortwaveRadiation(snapshot),
+                  snapshot.solar1Ok ? "measured reflection" : "default albedo fallback");
   }
 
   latestSensorSnapshotValid =
       (snapshot.wind1Ok || snapshot.wind2Ok) && snapshot.AirPressure > 0 &&
       snapshot.airOk && snapshot.soilOk &&
-      (snapshot.solar1Ok || snapshot.solar2Ok);
+      snapshot.solar2Ok;
   const EdgePrediction edgePrediction = updateEdgePrediction(snapshot);
   if (edgePrediction.valid) {
     Serial.printf("ESP32 edge prediction: soil in 30 min %.1f %% | drying %.3f %%/h | %s (%s)\n",

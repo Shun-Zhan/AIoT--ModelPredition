@@ -20,3 +20,9 @@ def test_et0_vectorized():
     assert result.shape == (2,)
     assert np.all(result >= 0)
 
+
+def test_observed_net_shortwave_is_not_reduced_by_albedo_twice():
+    # Rs↓=800 W/m² and Rs↑=160 W/m² means observed Rns=640 W/m².
+    observed_net = float(fao56_hourly_et0(25, 60, 2, 800, 101.3, net_shortwave_wm2=640))
+    double_reduced = float(fao56_hourly_et0(25, 60, 2, 640, 101.3))
+    assert observed_net > double_reduced

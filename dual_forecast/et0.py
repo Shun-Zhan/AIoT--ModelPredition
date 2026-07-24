@@ -45,12 +45,16 @@ def fao56_hourly_et0(
     solar_wm2,
     pressure_kpa,
     *,
+    net_shortwave_wm2=None,
     soil_heat_flux_mj_m2_h=0.0,
 ):
     """FAO-56 hourly Penman-Monteith ET0 in mm/hour.
 
-    Solar W/m2 is converted to MJ/m2/hour. Night-time negative net radiation is
-    not modeled; this controller-oriented estimate clips radiation at zero.
+    ``solar_wm2`` is incoming shortwave Rs↓ and is converted to MJ/m²/hour.
+    Set ``net_shortwave_wm2`` when a reflected-radiation probe provides an
+    observed net shortwave Rns=Rs↓−Rs↑.  This avoids applying the default
+    FAO albedo (0.23) twice.  Night-time negative net radiation is not
+    modeled; this controller-oriented estimate clips radiation at zero.
     """
     t = np.asarray(temp_c, dtype=float)
     rh = np.clip(np.asarray(rh_percent, dtype=float), 0.0, 100.0)
@@ -61,8 +65,10 @@ def fao56_hourly_et0(
     ea = es * rh / 100.0
     delta = 4098.0 * es / np.square(t + 237.3)
     gamma = 0.000665 * p
-    rn = 0.77 * rs
+    if net_shortwave_wm2 is None:
+        rn = 0.77 * rs
+    else:
+        rn = np.maximum(np.asarray(net_shortwave_wm2, dtype=float), 0.0) * 0.0036
     numerator = 0.408 * delta * (rn - soil_heat_flux_mj_m2_h) + gamma * (37.0 / (t + 273.0)) * u2 * (es - ea)
     denominator = delta + gamma * (1.0 + 0.34 * u2)
     return np.maximum(numerator / np.maximum(denominator, 1e-9), 0.0)
-

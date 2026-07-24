@@ -101,7 +101,9 @@ def snapshot_is_complete_for_prediction(snapshot: dict[str, Any]) -> bool:
         snapshot.get("windOk")
         and snapshot.get("airOk")
         and snapshot.get("soilOk")
-        and (snapshot.get("solar1Ok") or snapshot.get("solar2Ok"))
+        # Solar 2 is Rs↓ (incoming), the required ET₀ radiation input.
+        # Solar 1 is Rs↑ (reflection) and only improves the accuracy.
+        and snapshot.get("solar2Ok")
         and int(snapshot.get("AirPressure", 0)) > 0
     )
 

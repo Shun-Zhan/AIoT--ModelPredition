@@ -62,6 +62,16 @@ def test_zero_pressure_uses_configured_fallback():
     assert snapshot["AirPressure"] == 1013
 
 
+def test_prediction_requires_incoming_solar_sensor_2_not_only_reflection():
+    base = {
+        "windOk": True, "airOk": True, "soilOk": True,
+        "solar1Ok": True, "solar2Ok": False, "AirPressure": 1013,
+    }
+    assert not snapshot_is_complete_for_prediction(base)
+    base["solar2Ok"] = True
+    assert snapshot_is_complete_for_prediction(base)
+
+
 def test_esp32_edge_prediction_is_forwarded_to_live_dashboard():
     message = {
         "uptime_ms": 300000,
@@ -106,7 +116,9 @@ def test_incomplete_packet_is_not_used_for_prediction():
         "solar2Ok": False,
         "AirPressure": 1013,
     }
-    assert snapshot_is_complete_for_prediction(snapshot)
+    # Sensor 1 is reflected shortwave only.  It cannot substitute for the
+    # incoming Rs↓ energy measured by sensor 2 in an ET₀ model sample.
+    assert not snapshot_is_complete_for_prediction(snapshot)
 
     snapshot["soilOk"] = False
     assert not snapshot_is_complete_for_prediction(snapshot)

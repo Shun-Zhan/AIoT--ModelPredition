@@ -19,6 +19,7 @@ from .storage import Store
 
 def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> dict:
     """Convert an in-memory telemetry sample into the dashboard shape."""
+    net_shortwave, solar_source = snapshot.net_shortwave_solar()
     return {
         "receivedAt": received_at.isoformat(),
         "uptimeMs": snapshot.uptimeMs,
@@ -36,8 +37,11 @@ def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> di
             "temperatureC": snapshot.soil.temperatureC,
             "moisturePercent": snapshot.soil.moisturePercent,
         },
-        "solarOk": snapshot.solar_mean() is not None,
-        "solarRadiationWm2": snapshot.solar_mean(),
+        "solarOk": net_shortwave is not None,
+        "solarRadiationWm2": net_shortwave,
+        "solarIncomingWm2": snapshot.incoming_solar(),
+        "solarReflectedWm2": snapshot.reflected_solar(),
+        "solarSource": solar_source,
         "edgePrediction": (
             snapshot.edgePrediction.model_dump() if snapshot.edgePrediction is not None else None
         ),
@@ -218,6 +222,13 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       setValue('soilTemp', s.soilOk ? soil.temperatureC : null, '°C', 1);
       setValue('soilMoist', s.soilOk ? soil.moisturePercent : null, '%', 1);
       setValue('solar', s.solarOk ? s.solarRadiationWm2 : null, 'W/m²', 0);
+      setValue('solarIncoming', s.solarIncomingWm2, 'W/m²', 0);
+      setValue('solarReflected', s.solarReflectedWm2, 'W/m²', 0);
+      el('solarNote').textContent = s.solarSource === 'measured_reflection'
+        ? '净短波 = 入射 − 反射（实测）'
+        : s.solarSource === 'default_albedo_fallback'
+          ? '反射探头无效，按默认反照率 0.23 估算'
+          : '入射探头无效，不能用于 ET₀';
       el('updated').textContent = '最近采集：' + s.receivedAt + '，设备运行 ' + Math.round((s.uptimeMs || 0) / 1000) + ' 秒';
 
       var forecast = data.forecast;
@@ -622,7 +633,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card"><div class="label">平均风速</div><div id="wind" class="value">-- <span class="unit">m/s</span></div></div>
       <div class="card"><div class="label">土壤温度</div><div id="soilTemp" class="value">-- <span class="unit">°C</span></div></div>
       <div class="card"><div class="label">土壤湿度</div><div id="soilMoist" class="value">-- <span class="unit">%</span></div></div>
-      <div class="card"><div class="label">平均太阳辐射</div><div id="solar" class="value">-- <span class="unit">W/m²</span></div></div>
+      <div class="card"><div class="label">净短波辐射（ET₀）</div><div id="solar" class="value">-- <span class="unit">W/m²</span></div><div id="solarNote" class="meta"></div></div>
+      <div class="card"><div class="label">入射短波（Solar 2）</div><div id="solarIncoming" class="value">-- <span class="unit">W/m²</span></div></div>
+      <div class="card"><div class="label">反射短波（Solar 1）</div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
     <section class="card wide mobile-full"><h2>移动巡检与边缘风险</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
     <section class="card wide"><h2>预测模型（电脑端完整时序模型）</h2><div id="model" class="value" style="font-size:18px">等待数据...</div></section>
@@ -713,8 +726,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             warnings.append("soil sensor invalid")
         if not snapshot.windOk:
             warnings.append("wind sensor invalid")
-        if snapshot.solar_mean() is None:
-            warnings.append("both solar sensors invalid")
+        net_shortwave, solar_source = snapshot.net_shortwave_solar()
+        if net_shortwave is None:
+            warnings.append("incoming solar sensor invalid")
         if not store.insert_snapshot(snapshot, received_at, warnings):
             warnings.append("duplicate snapshot ignored")
         response = build_response(store.recent_frame(), models, settings)

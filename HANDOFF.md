@@ -31,7 +31,7 @@
 ### ESP32-S3 与传感器
 
 - 多传感器统一 `SensorSnapshot`，上报 `@TELEMETRY` JSON。
-- AHT20 空气温湿度，BMP280/BME280 气压，双路风速，土壤 RS485，双路太阳辐射 RS485。
+- AHT20 空气温湿度，BMP280/BME280 气压，双路风速，土壤 RS485，双路太阳辐射 RS485；Solar 1 为反射短波 Rs↑，Solar 2 为入射短波 Rs↓，ET₀ 使用净短波 Rns。
 - AHT20 / DHT11 可选，当前推荐 AHT20；DHT11 是备用方案。
 - 首次或执行 `@WIFI_RESET` 后开启配网热点；保存凭据到 ESP32 NVS，后续重启会自动重连。
 - ESP32 成功入网后开启 TCP 3333，并每 3 秒 UDP 3334 广播发现消息；电脑用自动发现，无需固定 IP。
@@ -62,13 +62,13 @@
 
 | 功能 | ESP32-S3 引脚 | 对外模块接法 / 注意事项 |
 | --- | --- | --- |
-| 风速 1 | GPIO9 | 接传感器 OUT；0–5 V 输出必须先分压至 0–3.3 V |
-| 风速 2 | GPIO6 | 接传感器 OUT；同样必须分压 |
+| 风速（当前启用） | GPIO6 | 接传感器 OUT；0–5 V 输出必须先分压至 0–3.3 V |
+| GPIO9 | 不接 | 预留给未来第二路风速；当前固件不采样 |
 | AHT20 | GPIO5 / GPIO8 | SDA / SCL；VCC→3.3 V，GND 共地，地址 0x38 |
 | DHT11 备用 | GPIO10 | OUT；当前固件默认不使用 |
 | BMP280/BME280（HW-611） | GPIO3 / GPIO4 | SDA / SCL；VCC→3.3 V，GND；CSB→3.3 V，SDO→GND 使用地址 0x76 |
 | 土壤传感器 | GPIO18 / GPIO17 | 经独立、3.3 V UART 兼容的自动收发 RS485 转换器：转换器 RO→GPIO18，DI→GPIO17；地址 0x03，4800 8N1 |
-| 两路太阳辐射 | GPIO16 / GPIO15 | 经另一独立 RS485 转换器：RO→GPIO16，DI→GPIO15；两个探头 A/B 可并联，地址 0x01、0x02，4800 8N1 |
+| Solar 1（反射 Rs↑）+ Solar 2（入射 Rs↓） | GPIO16 / GPIO15 | 经另一独立 RS485 转换器：RO→GPIO16，DI→GPIO15；两个探头 A/B 可并联，地址依次为 0x01、0x02，4800 8N1；计算净短波 `max(Solar2 - Solar1, 0)` |
 | 水阀继电器输入 | GPIO11 | 3.3 V 一路继电器，当前配置为高电平有效；模块 GND 必须和 ESP32 共地 |
 | 板载 I2C 电源控制 | GPIO7 | 程序使用，禁止外接或复用 |
 

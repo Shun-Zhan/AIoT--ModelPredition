@@ -6,8 +6,8 @@
 
 | 功能 | ESP32-S3 | 外设侧 | 说明 |
 | --- | --- | --- | --- |
-| 风速 1 | GPIO9 | OUT | ADC；0–5 V 必须分压到 0–3.3 V |
-| 风速 2 | GPIO6 | OUT | ADC；同上 |
+| 风速（当前启用） | GPIO6 | OUT | ADC；0–5 V 必须分压到 0–3.3 V |
+| GPIO9 | 不接 | 保留给未来第二路风速；当前固件不采样 |
 | AHT20 | GPIO5 / GPIO8 | SDA / SCL | 当前启用，3.3 V，地址 0x38 |
 | DHT11 备用 | GPIO10 | OUT | 当前停用 |
 | BMP280/BME280 | GPIO3 / GPIO4 | SDA / SCL | 3.3 V；CSB→3.3 V；SDO→GND（0x76） |
@@ -72,7 +72,7 @@ esp32-sensors.local:3333
 
 `@CONFIG` 只调整传感器读取周期，和控制 GPIO11 的 `@COMMAND` 分开处理。固件白名单为：`DEBUG` 固定 2000 ms、`IRRIGATION_MONITORING` 为 2000–5000 ms、`NORMAL_MONITORING` 为 30000–120000 ms、`NIGHT_ECO` 为 300000–900000 ms。无效模式/范围会被拒绝并 ACK 原有安全值。
 
-每 5 分钟，ESP32 还会在本地根据空气温湿度、气压、土壤湿度、太阳辐射和可用风速生成一个轻量趋势估计，并在 telemetry JSON 中增加：
+每 5 分钟，ESP32 还会在本地根据空气温湿度、气压、土壤湿度、净短波辐射和可用风速生成一个轻量趋势估计，并在 telemetry JSON 中增加：
 
 ```json
 "edge_prediction": {
@@ -86,6 +86,8 @@ esp32-sensors.local:3333
 ```
 
 它不是电脑端 N-BEATS/LSTM 的移植版，而是断网时仍可运行的低算力、可解释降级预测；只提示风险，不能直接打开水阀。
+
+太阳辐射语义固定为：RS485 地址 `0x01` 的 Solar 1 是反射短波 Rs↑，地址 `0x02` 的 Solar 2 是入射短波 Rs↓。ESP32 使用 `max(Solar2 - Solar1, 0)` 作为净短波；反射探头失败而入射探头正常时，以 `0.77 × Solar2` 作为默认反照率 α=0.23 回退。只有 Solar 2 正常的样本才可用于预测。
 
 动态配置仅存 RAM；上电或复位恢复 `DEBUG` / 2000 ms。水阀已打开时，固件拒绝大于 5000 ms 的周期和 `NIGHT_ECO`（原因 `valve_open_requires_fast_sampling`）。本项目不使用 Deep Sleep，因为必须持续保留继电器最长时长保护、8 秒心跳断开关阀和 USB 命令接收能力；这是一项安全设计，并非已测得的低功耗百分比。
 
