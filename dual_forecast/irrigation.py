@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import threading
 from typing import Any
 
 import pandas as pd
@@ -33,6 +34,28 @@ class IrrigationService:
         self.store = store
         self.settings = settings
         self.gateway = gateway or OpenAICompatibleGateway(settings)
+        persisted_mode = self.store.get_runtime_setting("operation_mode")
+        self._operation_mode = (
+            persisted_mode
+            if persisted_mode in {"semi_automatic", "automatic"}
+            else ("automatic" if settings.auto_irrigation_enabled else "semi_automatic")
+        )
+        self._analysis_lock = threading.Lock()
+
+    @property
+    def operation_mode(self) -> str:
+        return self._operation_mode
+
+    @property
+    def automatic_enabled(self) -> bool:
+        return self._operation_mode == "automatic"
+
+    def set_operation_mode(self, mode: str) -> str:
+        if mode not in {"semi_automatic", "automatic"}:
+            raise ValueError(mode)
+        self.store.set_runtime_setting("operation_mode", mode)
+        self._operation_mode = mode
+        return mode
 
     @property
     def last_device_state(self) -> dict[str, Any]:
@@ -236,6 +259,10 @@ class IrrigationService:
         return result
 
     def analyze(self, *, trigger: str = "manual") -> DecisionResult:
+        with self._analysis_lock:
+            return self._analyze(trigger=trigger)
+
+    def _analyze(self, *, trigger: str) -> DecisionResult:
         context = self.current_context()
         if not self.settings.llm_enabled:
             result = DecisionResult(
@@ -270,7 +297,7 @@ class IrrigationService:
         is never a direct hardware command.  The method records why an enabled
         automatic mode held a suggestion, so the dashboard remains auditable.
         """
-        if not self.settings.auto_irrigation_enabled or result.status != "awaiting_confirmation":
+        if not self.automatic_enabled or result.status != "awaiting_confirmation":
             return result
 
         reasons: list[str] = []
@@ -297,6 +324,7 @@ class IrrigationService:
 
         if reasons:
             held = result.model_copy(update={
+                "status": "auto_held",
                 "safetyReasons": result.safetyReasons + ["automatic execution held: " + reason for reason in reasons],
             })
             self.store.save_decision(held, current.model_dump(mode="json"), result.reason)

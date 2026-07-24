@@ -450,14 +450,14 @@ def test_auto_irrigation_requires_forecast_then_queues_after_local_gates(tmp_pat
     svc, store = service(tmp_path, enabled=True)
     svc.settings = replace(
         svc.settings,
-        auto_irrigation_enabled=True,
         auto_irrigation_min_confidence=0.8,
         auto_irrigation_require_forecast_ready=True,
     )
+    svc.set_operation_mode("automatic")
     svc.gateway = StartWateringGateway()
 
     held = svc.analyze(trigger="periodic")
-    assert held.status == "awaiting_confirmation"
+    assert held.status == "auto_held"
     assert any("complete local forecast" in reason for reason in held.safetyReasons)
     assert store.claim_pending_commands() == []
 
@@ -473,7 +473,7 @@ def test_auto_irrigation_requires_forecast_then_queues_after_local_gates(tmp_pat
 
 def test_auto_irrigation_never_bypasses_fresh_sensor_gate(tmp_path):
     svc, store = service(tmp_path, enabled=True)
-    svc.settings = replace(svc.settings, auto_irrigation_enabled=True)
+    svc.set_operation_mode("automatic")
     svc.gateway = StartWateringGateway()
     store.save_forecast(ready_forecast())
     store.save_live_snapshot(snapshot(), datetime.now(timezone.utc) - timedelta(seconds=svc.settings.data_stale_seconds + 1))
@@ -483,6 +483,23 @@ def test_auto_irrigation_never_bypasses_fresh_sensor_gate(tmp_path):
     assert held.status == "rejected"
     assert any("incomplete" in reason for reason in held.safetyReasons)
     assert store.claim_pending_commands() == []
+
+
+def test_operation_mode_is_persisted_and_auto_hold_cannot_be_manually_confirmed(tmp_path):
+    svc, store = service(tmp_path, enabled=True)
+    svc.gateway = StartWateringGateway()
+    svc.set_operation_mode("automatic")
+
+    held = svc.analyze(trigger="automatic_minute")
+
+    assert held.status == "auto_held"
+    assert svc.confirm(held.requestId).status == "auto_held"
+    assert store.claim_pending_commands() == []
+
+    restored = IrrigationService(store, svc.settings)
+    assert restored.operation_mode == "automatic"
+    restored.set_operation_mode("semi_automatic")
+    assert IrrigationService(store, svc.settings).operation_mode == "semi_automatic"
 
 
 class RecordingSerial:

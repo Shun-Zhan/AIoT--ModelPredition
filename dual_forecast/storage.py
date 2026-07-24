@@ -80,6 +80,9 @@ class Store:
               request_id TEXT PRIMARY KEY, config_json TEXT NOT NULL, status TEXT NOT NULL,
               queued_at TEXT NOT NULL, sent_at TEXT, ack_json TEXT
             );
+            CREATE TABLE IF NOT EXISTS runtime_settings (
+              key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_llm_calls_called_at ON llm_calls(called_at);
             CREATE INDEX IF NOT EXISTS idx_decisions_evaluated_at ON decisions(evaluated_at);
             CREATE INDEX IF NOT EXISTS idx_command_queue_status ON command_queue(status, queued_at);
@@ -96,6 +99,21 @@ class Store:
                 conn.execute(
                     "ALTER TABLE snapshots ADD COLUMN solar_semantics TEXT NOT NULL DEFAULT 'legacy_mean'"
                 )
+
+    def get_runtime_setting(self, key: str) -> str | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM runtime_settings WHERE key=?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_runtime_setting(self, key: str, value: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_settings(key,value,updated_at) VALUES(?,?,?)",
+                (key, value, datetime.now(timezone.utc).isoformat()),
+            )
 
     def insert_snapshot(self, snapshot: SensorSnapshot, received_at: datetime, warnings: list[str]) -> bool:
         solar, solar_source = snapshot.net_shortwave_solar()

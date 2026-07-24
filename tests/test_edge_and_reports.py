@@ -217,6 +217,11 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "环境事件时间线" not in html
     assert 'id="events"' not in html
     assert "<h2>云端分析决策</h2>" in html
+    assert "灌溉运行模式" in html
+    assert 'id="modeSemiAutomatic"' in html
+    assert 'id="modeAutomatic"' in html
+    assert "半自动模式" in html
+    assert "全自动模式" in html
     assert "云端增强与水阀安全层" not in html
     assert 'id="cloudConnectionBadge"' in html
     assert 'id="decisionAction"' in html
@@ -253,6 +258,9 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "/v1/actuator/debug/open" in app_js.text
     assert "/v1/actuator/debug/close" in app_js.text
     assert "beginDebugHold" in app_js.text
+    assert "/v1/operation-mode" in app_js.text
+    assert "每 60 秒调用一次 AI 决策" in app_js.text
+    assert "全自动模式无需人工确认" in app_js.text
     assert "analyzeStatus" in html
     assert "et0ForecastChart" in html
     assert "soilForecastChart" in html

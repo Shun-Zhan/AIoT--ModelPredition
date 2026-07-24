@@ -59,7 +59,7 @@ class Settings:
     crop_coefficient: float = 0.85
     proxy_irrigation_trigger_percent: float = 30.0
     proxy_irrigation_target_percent: float = 75.0
-    database_path: Path = Path("runtime/forecast.sqlite3")
+    database_path: Path = Path(os.getenv("AIOT_DATABASE_PATH", "runtime/forecast.sqlite3"))
     artifact_dir: Path = Path("artifacts")
     llm_enabled: bool = os.getenv("AIOT_LLM_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
     gateway_base_url: str = os.getenv("VEI_BASE_URL", "https://ai-gateway.vei.volces.com/v1")

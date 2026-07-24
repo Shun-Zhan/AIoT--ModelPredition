@@ -175,6 +175,11 @@ class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
 
 
+class OperationModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["semi_automatic", "automatic"]
+
+
 class ChatResponse(BaseModel):
     answer: str
     dataRange: dict[str, Any]

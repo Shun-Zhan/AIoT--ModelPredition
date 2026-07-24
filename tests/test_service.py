@@ -1,9 +1,12 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import threading
 
 from fastapi.testclient import TestClient
 
+import dual_forecast.service as service_module
 from dual_forecast.config import SETTINGS
+from dual_forecast.irrigation import IrrigationService
 from dual_forecast.schemas import SensorSnapshot
 from dual_forecast.service import create_app
 
@@ -99,6 +102,23 @@ def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):
     assert not status.json()["enabled"]
     assert status.json()["actuator"]["state"] == "CLOSED"
     assert not status.json()["autoIrrigation"]["enabled"]
+    assert status.json()["operationMode"] == "semi_automatic"
+
+    automatic = client.post("/v1/operation-mode", json={"mode": "automatic"})
+    assert automatic.status_code == 200
+    assert automatic.json()["mode"] == "automatic"
+    assert automatic.json()["automaticIntervalSeconds"] == 60
+    assert automatic.json()["nextAutomaticAnalysisAt"]
+    switched_status = client.get("/v1/cloud/status").json()
+    assert switched_status["operationMode"] == "automatic"
+    assert switched_status["autoIrrigation"]["enabled"]
+
+    invalid_mode = client.post("/v1/operation-mode", json={"mode": "manual"})
+    assert invalid_mode.status_code == 422
+
+    semi = client.post("/v1/operation-mode", json={"mode": "semi_automatic"})
+    assert semi.status_code == 200
+    assert not client.get("/v1/cloud/status").json()["autoIrrigation"]["enabled"]
 
     analysis = client.post("/v1/cloud/analyze").json()
     assert analysis["finalAction"] == "NO_OP"
@@ -117,3 +137,28 @@ def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):
     chat = client.post("/v1/cloud/chat", json={"question": "今天要浇水吗？"}).json()
     assert not chat["llmUsed"]
     assert "本地离线模式" in chat["answer"]
+
+
+def test_automatic_mode_worker_calls_ai_on_automatic_interval(tmp_path, monkeypatch):
+    settings = replace(
+        SETTINGS,
+        database_path=tmp_path / "db.sqlite",
+        artifact_dir=tmp_path / "artifacts",
+        llm_enabled=True,
+        auto_irrigation_enabled=True,
+    )
+    called = threading.Event()
+    triggers = []
+
+    def record_analysis(self, *, trigger="manual"):
+        triggers.append(trigger)
+        called.set()
+        return None
+
+    monkeypatch.setattr(service_module, "AUTO_ANALYSIS_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(IrrigationService, "analyze", record_analysis)
+
+    with TestClient(create_app(settings)):
+        assert called.wait(1)
+
+    assert triggers[0] == "automatic_minute"

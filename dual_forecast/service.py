@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import struct
 import threading
+import time
 from urllib.parse import urlparse
 import zlib
 
@@ -14,8 +15,11 @@ from .config import SETTINGS, Settings
 from .et0 import fao56_hourly_et0_from_net_shortwave
 from .inference import ModelBundle, build_response
 from .irrigation import IrrigationService
-from .schemas import ChatRequest, ForecastResponse, IrrigationAction, SensorSnapshot
+from .schemas import ChatRequest, ForecastResponse, IrrigationAction, OperationModeRequest, SensorSnapshot
 from .storage import Store
+
+
+AUTO_ANALYSIS_INTERVAL_SECONDS = 60
 
 
 def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> dict:
@@ -90,8 +94,15 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     store = Store(settings.database_path)
     models = ModelBundle(settings)
     irrigation = IrrigationService(store, settings)
-    state = {"last_uptime": None, "last_response": None, "last_live_snapshot": None}
+    state = {
+        "last_uptime": None,
+        "last_response": None,
+        "last_live_snapshot": None,
+        "last_automatic_analysis_at": None,
+        "next_automatic_analysis_at": None,
+    }
     stop_periodic = threading.Event()
+    wake_periodic = threading.Event()
 
     def edge_payload() -> dict:
         current = store.latest_live_snapshot() or store.latest_snapshot() or {}
@@ -156,16 +167,62 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         }
 
     def periodic_worker():
-        """Low-frequency cloud analysis; optional auto mode remains locally gated."""
-        interval = max(60, settings.llm_min_interval_minutes * 60)
-        elapsed = 0
-        while not stop_periodic.wait(10):
+        """Run cloud analysis at one minute in automatic mode.
+
+        Semi-automatic mode retains the existing low-frequency analysis
+        interval and always waits for a human confirmation.  Changing mode
+        wakes this worker and starts a fresh interval instead of inheriting an
+        almost-expired timer from the previous mode.
+        """
+        mode = irrigation.operation_mode
+        interval = (
+            AUTO_ANALYSIS_INTERVAL_SECONDS
+            if irrigation.automatic_enabled
+            else max(60, settings.llm_min_interval_minutes * 60)
+        )
+        next_analysis = time.monotonic() + interval
+        if irrigation.automatic_enabled:
+            state["next_automatic_analysis_at"] = (
+                datetime.now(timezone.utc) + timedelta(seconds=interval)
+            ).isoformat()
+        while not stop_periodic.is_set():
+            wake_periodic.wait(timeout=min(10, max(0.01, next_analysis - time.monotonic())))
+            wake_periodic.clear()
+            if stop_periodic.is_set():
+                break
             irrigation.record_data_interruption_if_needed()
             irrigation.record_valve_execution_failures()
-            elapsed += 10
-            if settings.llm_enabled and elapsed >= interval:
-                irrigation.analyze(trigger="periodic")
-                elapsed = 0
+            current_mode = irrigation.operation_mode
+            if current_mode != mode:
+                mode = current_mode
+                interval = (
+                    AUTO_ANALYSIS_INTERVAL_SECONDS
+                    if irrigation.automatic_enabled
+                    else max(60, settings.llm_min_interval_minutes * 60)
+                )
+                next_analysis = time.monotonic() + interval
+                state["next_automatic_analysis_at"] = (
+                    (datetime.now(timezone.utc) + timedelta(seconds=interval)).isoformat()
+                    if irrigation.automatic_enabled else None
+                )
+            if not settings.llm_enabled or time.monotonic() < next_analysis:
+                continue
+            trigger = "automatic_minute" if irrigation.automatic_enabled else "periodic"
+            irrigation.analyze(trigger=trigger)
+            now = datetime.now(timezone.utc)
+            if irrigation.automatic_enabled:
+                state["last_automatic_analysis_at"] = now.isoformat()
+            # Keep minute boundaries stable when the model responds within a
+            # minute. If a call itself overruns the interval, avoid an
+            # immediate catch-up burst and resume one interval later.
+            next_analysis += interval
+            monotonic_now = time.monotonic()
+            if next_analysis <= monotonic_now:
+                next_analysis = monotonic_now + interval
+            state["next_automatic_analysis_at"] = (
+                (now + timedelta(seconds=next_analysis - monotonic_now)).isoformat()
+                if irrigation.automatic_enabled else None
+            )
 
     @app.on_event("startup")
     def start_periodic_worker():
@@ -176,6 +233,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     @app.on_event("shutdown")
     def stop_periodic_worker():
         stop_periodic.set()
+        wake_periodic.set()
 
     # Keep the dashboard logic in a standalone, ES5-compatible asset.  Some
     # embedded/mobile browsers used during demonstrations do not execute the
@@ -203,6 +261,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   var analyzeBusy = false;
   var analyzeStatusTimer = null;
   var lastRenderedDecisionId = '';
+  var modeSwitchBusy = false;
 
   function el(id) { return document.getElementById(id); }
   function has(value) { return value !== null && value !== undefined; }
@@ -506,6 +565,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       gateway_error: '云端分析失败',
       suggested: '分析完成',
       awaiting_confirmation: '等待人工确认',
+      auto_held: '自动执行条件未满足',
       rejected: '本地安全审核未通过',
       rejected_on_confirmation: '确认时安全审核未通过',
       confirmed_waiting_device: '已确认，等待设备执行',
@@ -517,6 +577,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   }
   function decisionStatusTone(status) {
     if (status === 'rejected' || status === 'rejected_on_confirmation' || status === 'gateway_error') return 'bad';
+    if (status === 'auto_held') return 'warn';
     if (status === 'awaiting_confirmation' || status === 'confirmed_waiting_device' || status === 'auto_confirmed_waiting_device') return 'warn';
     if (status === 'suggested' || status === 'executed' || status === 'completed') return 'ok';
     return '';
@@ -651,6 +712,25 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       var decision = data.decision, actuator = data.actuator || {};
       var confirm = el('confirm');
       var automatic = data.autoIrrigation || {};
+      var automaticMode = data.operationMode === 'automatic';
+      var semiButton = el('modeSemiAutomatic'), autoButton = el('modeAutomatic');
+      semiButton.className = 'mode-option' + (!automaticMode ? ' selected' : '');
+      autoButton.className = 'mode-option' + (automaticMode ? ' selected automatic' : '');
+      semiButton.setAttribute('aria-pressed', automaticMode ? 'false' : 'true');
+      autoButton.setAttribute('aria-pressed', automaticMode ? 'true' : 'false');
+      semiButton.disabled = modeSwitchBusy || !automaticMode;
+      autoButton.disabled = modeSwitchBusy || automaticMode;
+      el('modeDescription').textContent = automaticMode
+        ? (data.enabled
+          ? '全自动模式：系统每 60 秒调用一次 AI 决策；通过本地安全审核后自动执行，无需人工确认。'
+          : '全自动模式已选择，但云端分析尚未启用；自动分析与执行当前处于暂停状态。')
+        : '半自动模式：AI 负责分析建议，正式开阀前仍需人工长按确认。';
+      el('modeSchedule').textContent = automaticMode
+        ? (data.enabled
+          ? ('下次自动分析：' + formatDecisionTime(data.nextAutomaticAnalysisAt)
+            + (data.lastAutomaticAnalysisAt ? '　·　上次：' + formatDecisionTime(data.lastAutomaticAnalysisAt) : ''))
+          : '等待云端分析功能启用。')
+        : '自动分析与自动执行当前未启用。';
       setStatusBadge('cloudConnectionBadge', data.enabled ? '云端：已连接' : '云端：未启用', data.enabled ? 'ok' : 'bad');
       setStatusBadge('cloudValveBadge', actuator.state === 'OPEN' ? '水阀：已开启' : '水阀：已关闭', actuator.state === 'OPEN' ? 'warn' : 'ok');
       setStatusBadge(
@@ -666,11 +746,15 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         : '云端分析当前未启用；本地传感器监测、预测和水阀安全保护仍正常运行。';
       renderDecision(decision);
 
-      var awaiting = !!(decision && decision.status === 'awaiting_confirmation');
+      var awaiting = !!(decision && decision.status === 'awaiting_confirmation' && !automaticMode);
       el('cancel').hidden = !awaiting;
       el('decisionNextStep').hidden = !awaiting;
       confirm.setAttribute('data-id', decision ? decision.requestId : '');
       confirm.setAttribute('data-enabled', awaiting ? 'true' : 'false');
+      confirm.setAttribute(
+        'data-disabled-label',
+        automaticMode ? '全自动模式无需人工确认' : '暂无可执行灌溉建议'
+      );
       if (awaiting && longPressDecisionId && longPressDecisionId !== decision.requestId && !longPressStartedAt) {
         longPressTriggered = false;
         longPressDecisionId = '';
@@ -694,6 +778,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
           setConfirmStatus('确认时的本地安全复核未通过，未发送开阀命令。', 'bad');
         } else if (decision && decision.status === 'rejected') {
           setConfirmStatus('云端建议已收到，但本地安全审核未通过，正式执行按钮暂不可用。', 'bad');
+        } else if (decision && decision.status === 'auto_held') {
+          setConfirmStatus('本轮自动执行条件未满足，未发送开阀指令；系统将在下一周期重新分析。', 'warn');
         } else if (decision && decision.finalAction === 'NO_OP') {
           setConfirmStatus('当前没有可执行的开阀建议，正式执行按钮暂不可用。', 'meta');
         } else {
@@ -733,12 +819,35 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     if (analyzeStatusTimer) clearTimeout(analyzeStatusTimer);
     analyzeStatusTimer = setTimeout(function () { setAnalyzeState('', ''); }, 4200);
   }
+  function setOperationMode(mode) {
+    if (modeSwitchBusy) return;
+    modeSwitchBusy = true;
+    el('modeStatus').textContent = '正在切换运行模式…';
+    el('modeStatus').className = 'warn';
+    el('modeSemiAutomatic').disabled = true;
+    el('modeAutomatic').disabled = true;
+    request('POST', '/v1/operation-mode', {mode: mode}, function (result) {
+      modeSwitchBusy = false;
+      el('modeStatus').textContent = result.mode === 'automatic'
+        ? '已进入全自动模式，首次自动分析将在 60 秒后进行。'
+        : '已进入半自动模式，开阀恢复为人工长按确认。';
+      el('modeStatus').className = 'ok';
+      refreshCloud();
+    }, function (message) {
+      modeSwitchBusy = false;
+      el('modeStatus').textContent = '模式切换失败：' + message;
+      el('modeStatus').className = 'bad';
+      refreshCloud();
+    });
+  }
   function resetConfirmButton() {
     var confirm = el('confirm');
     var enabled = confirm.getAttribute('data-enabled') === 'true';
     confirm.disabled = !enabled;
     confirm.className = 'hold formal-confirm';
-    confirm.textContent = enabled ? '长按 1.5 秒确认灌溉' : '暂无可执行灌溉建议';
+    confirm.textContent = enabled
+      ? '长按 1.5 秒确认灌溉'
+      : (confirm.getAttribute('data-disabled-label') || '暂无可执行灌溉建议');
   }
   function clearLongPress(showCancelled) {
     if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
@@ -923,6 +1032,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       refreshCloud();
     });
   };
+  el('modeSemiAutomatic').onclick = function () { setOperationMode('semi_automatic'); };
+  el('modeAutomatic').onclick = function () { setOperationMode('automatic'); };
   el('cancel').onclick = function () {
     var id = el('confirm').getAttribute('data-id');
     if (!id) return;
@@ -1097,6 +1208,18 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 18px; }
     .card { min-height: 70px; padding: 20px; background: var(--bg); border: 0; border-radius: 32px; box-shadow: var(--shadow-extruded); }
     .wide { margin-top: 20px; }
+    .mode-card { margin-bottom: 20px; padding: 17px 20px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+    .mode-copy { min-width: 0; flex: 1 1 auto; }
+    .mode-title { font-size: 16px; font-weight: 780; }
+    .mode-description { margin-top: 5px; color: var(--text); font-size: 13px; line-height: 1.55; }
+    .mode-schedule { margin-top: 4px; }
+    .mode-control { flex: 0 0 auto; display: flex; gap: 8px; padding: 6px; border-radius: 19px; box-shadow: var(--shadow-inset); }
+    .mode-option { min-width: 112px; margin: 0; color: var(--muted); background: transparent; box-shadow: none; }
+    .mode-option.selected { color: #fff; background: var(--success); box-shadow: var(--shadow-small); }
+    .mode-option.selected.automatic { background: var(--accent); }
+    .mode-option.selected:disabled { cursor: default; opacity: 1; }
+    #modeStatus:empty { display: none; }
+    #modeStatus { margin: 10px 3px 0; font-size: 13px; }
     .label { color: var(--muted); font-size: 13px; font-weight: 600; }
     .value { margin-top: 9px; font-size: 25px; font-weight: 750; letter-spacing: 0; color: var(--text); }
     .unit { font-size: 13px; color: var(--muted); font-weight: 500; }
@@ -1205,12 +1328,27 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       .decision-action { font-size: 25px; }
       .decision-actions { align-items: stretch; }
       .decision-actions button { flex: 1 1 180px; }
+      .mode-card { align-items: stretch; flex-direction: column; }
+      .mode-control { width: 100%; }
+      .mode-option { flex: 1 1 50%; min-width: 0; }
     }
   </style>
 </head>
 <body>
   <header><div><h1>AIoT 智慧灌溉监控</h1></div><div id="connection" class="muted">正在连接...</div></header>
   <main>
+    <section class="card mode-card" aria-labelledby="operationModeTitle">
+      <div class="mode-copy">
+        <div id="operationModeTitle" class="mode-title">灌溉运行模式</div>
+        <div id="modeDescription" class="mode-description">正在读取当前模式…</div>
+        <div id="modeSchedule" class="meta mode-schedule"></div>
+        <div id="modeStatus" aria-live="polite"></div>
+      </div>
+      <div class="mode-control" role="group" aria-label="选择灌溉运行模式">
+        <button id="modeSemiAutomatic" class="mode-option" type="button" aria-pressed="false">半自动模式</button>
+        <button id="modeAutomatic" class="mode-option" type="button" aria-pressed="false">全自动模式</button>
+      </div>
+    </section>
     <section class="grid">
       <div class="card"><div class="label">空气温度</div><div id="airTemp" class="value">-- <span class="unit">°C</span></div></div>
       <div class="card"><div class="label">空气湿度</div><div id="airRh" class="value">-- <span class="unit">%RH</span></div></div>
@@ -1413,14 +1551,34 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             "enabled": settings.llm_enabled,
             "configured": irrigation.gateway.configured,
             "provider": "volcengine-openai-compatible",
+            "operationMode": irrigation.operation_mode,
+            "automaticIntervalSeconds": AUTO_ANALYSIS_INTERVAL_SECONDS,
+            "lastAutomaticAnalysisAt": state["last_automatic_analysis_at"],
+            "nextAutomaticAnalysisAt": state["next_automatic_analysis_at"],
             "autoIrrigation": {
-                "enabled": settings.auto_irrigation_enabled,
+                "enabled": irrigation.automatic_enabled,
                 "minConfidence": settings.auto_irrigation_min_confidence,
                 "requiresForecastReady": settings.auto_irrigation_require_forecast_ready,
             },
             "latestCall": store.latest_llm_call(),
             "decision": decision.model_dump(mode="json") if decision else None,
             "actuator": irrigation.last_device_state,
+        }
+
+    @app.post("/v1/operation-mode")
+    def set_operation_mode(request: OperationModeRequest):
+        mode = irrigation.set_operation_mode(request.mode)
+        now = datetime.now(timezone.utc)
+        state["next_automatic_analysis_at"] = (
+            (now + timedelta(seconds=AUTO_ANALYSIS_INTERVAL_SECONDS)).isoformat()
+            if mode == "automatic" else None
+        )
+        wake_periodic.set()
+        return {
+            "mode": mode,
+            "automaticIntervalSeconds": AUTO_ANALYSIS_INTERVAL_SECONDS,
+            "nextAutomaticAnalysisAt": state["next_automatic_analysis_at"],
+            "safetyPolicy": "local_review_and_esp32_protection_required",
         }
 
     @app.post("/v1/cloud/analyze")
