@@ -224,8 +224,15 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert 'id="decisionSafetyBox"' in html
     assert 'id="decisionDetails"' in html
     assert 'id="decisionNextStep"' in html
+    assert 'id="confirm" class="hold formal-confirm"' in html
+    assert "暂无可执行灌溉建议" in html
     assert "云端判断原因" in html
     assert "本地安全审核" in html
+    assert "水阀调试（本地安全模式）" in html
+    assert 'id="debugOpenValve"' in html
+    assert "debug-hold" in html
+    assert 'id="debugCloseValve"' in html
+    assert "长按 1.5 秒调试开阀 5 秒" in html
     assert "查看技术详情" in html
     assert "建议灌溉" in app_js.text
     assert "建议停止灌溉" in app_js.text
@@ -241,6 +248,11 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "云端把执行权限误作灌溉依据，结果已被系统拒绝" in app_js.text
     assert "未满足本地预测灌溉候选条件" in app_js.text
     assert "el('decisionNextStep').hidden = !awaiting" in app_js.text
+    assert "confirm.setAttribute('data-enabled', awaiting ? 'true' : 'false')" in app_js.text
+    assert "暂不可执行" in app_js.text
+    assert "/v1/actuator/debug/open" in app_js.text
+    assert "/v1/actuator/debug/close" in app_js.text
+    assert "beginDebugHold" in app_js.text
     assert "analyzeStatus" in html
     assert "et0ForecastChart" in html
     assert "soilForecastChart" in html

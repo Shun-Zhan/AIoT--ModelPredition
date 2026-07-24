@@ -70,6 +70,7 @@ class IrrigationService:
 
     def _start_watering_safety_reasons(
         self, context: DecisionContext, duration_seconds: int | None, now: datetime,
+        *, enforce_watering_cooldown: bool = True,
     ) -> list[str]:
         """Apply the same local candidate and actuator gates at every review."""
         reasons: list[str] = []
@@ -88,9 +89,14 @@ class IrrigationService:
             reasons.append("duration exceeds local limit")
         if self.last_device_state.get("state") == "OPEN":
             reasons.append("valve is already open")
-        since = now - timedelta(minutes=self.settings.watering_cooldown_minutes)
-        if self.store.watering_totals(since) > 0:
-            reasons.append("watering cooldown is active")
+        if enforce_watering_cooldown:
+            since = now - timedelta(minutes=self.settings.watering_cooldown_minutes)
+            # A five-second actuator diagnostic is real valve activity and
+            # therefore still counts toward the daily safety limit, but it is
+            # not an agronomic watering cycle and must not start the formal
+            # irrigation cooldown.
+            if self.store.watering_totals(since, include_debug=False) > 0:
+                reasons.append("watering cooldown is active")
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         if self.store.watering_totals(day_start) + int(duration_seconds or 0) > self.settings.max_daily_watering_seconds:
             reasons.append("daily watering limit would be exceeded")
@@ -356,6 +362,64 @@ class IrrigationService:
         })
         self.store.save_decision(cancelled, {"cancelled": True}, result.reason)
         return cancelled
+
+    def queue_debug_actuation(self, action: IrrigationAction, *, duration_seconds: int = 5) -> dict[str, Any]:
+        """Queue a short, locally reviewed command for actuator diagnostics."""
+        request_id = new_request_id("debug")
+        now = datetime.now(timezone.utc)
+        safety_reasons: list[str] = []
+        if action == IrrigationAction.START_WATERING:
+            duration_seconds = min(max(int(duration_seconds), 1), 5)
+            context = self.current_context(request_id)
+            # The 15-minute agronomic cooldown prevents repeated irrigation
+            # cycles. It must not lock out the separate, fixed five-second
+            # actuator diagnostic. Debug commands still pass every other local
+            # gate, including telemetry, candidacy, valve state and daily use.
+            safety_reasons.extend(
+                self._start_watering_safety_reasons(
+                    context,
+                    duration_seconds,
+                    now,
+                    enforce_watering_cooldown=False,
+                )
+            )
+            if safety_reasons:
+                return {
+                    "status": "rejected",
+                    "queued": False,
+                    "requestId": request_id,
+                    "action": action.value,
+                    "durationSeconds": duration_seconds,
+                    "message": "本地安全审核未通过，未发送调试开阀命令。",
+                    "safetyReasons": safety_reasons,
+                }
+        else:
+            duration_seconds = 0
+
+        command = {
+            "schemaVersion": "1.0",
+            "requestId": request_id,
+            "action": action.value,
+            "durationSeconds": duration_seconds if action == IrrigationAction.START_WATERING else None,
+            "reasonCode": "MANUAL_ACTUATOR_DEBUG",
+            "reason": "local manual actuator diagnostic",
+            "confidence": 1.0,
+            "expiresAt": (now + timedelta(seconds=30)).isoformat(),
+            "ttlSeconds": 30,
+        }
+        queued = self.store.enqueue_command(command)
+        return {
+            "status": "queued" if queued else "duplicate",
+            "queued": queued,
+            "requestId": request_id,
+            "action": action.value,
+            "durationSeconds": command["durationSeconds"],
+            "message": (
+                "调试指令已进入串口发送队列，正在等待下位机 ACK。"
+                if queued else "调试指令未能进入发送队列。"
+            ),
+            "safetyReasons": [],
+        }
 
     def chat(self, question: str) -> dict[str, Any]:
         context = self.current_context("chat-" + new_request_id())

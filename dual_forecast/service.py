@@ -14,7 +14,7 @@ from .config import SETTINGS, Settings
 from .et0 import fao56_hourly_et0_from_net_shortwave
 from .inference import ModelBundle, build_response
 from .irrigation import IrrigationService
-from .schemas import ChatRequest, ForecastResponse, SensorSnapshot
+from .schemas import ChatRequest, ForecastResponse, IrrigationAction, SensorSnapshot
 from .storage import Store
 
 
@@ -191,6 +191,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   var longPressTriggered = false;
   var longPressPointerId = null;
   var longPressDecisionId = '';
+  var debugHoldTimer = null;
+  var debugHoldProgressTimer = null;
+  var debugHoldStartedAt = 0;
+  var debugHoldTriggered = false;
+  var debugStatusTimer = null;
   var voiceRecognition = null;
   var voiceStopTimer = null;
   var voiceBusy = false;
@@ -594,7 +599,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     var finalAction = decision.finalAction || 'NO_OP';
     var invalidGovernance = isGovernanceOnlyDecision(decision);
     var blocked = finalAction === 'NO_OP' && proposed !== 'NO_OP';
-    var actionText = invalidGovernance ? '结果无效' : (blocked ? '不执行灌溉' : actionLabel(proposed));
+    var actionText = invalidGovernance
+      ? '结果无效'
+      : (blocked ? actionLabel(proposed) + '（暂不可执行）' : actionLabel(proposed));
     var actionTone = invalidGovernance || blocked || decision.status === 'rejected' || decision.status === 'rejected_on_confirmation'
       || decision.status === 'gateway_error' ? 'bad' : (proposed === 'START_WATERING' ? 'warn' : 'ok');
     el('decisionAction').textContent = actionText;
@@ -660,10 +667,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       renderDecision(decision);
 
       var awaiting = !!(decision && decision.status === 'awaiting_confirmation');
-      confirm.hidden = !awaiting;
       el('cancel').hidden = !awaiting;
       el('decisionNextStep').hidden = !awaiting;
       confirm.setAttribute('data-id', decision ? decision.requestId : '');
+      confirm.setAttribute('data-enabled', awaiting ? 'true' : 'false');
       if (awaiting && longPressDecisionId && longPressDecisionId !== decision.requestId && !longPressStartedAt) {
         longPressTriggered = false;
         longPressDecisionId = '';
@@ -685,6 +692,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
           setConfirmStatus('已取消本次建议，未向 ESP32 发送任何开阀命令。', 'meta');
         } else if (decision && decision.status === 'rejected_on_confirmation') {
           setConfirmStatus('确认时的本地安全复核未通过，未发送开阀命令。', 'bad');
+        } else if (decision && decision.status === 'rejected') {
+          setConfirmStatus('云端建议已收到，但本地安全审核未通过，正式执行按钮暂不可用。', 'bad');
+        } else if (decision && decision.finalAction === 'NO_OP') {
+          setConfirmStatus('当前没有可执行的开阀建议，正式执行按钮暂不可用。', 'meta');
         } else {
           setConfirmStatus('', 'meta');
         }
@@ -693,7 +704,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       setStatusBadge('cloudConnectionBadge', '云端：状态不可用', 'bad');
       el('cloudAvailability').hidden = false;
       el('cloudAvailability').textContent = '无法读取云端状态；本地传感器监测、预测和水阀安全保护仍正常运行。';
-      el('confirm').hidden = true;
+      el('confirm').setAttribute('data-enabled', 'false');
+      resetConfirmButton();
       el('cancel').hidden = true;
       el('decisionNextStep').hidden = true;
     });
@@ -723,9 +735,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   }
   function resetConfirmButton() {
     var confirm = el('confirm');
-    confirm.disabled = false;
-    confirm.className = 'hold';
-    confirm.textContent = '长按 1.5 秒确认灌溉';
+    var enabled = confirm.getAttribute('data-enabled') === 'true';
+    confirm.disabled = !enabled;
+    confirm.className = 'hold formal-confirm';
+    confirm.textContent = enabled ? '长按 1.5 秒确认灌溉' : '暂无可执行灌溉建议';
   }
   function clearLongPress(showCancelled) {
     if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
@@ -745,7 +758,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     clearLongPress(false);
     var confirm = el('confirm');
     confirm.disabled = true;
-    confirm.className = 'hold active';
+    confirm.className = 'hold formal-confirm active';
     confirm.textContent = '正在发送开阀确认…';
     setConfirmStatus('长按确认成功，正在进行最后一次本地安全复核。', 'warn');
     request('POST', '/v1/decisions/' + encodeURIComponent(id) + '/confirm', {}, function (result) {
@@ -768,7 +781,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     longPressStartedAt = new Date().getTime();
     longPressPointerId = event.pointerId;
     longPressDecisionId = confirm.getAttribute('data-id') || '';
-    confirm.className = 'hold active';
+    confirm.className = 'hold formal-confirm active';
     function updateProgress() {
       var percent = Math.min(100, Math.round((new Date().getTime() - longPressStartedAt) / 15));
       confirm.textContent = '请持续按住：' + percent + '%';
@@ -780,6 +793,112 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     }
     longPressProgressTimer = setInterval(updateProgress, 50);
     longPressTimer = setTimeout(confirmDecision, 1500);
+  }
+  function setDebugStatus(text, className) {
+    el('debugValveStatus').textContent = text || '';
+    el('debugValveStatus').className = className || 'meta';
+  }
+  function watchDebugCommand(requestId, action, attempt) {
+    if (debugStatusTimer) clearTimeout(debugStatusTimer);
+    request('GET', '/v1/actuator/debug/' + encodeURIComponent(requestId), null, function (result) {
+      var ack = result.ack || {};
+      if (result.status === 'pending') {
+        setDebugStatus('指令仍在队列中：串口接收器尚未取走，请检查接收器进程是否运行。', 'warn');
+      } else if (result.status === 'sent') {
+        setDebugStatus('指令已写入 ESP32 通信链路，正在等待下位机 ACK。', 'warn');
+      } else if (result.status === 'acked') {
+        setDebugStatus(
+          '下位机已接受指令，实际阀门状态：' + (ack.actualState || '未知') + (ack.reason ? '；' + ack.reason : ''),
+          'ok'
+        );
+        refreshCloud();
+        return;
+      } else if (result.status === 'rejected') {
+        setDebugStatus('下位机拒绝指令：' + (ack.reason || '未返回具体原因'), 'bad');
+        refreshCloud();
+        return;
+      } else if (result.status === 'expired') {
+        setDebugStatus('指令在发送前已过期，请检查串口接收器进程。', 'bad');
+        return;
+      }
+      if (attempt < 20) {
+        debugStatusTimer = setTimeout(function () {
+          watchDebugCommand(requestId, action, attempt + 1);
+        }, 750);
+      } else {
+        setDebugStatus(
+          action === 'START_WATERING'
+            ? '15 秒内未收到下位机 ACK，请检查串口/TCP 接收器日志、ESP32 @COMMAND 解析和继电器接线。'
+            : '15 秒内未收到关阀 ACK，请立即检查下位机连接和阀门实际状态。',
+          'bad'
+        );
+      }
+    }, function () {
+      setDebugStatus('无法读取调试指令状态，请检查电脑端服务。', 'bad');
+    });
+  }
+  function resetDebugOpenButton() {
+    var button = el('debugOpenValve');
+    button.disabled = false;
+    button.className = 'hold debug-hold';
+    button.textContent = '长按 1.5 秒调试开阀 5 秒';
+  }
+  function clearDebugHold(showCancelled) {
+    if (debugHoldTimer) { clearTimeout(debugHoldTimer); debugHoldTimer = null; }
+    if (debugHoldProgressTimer) { clearInterval(debugHoldProgressTimer); debugHoldProgressTimer = null; }
+    var wasHolding = debugHoldStartedAt > 0;
+    debugHoldStartedAt = 0;
+    if (!debugHoldTriggered) resetDebugOpenButton();
+    if (showCancelled && wasHolding && !debugHoldTriggered) {
+      setDebugStatus('已取消：需持续按住满 1.5 秒才会提交调试开阀指令。', 'meta');
+    }
+  }
+  function sendDebugOpen() {
+    if (debugHoldTriggered) return;
+    debugHoldTriggered = true;
+    clearDebugHold(false);
+    var button = el('debugOpenValve');
+    button.disabled = true;
+    button.className = 'hold debug-hold active';
+    button.textContent = '正在进行本地安全审核…';
+    setDebugStatus('正在检查传感器、灌溉候选、水阀状态和安全限额。', 'warn');
+    request('POST', '/v1/actuator/debug/open', {}, function (result) {
+      if (result.queued) {
+        setDebugStatus(
+          '调试开阀指令已进入串口队列（' + result.requestId + '），等待下位机 ACK；开阀时长固定为 5 秒。',
+          'warn'
+        );
+        watchDebugCommand(result.requestId, result.action, 0);
+      } else {
+        var reasons = result.safetyReasons || [];
+        setDebugStatus(
+          '未发送调试开阀指令：' + (reasons.length ? reasons.map(translateSafetyReason).join('；') : result.message),
+          'bad'
+        );
+      }
+      debugHoldTriggered = false;
+      resetDebugOpenButton();
+      refreshCloud();
+    }, function (message) {
+      debugHoldTriggered = false;
+      resetDebugOpenButton();
+      setDebugStatus('调试开阀请求失败：' + message, 'bad');
+    });
+  }
+  function beginDebugHold(event) {
+    var button = el('debugOpenValve');
+    if (button.disabled || debugHoldStartedAt || debugHoldTriggered) return;
+    event.preventDefault();
+    debugHoldStartedAt = new Date().getTime();
+    button.className = 'hold debug-hold active';
+    function updateDebugProgress() {
+      var percent = Math.min(100, Math.round((new Date().getTime() - debugHoldStartedAt) / 15));
+      button.textContent = '请持续按住：' + percent + '%';
+    }
+    updateDebugProgress();
+    setDebugStatus('正在确认调试操作，请保持按住 1.5 秒…', 'warn');
+    debugHoldProgressTimer = setInterval(updateDebugProgress, 50);
+    debugHoldTimer = setTimeout(sendDebugOpen, 1500);
   }
   function setQr() {
     var address = window.location.protocol + '//' + window.location.host + '/dashboard';
@@ -829,6 +948,35 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   el('confirm').addEventListener('keyup', function (event) {
     if (event.key === ' ' || event.key === 'Enter') clearLongPress(true);
   });
+  el('debugOpenValve').addEventListener('pointerdown', beginDebugHold);
+  el('debugOpenValve').addEventListener('pointerup', function () { clearDebugHold(true); });
+  el('debugOpenValve').addEventListener('pointercancel', function () { clearDebugHold(true); });
+  el('debugOpenValve').addEventListener('pointerleave', function () { clearDebugHold(true); });
+  el('debugOpenValve').addEventListener('keydown', function (event) {
+    if (event.key === ' ' || event.key === 'Enter') beginDebugHold(event);
+  });
+  el('debugOpenValve').addEventListener('keyup', function (event) {
+    if (event.key === ' ' || event.key === 'Enter') clearDebugHold(true);
+  });
+  el('debugCloseValve').onclick = function () {
+    var button = el('debugCloseValve');
+    button.disabled = true;
+    setDebugStatus('正在提交紧急关阀调试指令…', 'warn');
+    request('POST', '/v1/actuator/debug/close', {}, function (result) {
+      button.disabled = false;
+      setDebugStatus(
+        result.queued
+          ? '关阀指令已进入串口队列（' + result.requestId + '），等待下位机 ACK。'
+          : '关阀指令未能进入串口队列，请检查服务日志。',
+        result.queued ? 'warn' : 'bad'
+      );
+      if (result.queued) watchDebugCommand(result.requestId, result.action, 0);
+      refreshCloud();
+    }, function (message) {
+      button.disabled = false;
+      setDebugStatus('调试关阀请求失败：' + message, 'bad');
+    });
+  };
   el('ask').onclick = function () {
     var question = el('question').value.replace(/^\s+|\s+$/g, '');
     if (!question) return;
@@ -1001,6 +1149,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .decision-details { border-radius: 16px; box-shadow: var(--shadow-inset); color: var(--muted); font-size: 13px; }
     .decision-details summary { padding: 12px 15px; cursor: pointer; color: var(--text); font-weight: 700; }
     .decision-technical { padding: 0 15px 14px; white-space: pre-line; line-height: 1.65; }
+    .actuator-debug { margin-top: 16px; padding: 15px 17px; border-radius: 18px; box-shadow: var(--shadow-inset); }
+    .actuator-debug .decision-actions { margin-top: 4px; }
     button {
       min-height: 44px; margin: 10px 8px 0 0; padding: 10px 15px; border: 0; border-radius: 16px;
       color: var(--accent); background: var(--bg); box-shadow: var(--shadow-small); cursor: pointer; touch-action: manipulation;
@@ -1024,10 +1174,15 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .row button { margin-right: 0; }
     .qr { width: 132px; height: 132px; padding: 9px; background: #fff; border-radius: 16px; box-shadow: var(--shadow-small); }
-    .hold { min-width: 180px; color: #fff; background: var(--danger); box-shadow: 7px 7px 14px rgba(167, 45, 76, .28), -5px -5px 12px rgba(255, 255, 255, .56); }
-    .hold:hover:not(:disabled) { color: #fff; background: #be385b; }
-    .hold.active { background: #86233e; transform: scale(.985); box-shadow: var(--shadow-inset); }
-    .hold:disabled { cursor: wait; }
+    .hold { min-width: 180px; color: #fff; }
+    .formal-confirm { background: var(--success); box-shadow: 7px 7px 14px rgba(22, 123, 114, .28), -5px -5px 12px rgba(255, 255, 255, .56); }
+    .formal-confirm:hover:not(:disabled) { color: #fff; background: #126b64; }
+    .formal-confirm.active { background: #0d5752; transform: scale(.985); box-shadow: var(--shadow-inset); }
+    .formal-confirm:disabled { color: #f2f4f6; background: #a7afb9; box-shadow: var(--shadow-inset); cursor: not-allowed; opacity: .82; }
+    .debug-hold { background: var(--danger); box-shadow: 7px 7px 14px rgba(167, 45, 76, .28), -5px -5px 12px rgba(255, 255, 255, .56); }
+    .debug-hold:hover:not(:disabled) { color: #fff; background: #be385b; }
+    .debug-hold.active { background: #86233e; transform: scale(.985); box-shadow: var(--shadow-inset); }
+    .debug-hold:disabled { cursor: wait; }
     #updated { margin-top: 18px; padding: 0 4px; }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
@@ -1128,11 +1283,20 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div id="decisionNextStep" class="decision-next-step" hidden>该建议已通过当前安全审核。如需执行，请持续按住确认按钮 1.5 秒；下发前系统还会再次检查传感器、湿度、冷却时间和每日限额。</div>
       <div class="decision-actions">
         <button id="analyze" class="action-button" type="button" aria-busy="false">请求一次分析</button>
-        <button id="confirm" class="hold" type="button" hidden>长按 1.5 秒确认灌溉</button>
+        <button id="confirm" class="hold formal-confirm" type="button" data-enabled="false" disabled>暂无可执行灌溉建议</button>
         <button id="cancel" class="secondary" type="button" hidden>取消待确认建议</button>
       </div>
       <div id="analyzeStatus" class="meta" aria-live="polite"></div>
       <div id="confirmStatus" class="meta" aria-live="polite"></div>
+      <div class="actuator-debug">
+        <div class="decision-section-title">水阀调试（本地安全模式）</div>
+        <div class="meta">调试开阀固定 5 秒，不受正式灌溉的 15 分钟冷却限制；仍需通过传感器有效性、预测候选、水阀状态和灌溉限额检查。关阀指令可随时下发。</div>
+        <div class="decision-actions">
+          <button id="debugOpenValve" class="hold debug-hold" type="button">长按 1.5 秒调试开阀 5 秒</button>
+          <button id="debugCloseValve" class="secondary" type="button">调试关阀</button>
+        </div>
+        <div id="debugValveStatus" class="meta" aria-live="polite"></div>
+      </div>
     </section>
     <section class="card wide"><h2>自然语言问答（可选语音）</h2><div class="row"><input id="question" placeholder="例如：今天需要调整灌溉计划吗？"><button id="ask">提问</button><button id="voice" class="secondary">开始说话</button><button id="speak" class="secondary">朗读回答</button></div><div id="voiceStatus" class="meta"></div><div id="answer" class="muted" style="margin-top:12px;white-space:pre-line"></div></section>
     <section class="card wide"><h2>手机入口</h2><div class="row"><img id="qr" class="qr" alt="当前页面二维码"><div><div id="address" class="meta"></div><button id="copy" class="secondary">复制访问地址</button><div class="meta">二维码由浏览器按当前地址生成；若手机不能访问，请让电脑与手机在同一 Wi‑Fi，并以 --host 0.0.0.0 启动服务。</div></div></div></section>
@@ -1321,6 +1485,24 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     def actuator_state():
         decision = store.latest_decision()
         return {"actuator": irrigation.last_device_state, "lastDecision": decision.model_dump(mode="json") if decision else None}
+
+    @app.post("/v1/actuator/debug/open")
+    def debug_open_valve():
+        return irrigation.queue_debug_actuation(
+            IrrigationAction.START_WATERING,
+            duration_seconds=5,
+        )
+
+    @app.post("/v1/actuator/debug/close")
+    def debug_close_valve():
+        return irrigation.queue_debug_actuation(IrrigationAction.STOP_WATERING)
+
+    @app.get("/v1/actuator/debug/{request_id}")
+    def debug_command_status(request_id: str):
+        status = store.command_status(request_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="debug command not found")
+        return status
 
     return app
 

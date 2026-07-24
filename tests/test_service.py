@@ -104,6 +104,16 @@ def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):
     assert analysis["finalAction"] == "NO_OP"
     assert analysis["status"] == "disabled"
 
+    debug_open = client.post("/v1/actuator/debug/open").json()
+    assert not debug_open["queued"]
+    assert debug_open["status"] == "rejected"
+    debug_close = client.post("/v1/actuator/debug/close").json()
+    assert debug_close["queued"]
+    assert debug_close["action"] == "STOP_WATERING"
+    debug_status = client.get(f"/v1/actuator/debug/{debug_close['requestId']}")
+    assert debug_status.status_code == 200
+    assert debug_status.json()["status"] == "pending"
+
     chat = client.post("/v1/cloud/chat", json={"question": "今天要浇水吗？"}).json()
     assert not chat["llmUsed"]
     assert "本地离线模式" in chat["answer"]

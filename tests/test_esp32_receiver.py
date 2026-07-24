@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from dual_forecast.esp32_receiver import (
     _handle_ack_line,
     _handle_config_ack_line,
@@ -10,6 +13,19 @@ from dual_forecast.esp32_receiver import (
     snapshot_is_complete_for_prediction,
 )
 from dual_forecast.storage import Store
+
+
+def test_firmware_tcp_control_buffer_accepts_full_command_envelope():
+    firmware = (
+        Path(__file__).resolve().parents[1]
+        / "firmware"
+        / "esp32_s3_all_sensors"
+        / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+
+    assert "HOST_CONTROL_LINE_CAPACITY = 1024" in firmware
+    assert firmware.count("line[HOST_CONTROL_LINE_CAPACITY]") >= 2
+    assert "line[192]" not in firmware
 
 
 def test_esp32_message_maps_to_service_snapshot():
@@ -188,6 +204,10 @@ class FakeSerial:
         self.data += data
 
 
+class FakeTcpWriter(FakeSerial):
+    max_control_line_bytes = 191
+
+
 class FailingSerial:
     def write(self, data):
         raise OSError("USB disconnected")
@@ -210,6 +230,37 @@ def test_pending_command_uses_command_prefix(tmp_path):
     serial = FakeSerial()
     _send_pending_commands(serial, store)
     assert serial.data.startswith(b"@COMMAND {")
+
+
+def test_wifi_command_is_compacted_for_deployed_192_byte_firmware_buffer(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    store = Store(tmp_path / "db.sqlite")
+    request_id = "analysis-13a1d447-2192-4947-b933-b8671a7176ec"
+    assert store.enqueue_command({
+        "schemaVersion": "1.0",
+        "requestId": request_id,
+        "action": "START_WATERING",
+        "durationSeconds": 60,
+        "reasonCode": "MANUAL_ACTUATOR_DEBUG",
+        "reason": "long audit reason retained only in SQLite",
+        "confidence": 1,
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "ttlSeconds": 30,
+    })
+    writer = FakeTcpWriter()
+
+    _send_pending_commands(writer, store)
+
+    wire = writer.data.decode().rstrip("\n")
+    assert len(wire.encode()) <= writer.max_control_line_bytes
+    payload = json.loads(wire.removeprefix("@COMMAND "))
+    assert payload["requestId"] == request_id
+    assert payload["action"] == "START_WATERING"
+    assert payload["durationSeconds"] == 60
+    assert payload["ttlSeconds"] == 30
+    assert "reason" not in payload
+    assert "confidence" not in payload
 
 
 def test_failed_serial_write_keeps_command_pending(tmp_path):

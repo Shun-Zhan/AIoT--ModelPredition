@@ -52,6 +52,103 @@ def test_start_waits_for_human_confirmation_then_is_queued(tmp_path):
     assert queued[0]["durationSeconds"] == 30
 
 
+def test_manual_debug_open_is_short_and_uses_the_same_local_safety_gate(tmp_path):
+    svc, store = service(tmp_path)
+
+    queued = svc.queue_debug_actuation(IrrigationAction.START_WATERING, duration_seconds=30)
+
+    assert queued["queued"]
+    assert queued["durationSeconds"] == 5
+    assert store.command_status(queued["requestId"])["status"] == "pending"
+    command = store.claim_pending_commands()[0]
+    assert store.command_status(queued["requestId"])["status"] == "sent"
+    assert command["action"] == "START_WATERING"
+    assert command["durationSeconds"] == 5
+    assert command["reasonCode"] == "MANUAL_ACTUATOR_DEBUG"
+    store.record_ack({
+        "requestId": queued["requestId"],
+        "accepted": True,
+        "actualState": "OPEN",
+        "reason": "started",
+    })
+    assert store.command_status(queued["requestId"])["status"] == "acked"
+
+    svc2, store2 = service(tmp_path / "invalid")
+    store2.save_live_snapshot(snapshot(moisture=0), datetime.now(timezone.utc))
+    rejected = svc2.queue_debug_actuation(IrrigationAction.START_WATERING)
+    assert not rejected["queued"]
+    assert rejected["status"] == "rejected"
+    assert any("incomplete" in reason for reason in rejected["safetyReasons"])
+    assert store2.claim_pending_commands() == []
+
+
+def test_manual_debug_close_can_always_be_queued(tmp_path):
+    svc, store = service(tmp_path)
+    store.save_live_snapshot(snapshot(soil_ok=False), datetime.now(timezone.utc))
+
+    result = svc.queue_debug_actuation(IrrigationAction.STOP_WATERING)
+
+    assert result["queued"]
+    command = store.claim_pending_commands()[0]
+    assert command["action"] == "STOP_WATERING"
+    assert command["durationSeconds"] is None
+
+
+def test_manual_debug_open_is_not_locked_by_formal_watering_cooldown(tmp_path):
+    svc, store = service(tmp_path)
+    store.record_actuator_event(
+        "recent-watering",
+        IrrigationAction.START_WATERING,
+        10,
+        {"accepted": True, "actualState": "OPEN"},
+    )
+
+    formal = svc.evaluate(
+        decision("request-during-cooldown"),
+        svc.current_context("request-during-cooldown"),
+        trigger="test",
+    )
+    debug = svc.queue_debug_actuation(IrrigationAction.START_WATERING)
+
+    assert formal.status == "rejected"
+    assert any("cooldown" in reason for reason in formal.safetyReasons)
+    assert debug["queued"]
+    assert debug["durationSeconds"] == 5
+    assert store.command_status(debug["requestId"])["status"] == "pending"
+
+
+def test_debug_open_does_not_start_formal_watering_cooldown(tmp_path):
+    svc, store = service(tmp_path)
+    debug = svc.queue_debug_actuation(IrrigationAction.START_WATERING)
+    store.claim_pending_commands()
+    store.record_ack({
+        "requestId": debug["requestId"],
+        "accepted": True,
+        "actualState": "OPEN",
+        "reason": "started",
+    })
+    store.record_ack({
+        "requestId": debug["requestId"],
+        "accepted": True,
+        "actualState": "CLOSED",
+        "reason": "duration_elapsed",
+    })
+
+    formal = svc.evaluate(
+        decision("request-after-debug"),
+        svc.current_context("request-after-debug"),
+        trigger="test",
+    )
+
+    assert store.watering_totals(datetime.now(timezone.utc) - timedelta(minutes=1)) == 5
+    assert store.watering_totals(
+        datetime.now(timezone.utc) - timedelta(minutes=1),
+        include_debug=False,
+    ) == 0
+    assert formal.status == "awaiting_confirmation"
+    assert not any("cooldown" in reason for reason in formal.safetyReasons)
+
+
 def test_cancelled_suggestion_never_queues_a_device_command(tmp_path):
     svc, store = service(tmp_path)
     result = svc.evaluate(decision(), svc.current_context("request-123"), trigger="test")

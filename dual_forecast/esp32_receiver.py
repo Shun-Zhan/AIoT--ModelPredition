@@ -166,6 +166,11 @@ class Esp32Endpoint:
 class _SocketWriter:
     """Give a TCP socket the small write() interface used by command helpers."""
 
+    # Deployed firmware before the 1024-byte buffer fix accepts at most 191
+    # bytes before the newline. Keep Wi-Fi control backward compatible until
+    # every field device has been reflashed.
+    max_control_line_bytes = 191
+
     def __init__(self, connection: socket.socket) -> None:
         self._connection = connection
 
@@ -333,6 +338,27 @@ def _handle_config_ack_line(line: str, store: Store) -> bool:
 def _send_pending_commands(connection: Any, store: Store) -> None:
     for command in store.pending_commands(limit=1):
         line = "@COMMAND " + json.dumps(command, ensure_ascii=False, separators=(",", ":")) + "\n"
+        max_bytes = getattr(connection, "max_control_line_bytes", None)
+        if max_bytes is not None and len(line.rstrip("\n").encode("utf-8")) > max_bytes:
+            # pending_commands() has already enforced the real expiresAt. The
+            # current ESP32 firmware only checks that expiresAt exists and
+            # applies ttlSeconds itself, so this minimal envelope preserves the
+            # actuator safety contract while fitting older TCP buffers.
+            compact = {
+                "schemaVersion": command["schemaVersion"],
+                "requestId": command["requestId"],
+                "action": command["action"],
+            }
+            if command["action"] == "START_WATERING":
+                compact["durationSeconds"] = command["durationSeconds"]
+            compact.update({
+                "reasonCode": "X",
+                "expiresAt": "x",
+                "ttlSeconds": command["ttlSeconds"],
+            })
+            line = "@COMMAND " + json.dumps(compact, separators=(",", ":")) + "\n"
+        if max_bytes is not None and len(line.rstrip("\n").encode("utf-8")) > max_bytes:
+            raise OSError("ESP32 TCP command exceeds the deployed firmware control-line limit")
         connection.write(line.encode("utf-8"))
         store.mark_command_sent(str(command["requestId"]))
         print(f"Sent ESP32 command: requestId={command.get('requestId')} action={command.get('action')}")

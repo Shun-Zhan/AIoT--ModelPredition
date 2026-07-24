@@ -337,6 +337,24 @@ class Store:
                 (datetime.now(timezone.utc).isoformat(), request_id),
             )
 
+    def command_status(self, request_id: str) -> dict | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT request_id,command_json,status,queued_at,sent_at,ack_json "
+                "FROM command_queue WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "requestId": row["request_id"],
+            "command": json.loads(row["command_json"]),
+            "status": row["status"],
+            "queuedAt": row["queued_at"],
+            "sentAt": row["sent_at"],
+            "ack": json.loads(row["ack_json"]) if row["ack_json"] else None,
+        }
+
     def claim_pending_commands(self, limit: int = 1) -> list[dict]:
         """Compatibility helper used by tests and non-I/O queue consumers."""
         commands = self.pending_commands(limit)
@@ -413,13 +431,22 @@ class Store:
             "zone": "zone-1",
         }
 
-    def watering_totals(self, since: datetime) -> int:
+    def watering_totals(self, since: datetime, *, include_debug: bool = True) -> int:
         with self.connection() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(duration_seconds),0) total FROM actuator_events WHERE action=? AND occurred_at>=?",
+            rows = conn.execute(
+                "SELECT e.duration_seconds,c.command_json "
+                "FROM actuator_events e LEFT JOIN command_queue c ON c.request_id=e.request_id "
+                "WHERE e.action=? AND e.occurred_at>=?",
                 (IrrigationAction.START_WATERING.value, since.isoformat()),
-            ).fetchone()
-        return int(row["total"] or 0)
+            ).fetchall()
+        total = 0
+        for row in rows:
+            if not include_debug and row["command_json"]:
+                command = json.loads(row["command_json"])
+                if command.get("reasonCode") == "MANUAL_ACTUATOR_DEBUG":
+                    continue
+            total += int(row["duration_seconds"] or 0)
+        return total
 
     def latest_actuator_state(self, mode: str = "serial") -> dict:
         with self.connection() as conn:
