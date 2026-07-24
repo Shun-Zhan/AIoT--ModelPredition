@@ -104,7 +104,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             **assessment.to_dict(),
             "configQueued": False,
             "thresholds": {
+                "irrigationSevereDryPercent": settings.irrigation_severe_dry_percent,
                 "irrigationSoilMoisturePercent": settings.irrigation_trigger_percent,
+                "irrigationPredictiveMaxPercent": settings.irrigation_predictive_max_percent,
+                "irrigationHighEt0OneHourMm": settings.irrigation_high_et0_1h_mm,
                 "irrigationTargetSoilMoisturePercent": settings.irrigation_target_percent,
                 "quantity": "土壤传感器含水率读数",
                 "unit": "%",
@@ -391,8 +394,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       el('risk').className = 'value ' + (sensorIssues.length ? 'bad' : (risk === 'NORMAL' ? 'ok' : (risk === 'ATTENTION' ? 'warn' : 'bad')));
       el('riskReasons').textContent = (edge.reasons || []).join('；');
       var thresholds = edge.thresholds || {};
-      el('riskThreshold').textContent = '灌溉触发条件：' + (thresholds.quantity || '土壤含水率') + ' < '
-        + number(thresholds.irrigationSoilMoisturePercent, 1) + (thresholds.unit || '%')
+      el('riskThreshold').textContent = '预测灌溉分段：严重干燥 < '
+        + number(thresholds.irrigationSevereDryPercent, 1) + (thresholds.unit || '%')
+        + '；预测触发线 ' + number(thresholds.irrigationSoilMoisturePercent, 1) + (thresholds.unit || '%')
+        + '；提前决策上限 ' + number(thresholds.irrigationPredictiveMaxPercent, 1) + (thresholds.unit || '%')
+        + '；高 ET₀ ≥ ' + number(thresholds.irrigationHighEt0OneHourMm, 2) + ' mm/小时'
         + '；目标值：' + number(thresholds.irrigationTargetSoilMoisturePercent, 1) + (thresholds.unit || '%')
         + '。' + (thresholds.basis || '');
       var samplingLabels = {

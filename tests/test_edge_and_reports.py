@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
+import pytest
 
 from dual_forecast.config import SETTINGS
 from dual_forecast.edge import SamplingMode, assess_environment
@@ -24,21 +25,90 @@ def live(*, soil=40.0, temp=32.0, wind=3.0, solar=700.0, air_ok=True, received_a
     }
 
 
-def test_high_evapotranspiration_requires_multisensor_combination():
-    assessment = assess_environment(live(), {"status": "ok", "forecast": [{"et0Mm": 0.2, "soilMoisturePercent": 25}]}, SETTINGS)
+def forecast(*, end_soil=40.0, min_soil=None, et0=0.30, status="ok", points=12):
+    now = datetime.now(timezone.utc)
+    values = [end_soil + 0.1 * (points - index - 1) for index in range(points)]
+    if min_soil is not None and values:
+        values[len(values) // 2] = min_soil
+    return {
+        "status": status,
+        "forecast": [
+            {
+                "timestamp": (now + timedelta(minutes=5 * (index + 1))).isoformat(),
+                "et0Mm": et0 / points,
+                "soilMoisturePercent": soil,
+            }
+            for index, soil in enumerate(values)
+        ],
+    }
+
+
+def test_high_evapotranspiration_requires_complete_high_et0_forecast():
+    assessment = assess_environment(live(soil=50), forecast(end_soil=50, et0=0.30), SETTINGS)
     assert assessment.risk_level == "HIGH_EVAPOTRANSPIRATION"
     assert assessment.recommended_sampling_mode == SamplingMode.IRRIGATION_MONITORING
     event = next(event for event in assessment.events if event.code == "HIGH_EVAPOTRANSPIRATION_RISK")
-    assert event.evidence["forecast"]["available"]
+    assert event.evidence["forecast"]["ready"]
+    assert event.evidence["forecast"]["forecastEt0Mm"] == 0.3
 
 
 def test_dry_soil_and_open_valve_never_recommends_night_mode():
-    assessment = assess_environment(live(soil=20, temp=20, wind=0, solar=0), {"status": "warming_up"}, SETTINGS,
+    assessment = assess_environment(live(soil=19.9, temp=20, wind=0, solar=0), {"status": "warming_up"}, SETTINGS,
                                     actuator={"state": "OPEN"})
     assert assessment.risk_level == "IRRIGATION_CANDIDATE"
-    assert assessment.reasons[0] == "土壤含水率 20.0% < 灌溉触发阈值 30.0%"
+    assert assessment.irrigation_candidate["rule"] == "SEVERE_DRY"
     assert assessment.recommended_sampling_mode == SamplingMode.IRRIGATION_MONITORING
     assert assessment.recommended_read_interval_ms <= 5000
+
+
+@pytest.mark.parametrize(
+    ("moisture", "prediction", "candidate", "rule"),
+    [
+        (19.9, {"status": "warming_up"}, True, "SEVERE_DRY"),
+        (20.0, forecast(end_soil=20.0, et0=0.29), False, None),
+        (29.9, forecast(end_soil=29.8, et0=0.0), True, "DECLINING_OR_HIGH_ET0"),
+        (30.0, forecast(end_soil=30.1, min_soil=29.9, et0=0.30), True, "PREDICTED_CROSSING_AND_HIGH_ET0"),
+        (45.0, forecast(end_soil=45.1, min_soil=29.9, et0=0.30), True, "PREDICTED_CROSSING_AND_HIGH_ET0"),
+        (45.1, forecast(end_soil=29.0, min_soil=29.0, et0=0.50), False, None),
+    ],
+)
+def test_predictive_irrigation_candidate_boundaries(moisture, prediction, candidate, rule):
+    assessment = assess_environment(live(soil=moisture), prediction, SETTINGS)
+    assert (assessment.risk_level == "IRRIGATION_CANDIDATE") is candidate
+    assert assessment.irrigation_candidate["eligible"] is candidate
+    assert assessment.irrigation_candidate["rule"] == rule
+
+
+def test_mid_band_accepts_decline_or_high_et0_but_requires_ready_hour():
+    irregular = forecast(end_soil=24.0, et0=0.5)
+    irregular["forecast"][-1]["timestamp"] = (
+        datetime.now(timezone.utc) + timedelta(minutes=65)
+    ).isoformat()
+    declining = assess_environment(live(soil=25), forecast(end_soil=24.9, et0=0), SETTINGS)
+    high_et0 = assess_environment(live(soil=25), forecast(end_soil=25.1, et0=0.30), SETTINGS)
+    neither = assess_environment(live(soil=25), forecast(end_soil=25.1, et0=0.29), SETTINGS)
+    incomplete = assess_environment(
+        live(soil=25), forecast(end_soil=24.0, et0=0.5, points=11), SETTINGS,
+    )
+    wrong_cadence = assess_environment(live(soil=25), irregular, SETTINGS)
+
+    assert declining.risk_level == "IRRIGATION_CANDIDATE"
+    assert high_et0.risk_level == "IRRIGATION_CANDIDATE"
+    assert neither.risk_level != "IRRIGATION_CANDIDATE"
+    assert incomplete.risk_level != "IRRIGATION_CANDIDATE"
+    assert wrong_cadence.risk_level != "IRRIGATION_CANDIDATE"
+    assert not incomplete.irrigation_candidate["forecastReady"]
+
+
+def test_upper_band_requires_both_threshold_crossing_and_high_et0():
+    both = assess_environment(live(soil=40), forecast(end_soil=40, min_soil=29.9, et0=0.30), SETTINGS)
+    crossing_only = assess_environment(live(soil=40), forecast(end_soil=40, min_soil=29.9, et0=0.29), SETTINGS)
+    et0_only = assess_environment(live(soil=40), forecast(end_soil=40, min_soil=30.0, et0=0.30), SETTINGS)
+
+    assert both.risk_level == "IRRIGATION_CANDIDATE"
+    assert crossing_only.risk_level != "IRRIGATION_CANDIDATE"
+    assert et0_only.risk_level != "IRRIGATION_CANDIDATE"
+    assert both.irrigation_candidate["forecast"]["forecastMinSoilPercent"] == 29.9
 
 
 def test_stale_or_failed_sensor_causes_attention_and_event():

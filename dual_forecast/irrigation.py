@@ -62,6 +62,34 @@ class IrrigationService:
         return [{"code": event.code, "severity": event.severity, "message": event.message,
                  "details": event.evidence} for event in assessment.events]
 
+    def _start_watering_safety_reasons(
+        self, context: DecisionContext, duration_seconds: int | None, now: datetime,
+    ) -> list[str]:
+        """Apply the same local candidate and actuator gates at every review."""
+        reasons: list[str] = []
+        if not context.current.get("allSensorsValid"):
+            reasons.append("required sensor data is incomplete or stale")
+        edge_risk = context.constraints.get("edgeRisk", {})
+        if edge_risk.get("riskLevel") != "IRRIGATION_CANDIDATE":
+            reasons.append("local predictive irrigation candidate criteria are not met")
+        moisture = (
+            context.current.get("soil", {}).get("moisturePercent")
+            if isinstance(context.current.get("soil"), dict) else None
+        )
+        if moisture is None or float(moisture) >= self.settings.irrigation_target_percent:
+            reasons.append("soil moisture is already at or above target")
+        if duration_seconds is None or duration_seconds > self.settings.max_watering_seconds:
+            reasons.append("duration exceeds local limit")
+        if self.last_device_state.get("state") == "OPEN":
+            reasons.append("valve is already open")
+        since = now - timedelta(minutes=self.settings.watering_cooldown_minutes)
+        if self.store.watering_totals(since) > 0:
+            reasons.append("watering cooldown is active")
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if self.store.watering_totals(day_start) + int(duration_seconds or 0) > self.settings.max_daily_watering_seconds:
+            reasons.append("daily watering limit would be exceeded")
+        return reasons
+
     def record_data_interruption_if_needed(self) -> None:
         current = self.store.latest_live_snapshot()
         if not current:
@@ -137,7 +165,10 @@ class IrrigationService:
             actuator=self.last_device_state,
             constraints={
                 "maxWateringSeconds": self.settings.max_watering_seconds,
+                "severeDryPercent": self.settings.irrigation_severe_dry_percent,
                 "triggerPercent": self.settings.irrigation_trigger_percent,
+                "predictiveMaxPercent": self.settings.irrigation_predictive_max_percent,
+                "highEt0OneHourMm": self.settings.irrigation_high_et0_1h_mm,
                 "targetPercent": self.settings.irrigation_target_percent,
                 "cloudNeverDirectlyControlsGPIO": True,
                 "activeAnomalies": anomalies,
@@ -166,21 +197,7 @@ class IrrigationService:
         if decision.requestId != context.requestId:
             reasons.append("model requestId does not match local requestId")
         if decision.action == IrrigationAction.START_WATERING:
-            moisture = context.current.get("soil", {}).get("moisturePercent") if isinstance(context.current.get("soil"), dict) else None
-            if not context.current.get("allSensorsValid"):
-                reasons.append("required sensor data is incomplete")
-            if moisture is None or float(moisture) >= self.settings.irrigation_target_percent:
-                reasons.append("soil moisture is already at or above target")
-            if decision.durationSeconds is None or decision.durationSeconds > self.settings.max_watering_seconds:
-                reasons.append("duration exceeds local limit")
-            if self.last_device_state.get("state") == "OPEN":
-                reasons.append("valve is already open")
-            since = now - timedelta(minutes=self.settings.watering_cooldown_minutes)
-            if self.store.watering_totals(since) > 0:
-                reasons.append("watering cooldown is active")
-            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            if self.store.watering_totals(day_start) + int(decision.durationSeconds or 0) > self.settings.max_daily_watering_seconds:
-                reasons.append("daily watering limit would be exceeded")
+            reasons.extend(self._start_watering_safety_reasons(context, decision.durationSeconds, now))
         if decision.confidence < 0.5 and decision.action == IrrigationAction.START_WATERING:
             reasons.append("model confidence is below local threshold")
         accepted = not reasons
@@ -277,21 +294,11 @@ class IrrigationService:
         if result.expiresAt is None or result.expiresAt <= datetime.now(timezone.utc):
             reject_reasons.append("suggestion expired before human confirmation")
         if result.finalAction == IrrigationAction.START_WATERING:
-            if not current.current.get("allSensorsValid"):
-                reject_reasons.append("current sensor data is incomplete or stale")
-            soil = current.current.get("soil") or {}
-            moisture = soil.get("moisturePercent") if isinstance(soil, dict) else None
-            if moisture is None or float(moisture) >= self.settings.irrigation_target_percent:
-                reject_reasons.append("current soil moisture is at or above target")
-            if self.last_device_state.get("state") == "OPEN":
-                reject_reasons.append("valve is already open")
-            since = datetime.now(timezone.utc) - timedelta(minutes=self.settings.watering_cooldown_minutes)
-            if self.store.watering_totals(since) > 0:
-                reject_reasons.append("watering cooldown is active")
-            day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-            if (self.store.watering_totals(day_start) + int(result.durationSeconds or 0)
-                    > self.settings.max_daily_watering_seconds):
-                reject_reasons.append("daily watering limit would be exceeded")
+            reject_reasons.extend(
+                self._start_watering_safety_reasons(
+                    current, result.durationSeconds, datetime.now(timezone.utc),
+                )
+            )
         if reject_reasons:
             rejected = result.model_copy(update={
                 "status": "rejected_on_confirmation", "finalAction": IrrigationAction.NO_OP,

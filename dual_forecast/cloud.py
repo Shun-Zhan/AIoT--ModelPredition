@@ -27,6 +27,7 @@ weather.status 为 not_configured 时，不得声称知道天气、降雨、地�
 灌溉动作只能返回一个严格 JSON 对象，字段必须是 schemaVersion、requestId、action、
 durationSeconds、reasonCode、reason、confidence、expiresAt；action 只能为
 START_WATERING、STOP_WATERING、NO_OP。不要使用 Markdown 代码围栏，不要添加额外字段。
+只有 constraints.edgeRisk.riskLevel 为 IRRIGATION_CANDIDATE 时才可建议 START_WATERING；
 数据不完整、传感器异常或没有明确必要时必须返回 NO_OP。云端不能直接控制硬件；动作仅可由本地安全层在人工确认或部署者显式启用自动模式后下发。"""
 
 

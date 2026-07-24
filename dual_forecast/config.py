@@ -69,7 +69,10 @@ class Settings:
     max_watering_seconds: int = 60
     watering_cooldown_minutes: int = 15
     max_daily_watering_seconds: int = 600
+    irrigation_severe_dry_percent: float = float(os.getenv("AIOT_IRRIGATION_SEVERE_DRY_PERCENT", "20"))
     irrigation_trigger_percent: float = float(os.getenv("AIOT_IRRIGATION_TRIGGER_PERCENT", "30"))
+    irrigation_predictive_max_percent: float = float(os.getenv("AIOT_IRRIGATION_PREDICTIVE_MAX_PERCENT", "45"))
+    irrigation_high_et0_1h_mm: float = float(os.getenv("AIOT_IRRIGATION_HIGH_ET0_1H_MM", "0.30"))
     irrigation_target_percent: float = float(os.getenv("AIOT_IRRIGATION_TARGET_PERCENT", "75"))
     llm_min_interval_minutes: int = int(os.getenv("AIOT_LLM_INTERVAL_MINUTES", "15"))
     # Automatic irrigation is deliberately opt-in.  The cloud can recommend a
@@ -89,10 +92,6 @@ class Settings:
     event_cooldown_seconds: int = int(os.getenv("AIOT_EVENT_COOLDOWN_SECONDS", "300"))
     data_stale_seconds: int = int(os.getenv("AIOT_DATA_STALE_SECONDS", "20"))
     actuator_ack_timeout_seconds: int = int(os.getenv("AIOT_ACTUATOR_ACK_TIMEOUT_SECONDS", "15"))
-    high_et_temp_c: float = float(os.getenv("AIOT_HIGH_ET_TEMP_C", "30"))
-    high_et_solar_wm2: float = float(os.getenv("AIOT_HIGH_ET_SOLAR_WM2", "500"))
-    high_et_wind_ms: float = float(os.getenv("AIOT_HIGH_ET_WIND_MS", "2"))
-    high_et_soil_percent: float = float(os.getenv("AIOT_HIGH_ET_SOIL_PERCENT", "45"))
     night_solar_wm2: float = float(os.getenv("AIOT_NIGHT_SOLAR_WM2", "20"))
     night_wind_ms: float = float(os.getenv("AIOT_NIGHT_WIND_MS", "1"))
     valve_flow_lpm: float | None = (
@@ -111,6 +110,18 @@ class Settings:
     def __post_init__(self) -> None:
         if self.fast_test_samples < 2:
             raise ValueError("fast_test_samples must be at least 2")
+        if not (
+            0 <= self.irrigation_severe_dry_percent
+            < self.irrigation_trigger_percent
+            <= self.irrigation_predictive_max_percent
+            <= 100
+        ):
+            raise ValueError(
+                "irrigation thresholds must satisfy 0 <= severe dry < trigger "
+                "<= predictive maximum <= 100"
+            )
+        if self.irrigation_high_et0_1h_mm < 0:
+            raise ValueError("irrigation_high_et0_1h_mm must be non-negative")
 
     @property
     def required_samples(self) -> int:

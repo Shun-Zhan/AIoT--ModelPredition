@@ -10,7 +10,7 @@ from dual_forecast.schemas import ForecastPoint, ForecastResponse, IrrigationAct
 from dual_forecast.storage import Store
 
 
-def snapshot(moisture=20.0, *, soil_ok=True):
+def snapshot(moisture=19.9, *, soil_ok=True):
     return SensorSnapshot.model_validate({
         "uptimeMs": 1000, "windOk": True, "windVoltage": 0.1, "windSpeedMs": 1.0,
         "airOk": True, "air": {"temperatureC": 25, "humidityPercent": 60},
@@ -75,6 +75,51 @@ def test_expired_and_incomplete_sensor_decisions_are_rejected(tmp_path):
     invalid = svc.evaluate(decision("request-invalid"), svc.current_context("request-invalid"), trigger="test")
     assert invalid.status == "rejected"
     assert any("incomplete" in item for item in invalid.safetyReasons)
+
+
+def test_manual_start_cannot_bypass_predictive_candidate(tmp_path):
+    svc, store = service(tmp_path)
+    store.save_live_snapshot(snapshot(moisture=40), datetime.now(timezone.utc))
+
+    result = svc.evaluate(
+        decision("request-not-candidate"),
+        svc.current_context("request-not-candidate"),
+        trigger="test",
+    )
+
+    assert result.status == "rejected"
+    assert result.finalAction == IrrigationAction.NO_OP
+    assert any("predictive irrigation candidate" in reason for reason in result.safetyReasons)
+    assert store.claim_pending_commands() == []
+
+
+def test_confirmation_rechecks_predictive_candidate_and_cooldown(tmp_path):
+    svc, store = service(tmp_path)
+    result = svc.evaluate(
+        decision("request-candidate-change"),
+        svc.current_context("request-candidate-change"),
+        trigger="test",
+    )
+    assert result.status == "awaiting_confirmation"
+
+    store.save_live_snapshot(snapshot(moisture=40), datetime.now(timezone.utc))
+    changed = svc.confirm(result.requestId)
+    assert changed.status == "rejected_on_confirmation"
+    assert any("predictive irrigation candidate" in reason for reason in changed.safetyReasons)
+    assert store.claim_pending_commands() == []
+
+    svc2, store2 = service(tmp_path / "cooldown")
+    store2.record_actuator_event(
+        "recent-watering", IrrigationAction.START_WATERING, 10, {"accepted": True},
+    )
+    cooled = svc2.evaluate(
+        decision("request-cooldown"),
+        svc2.current_context("request-cooldown"),
+        trigger="test",
+    )
+    assert cooled.status == "rejected"
+    assert any("cooldown" in reason for reason in cooled.safetyReasons)
+    assert store2.claim_pending_commands() == []
 
 
 def test_request_id_is_idempotent(tmp_path):
@@ -258,7 +303,14 @@ def ready_forecast() -> ForecastResponse:
     now = datetime.now(timezone.utc)
     return ForecastResponse(
         status="ok", generatedAt=now, requiredSamples=288, availableSamples=288,
-        forecast=[ForecastPoint(timestamp=now + timedelta(minutes=5), et0Mm=0.1, soilMoisturePercent=19.5)],
+        forecast=[
+            ForecastPoint(
+                timestamp=now + timedelta(minutes=5 * (index + 1)),
+                et0Mm=0.025,
+                soilMoisturePercent=19.9 - 0.05 * (index + 1),
+            )
+            for index in range(12)
+        ],
     )
 
 

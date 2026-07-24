@@ -41,10 +41,17 @@ flowchart LR
 | --- | --- | --- |
 | `NORMAL` | 数据新鲜，环境稳定 | 常规监测 |
 | `ATTENTION` | 传感器失败或实时数据陈旧 | 记录故障，禁止演示自动开阀 |
-| `HIGH_EVAPOTRANSPIRATION` | 土壤偏干 + 高温 + 强光 + 较高风速 + 预测证据 | 记录综合证据，建议高频监测和低频云端分析 |
-| `IRRIGATION_CANDIDATE` | 有效土壤湿度低于本地灌溉触发阈值 | 记录干旱候选；仍只产生建议，绝不无人值守开阀 |
+| `HIGH_EVAPOTRANSPIRATION` | 完整的一小时预测中累计 ET₀ 达到高蒸散阈值 | 记录预测证据，建议高频监测和低频云端分析 |
+| `IRRIGATION_CANDIDATE` | 当前湿度与未来一小时土壤湿度、ET₀预测满足分段规则 | 记录命中规则和预测证据；仍须经过本地安全审核 |
 
-灌溉触发阈值对应土壤传感器的含水率读数，单位为 `%`；默认 `30%` 只是尚未完成田间标定时的工程初值，不是适用于所有土壤和作物的常数。正式部署应先校准传感器，再根据当地土壤的田间持水量 θFC、萎蔫点 θWP、作物根深和允许耗水比例 p 确定，可用 `θ触发 = θFC − p(θFC − θWP)` 作为起点，并结合实际胁迫表现复核。通过 `.env` 中的 `AIOT_IRRIGATION_TRIGGER_PERCENT` 和 `AIOT_IRRIGATION_TARGET_PERCENT` 设置现场值。页面的 `76/100` 等数值是便于排序和着色的规则风险等级，没有物理单位，也不是模型概率。
+预测灌溉候选采用以下本地确定性规则：
+
+- 当前湿度 `<20%`：严重干燥，直接形成候选，不要求预测就绪。
+- `20% ≤ 当前湿度 <30%`：完整一小时预测的末值低于当前值，或未来一小时累计 ET₀ `≥0.30 mm`，才形成候选。
+- `30% ≤ 当前湿度 ≤45%`：预测序列一小时内最低值 `<30%`，且未来一小时累计 ET₀ `≥0.30 mm`，才提前形成候选。
+- 当前湿度 `>45%`：不形成候选。
+
+预测相关分支要求预测状态为 `ok`、数据点完整有效且覆盖一小时。传感器异常、实时数据陈旧、冷却中、阀门已开启、单次时长或每日累计达到安全上限时一律不下发开阀命令。上述 `20%`、`30%`、`45%` 和 `0.30 mm` 都是工程初值，可分别通过 `.env` 中的 `AIOT_IRRIGATION_SEVERE_DRY_PERCENT`、`AIOT_IRRIGATION_TRIGGER_PERCENT`、`AIOT_IRRIGATION_PREDICTIVE_MAX_PERCENT` 和 `AIOT_IRRIGATION_HIGH_ET0_1H_MM` 标定；`AIOT_IRRIGATION_TARGET_PERCENT` 配置灌溉目标值。页面的 `76/100` 等数值只是便于排序和着色的规则风险等级，没有物理单位，也不是模型概率。
 
 SQLite 的 `environment_events` 记录事件代码、严重度、发生时间、证据、建议动作和恢复状态，并使用冷却时间去重。当前事件包括 `SOIL_ABNORMALLY_DRY`、`HIGH_EVAPOTRANSPIRATION_RISK`、`NIGHT_STABLE`、`SENSOR_FAILURE`、`DATA_INTERRUPTION` 和 `VALVE_EXECUTION_FAILURE`。页面的事件时间线和接口可审计这些记录。
 
@@ -236,7 +243,7 @@ AIOT_AUTO_IRRIGATION_MIN_CONFIDENCE=0.80
 AIOT_AUTO_IRRIGATION_REQUIRE_FORECAST_READY=1
 ```
 
-自动模式下，AI 不能直接操作 GPIO。只有 `START_WATERING` 同时满足以下条件，电脑才会把命令加入 ESP32 队列：AI 置信度不低于阈值、ESP32 数据新鲜且全部有效、本地边缘判断为 `IRRIGATION_CANDIDATE`、本地预测状态为 `ok`、土壤湿度低于阈值、冷却时间/单次时长/每日总时长均符合限制，并在入队前再次复核。任一条件失败都会保留建议并写出原因，不开阀。云端不可用、模型输出错误或网络中断时固定为 `NO_OP`。
+自动模式下，AI 不能直接操作 GPIO。只有 `START_WATERING` 同时满足以下条件，电脑才会把命令加入 ESP32 队列：AI 置信度不低于阈值、ESP32 数据新鲜且全部有效、本地分段预测规则判断为 `IRRIGATION_CANDIDATE`、自动模式要求的预测已就绪、冷却时间/单次时长/每日总时长均符合限制，并在入队前再次复核。人工确认同样不能绕过本地候选规则和安全上限。任一条件失败都会保留或拒绝建议并写出原因，不开阀。云端不可用、模型输出错误或网络中断时固定为 `NO_OP`。
 
 `STOP_WATERING` 是保守动作：仍需有效 AI 决策和本地命令 TTL，但不因预测尚在预热而阻止关阀。所有自动下发会显示为 `auto_confirmed_waiting_device`，命令和 ESP32 `@ACK` 仍会保存到 SQLite。首次启用时建议先断开 24 V 水阀，只观察继电器指示灯、命令队列和 ACK。
 
