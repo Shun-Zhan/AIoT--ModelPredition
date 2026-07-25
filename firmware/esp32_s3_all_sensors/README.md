@@ -70,7 +70,7 @@ esp32-sensors.local:3333
 @CONFIG_ACK {"requestId":"config-...","accepted":true,"samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
 ```
 
-`@CONFIG` 只调整传感器读取周期，和控制 GPIO11 的 `@COMMAND` 分开处理。固件白名单为：`DEBUG` 固定 2000 ms、`IRRIGATION_MONITORING` 为 2000–5000 ms、`NORMAL_MONITORING` 为 30000–120000 ms、`NIGHT_ECO` 为 300000–900000 ms。无效模式/范围会被拒绝并 ACK 原有安全值。
+`@CONFIG` 只调整传感器读取周期，和控制 GPIO11 的 `@COMMAND` 分开处理。固件白名单为：`DEBUG` 固定 2000 ms、`IRRIGATION_MONITORING` 为 2000–5000 ms、`NORMAL_MONITORING` 为 30000–120000 ms、`NIGHT_ECO` 为 300000–900000 ms、`OFFLINE_LOGGING` 固定 300000 ms（5 分钟）。无效模式/范围会被拒绝并 ACK 原有安全值。
 
 每 5 分钟，ESP32 还会在本地根据空气温湿度、气压、土壤湿度、净短波辐射和可用风速生成一个轻量趋势估计，并在 telemetry JSON 中增加：
 
@@ -89,7 +89,18 @@ esp32-sensors.local:3333
 
 太阳辐射语义固定为：RS485 地址 `0x01` 的 Solar 1 是反射短波 Rs↑，地址 `0x02` 的 Solar 2 是入射短波 Rs↓。ESP32 使用 `max(Solar2 - Solar1, 0)` 作为净短波；反射探头失败而入射探头正常时，以 `0.77 × Solar2` 作为默认反照率 α=0.23 回退。只有 Solar 2 正常的样本才可用于预测。
 
-动态配置仅存 RAM；上电或复位恢复 `DEBUG` / 2000 ms。水阀已打开时，固件拒绝大于 5000 ms 的周期和 `NIGHT_ECO`（原因 `valve_open_requires_fast_sampling`）。本项目不使用 Deep Sleep，因为必须持续保留继电器最长时长保护、8 秒心跳断开关阀和 USB 命令接收能力；这是一项安全设计，并非已测得的低功耗百分比。
+### 脱离电脑的离线采集与保存
+
+上电或复位后，默认是 `OFFLINE_LOGGING` / 300000 ms：ESP32 自己每 5 分钟采一次，并保存到自身 Flash 的 LittleFS，不需要 USB、电脑、Dashboard 或 Wi-Fi。只要没有手动改为 `DEBUG` 等临时模式，它会一直按此周期运行。
+
+- 只有风速、气压、AHT20、土壤、Solar 1 和 Solar 2 均成功读取的**完整样本**才会写入；0 W/m² 和 0 m/s 是正常数值，不会被当成缺失。
+- 有任意传感器读失败时，该条不会进入离线历史；设备会在 15 秒后自动重试，直到获得下一条完整样本，再恢复 5 分钟节奏。
+- 数据断电不丢失。固件使用两个轮换文件，每个保留 4032 条（14 天 × 每 5 分钟一条），总计约 28 天；空间写满后滚动丢弃最早的 14 天。
+- 串口启动会显示 `[OFFLINE LOG] Ready: ...`，完整保存会显示 `[OFFLINE LOG] Saved complete sample ...`；传感器不完整会显示 `Missing sensor; retrying in 15 seconds`。
+
+当前版先完成“离线采集、完整性筛选和本地持久化”。离线二进制记录尚不会在电脑重新连上后自动补传进 SQLite/预测历史；实时 Wi-Fi/USB 数据链路仍照常工作。
+
+动态配置仅存 RAM；上电或复位恢复 `OFFLINE_LOGGING` / 300000 ms。水阀已打开时，固件拒绝大于 5000 ms 的周期和 `NIGHT_ECO`（原因 `valve_open_requires_fast_sampling`）。本项目不使用 Deep Sleep，因为必须持续保留继电器最长时长保护、8 秒心跳断开关阀和 USB 命令接收能力；这是一项安全设计，并非已测得的低功耗百分比。
 
 USB 模式中，Arduino 串口监视器和 `dual-forecast receive-esp32-serial` 不能同时打开。macOS 端口一般类似 `/dev/cu.wchusbserial10`，Windows 为 `COM3` 等。
 

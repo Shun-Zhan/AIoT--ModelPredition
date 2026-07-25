@@ -30,13 +30,18 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include <LittleFS.h>
 
 // -------------------- Common --------------------
 
 static const uint32_t PC_BAUD = 115200;
-// Safe boot default. A requested setting lives only in RAM, so every reset
-// returns to frequent sampling rather than an unattended low-power mode.
-static const uint32_t DEFAULT_READ_INTERVAL_MS = 2000;
+// Safe unattended boot default.  With no computer connected, the ESP32
+// still takes and persists one environmental record every five minutes.
+// A computer can temporarily request a faster diagnostic interval, but a
+// reset always returns to this storage-friendly cadence.
+static const uint32_t OFFLINE_LOG_INTERVAL_MS = 5UL * 60UL * 1000UL;
+static const uint32_t MISSING_SENSOR_RETRY_INTERVAL_MS = 15UL * 1000UL;
+static const uint32_t DEFAULT_READ_INTERVAL_MS = OFFLINE_LOG_INTERVAL_MS;
 static const uint32_t IRRIGATION_MAX_READ_INTERVAL_MS = 5000;
 // The lightweight edge estimator deliberately runs much less often than
 // sensor acquisition.  It is a safe, explainable fallback while the computer
@@ -73,7 +78,7 @@ bool latestSensorSnapshotValid = false;
 char activeRequestId[101] = {};
 char lastRequestId[101] = {};
 uint32_t readIntervalMs = DEFAULT_READ_INTERVAL_MS;
-char samplingMode[32] = "DEBUG";
+char samplingMode[32] = "OFFLINE_LOGGING";
 
 // -------------------- Wi-Fi provisioning and legacy TCP telemetry --------------------
 
@@ -323,6 +328,157 @@ struct SensorSnapshot {
   uint16_t solarRadiation2Wm2;
 };
 
+// Arduino's sketch preprocessor creates function declarations before this
+// file's later helper types.  Forward-declaring this one keeps those generated
+// declarations valid; its full layout remains next to the edge estimator.
+struct EdgePrediction;
+
+// -------------------- Standalone offline data log --------------------
+//
+// LittleFS lives in the ESP32's own flash, so this is independent of a USB
+// cable, dashboard, Wi-Fi router, or computer.  A record is written only
+// when every *enabled* environmental sensor read successfully.  Two rotating
+// files retain 28 days at one sample / 5 minutes (14 days per file); once both
+// are full the oldest 14 days are discarded.  This bounded log prevents a
+// long unattended deployment from filling flash or repeatedly rewriting one
+// NVS sector.
+static const char *OFFLINE_LOG_CURRENT_PATH = "/aiot-current.bin";
+static const char *OFFLINE_LOG_PREVIOUS_PATH = "/aiot-previous.bin";
+static const uint16_t OFFLINE_LOG_RECORDS_PER_FILE = 4032;  // 14 days × 24 × 12
+static const uint32_t OFFLINE_LOG_MAGIC = 0x41494F54UL;     // "AIOT"
+
+struct __attribute__((packed)) OfflineLogRecord {
+  uint32_t magic;
+  uint32_t bootSessionId;
+  uint32_t uptimeMs;
+  uint8_t windOk;
+  uint8_t airOk;
+  uint8_t soilOk;
+  uint8_t solar1Ok;
+  uint8_t solar2Ok;
+  uint16_t airPressureHpa;
+  float windVoltage;
+  float windSpeedMs;
+  float airTemperatureC;
+  float airHumidityPercent;
+  float soilTemperatureC;
+  float soilMoisturePercent;
+  uint16_t solar1Wm2;
+  uint16_t solar2Wm2;
+  uint32_t checksum;
+};
+
+bool offlineLogReady = false;
+uint32_t offlineLogBootSessionId = 0;
+uint32_t lastOfflineLogSavedMs = 0;
+
+uint32_t offlineLogChecksum(const uint8_t *data, size_t length) {
+  // FNV-1a is sufficient here to detect a torn/corrupt flash record before
+  // it is ever exported.  It is an integrity check, not cryptography.
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < length; ++i) {
+    hash ^= data[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+bool offlineSnapshotIsComplete(const SensorSnapshot &snapshot) {
+  // WIND_1 is deliberately disabled in this hardware revision.  Every
+  // enabled sensor must be present; a zero radiation reading is valid, while
+  // a false ok flag is not.
+  const bool windOk = (!WIND_1_ENABLED || snapshot.wind1Ok) &&
+                      (!WIND_2_ENABLED || snapshot.wind2Ok);
+  return windOk && snapshot.AirPressure > 0 && snapshot.airOk &&
+         snapshot.soilOk && snapshot.solar1Ok && snapshot.solar2Ok;
+}
+
+size_t offlineLogRecordCount(const char *path) {
+  if (!offlineLogReady || !LittleFS.exists(path)) return 0;
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file) return 0;
+  const size_t count = file.size() / sizeof(OfflineLogRecord);
+  file.close();
+  return count;
+}
+
+void initOfflineLog() {
+  // Do not call LittleFS.format() automatically: an unexpected mount failure
+  // must not erase field data.  The serial message tells the operator exactly
+  // why persistence is unavailable.
+  offlineLogReady = LittleFS.begin(false);
+  offlineLogBootSessionId = esp_random();
+  if (!offlineLogReady) {
+    Serial.println("[OFFLINE LOG] LittleFS mount failed; records will not persist.");
+    return;
+  }
+
+  for (const char *path : {OFFLINE_LOG_CURRENT_PATH, OFFLINE_LOG_PREVIOUS_PATH}) {
+    if (!LittleFS.exists(path)) continue;
+    File file = LittleFS.open(path, FILE_READ);
+    const bool validLength = file && file.size() % sizeof(OfflineLogRecord) == 0;
+    if (file) file.close();
+    if (!validLength) {
+      Serial.printf("[OFFLINE LOG] Removing corrupt file %s.\n", path);
+      LittleFS.remove(path);
+    }
+  }
+  Serial.printf("[OFFLINE LOG] Ready: %u current + %u previous valid samples.\n",
+                static_cast<unsigned>(offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH)),
+                static_cast<unsigned>(offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH)));
+}
+
+bool appendOfflineLog(const SensorSnapshot &snapshot) {
+  if (!offlineLogReady) return false;
+  if (offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH) >= OFFLINE_LOG_RECORDS_PER_FILE) {
+    // Keep the newest completed fourteen-day block and discard only the older
+    // one.  Rename is atomic on LittleFS at the directory level.
+    LittleFS.remove(OFFLINE_LOG_PREVIOUS_PATH);
+    if (LittleFS.exists(OFFLINE_LOG_CURRENT_PATH) &&
+        !LittleFS.rename(OFFLINE_LOG_CURRENT_PATH, OFFLINE_LOG_PREVIOUS_PATH)) {
+      Serial.println("[OFFLINE LOG] Rotation failed; keeping current log unchanged.");
+      return false;
+    }
+    Serial.println("[OFFLINE LOG] Rotated: retained previous 14 days, started a new log.");
+  }
+
+  OfflineLogRecord record = {};
+  record.magic = OFFLINE_LOG_MAGIC;
+  record.bootSessionId = offlineLogBootSessionId;
+  record.uptimeMs = snapshot.uptimeMs;
+  record.windOk = snapshot.wind1Ok || snapshot.wind2Ok;
+  record.airOk = snapshot.airOk;
+  record.soilOk = snapshot.soilOk;
+  record.solar1Ok = snapshot.solar1Ok;
+  record.solar2Ok = snapshot.solar2Ok;
+  record.airPressureHpa = snapshot.AirPressure;
+  if (snapshot.wind2Ok) {
+    record.windVoltage = snapshot.wind2Voltage;
+    record.windSpeedMs = snapshot.wind2SpeedMs;
+  } else {
+    record.windVoltage = snapshot.wind1Voltage;
+    record.windSpeedMs = snapshot.wind1SpeedMs;
+  }
+  record.airTemperatureC = snapshot.air.temperatureC;
+  record.airHumidityPercent = snapshot.air.humidityPercent;
+  record.soilTemperatureC = snapshot.soil.temperatureC;
+  record.soilMoisturePercent = snapshot.soil.moisturePercent;
+  record.solar1Wm2 = snapshot.solarRadiation1Wm2;
+  record.solar2Wm2 = snapshot.solarRadiation2Wm2;
+  record.checksum = offlineLogChecksum(
+      reinterpret_cast<const uint8_t *>(&record), offsetof(OfflineLogRecord, checksum));
+
+  File file = LittleFS.open(OFFLINE_LOG_CURRENT_PATH, FILE_APPEND);
+  if (!file) {
+    Serial.println("[OFFLINE LOG] Cannot open current log for append.");
+    return false;
+  }
+  const bool written = file.write(reinterpret_cast<const uint8_t *>(&record), sizeof(record)) == sizeof(record);
+  file.close();
+  if (written) lastOfflineLogSavedMs = snapshot.uptimeMs;
+  return written;
+}
+
 // This is intentionally not the PC's N-BEATS + LSTM model.  It is a small
 // C++ evapotranspiration-inspired trend estimate that fits comfortably on the
 // ESP32-S3 and remains available without Wi-Fi or a Python runtime.
@@ -415,6 +571,7 @@ bool validSamplingConfiguration(const char *mode, int intervalMs) {
   if (strcmp(mode, "IRRIGATION_MONITORING") == 0) return intervalMs >= 2000 && intervalMs <= 5000;
   if (strcmp(mode, "NORMAL_MONITORING") == 0) return intervalMs >= 30000 && intervalMs <= 120000;
   if (strcmp(mode, "NIGHT_ECO") == 0) return intervalMs >= 300000 && intervalMs <= 900000;
+  if (strcmp(mode, "OFFLINE_LOGGING") == 0) return intervalMs == OFFLINE_LOG_INTERVAL_MS;
   return false;
 }
 
@@ -444,7 +601,7 @@ void handleSamplingConfig(const char *json) {
   }
   readIntervalMs = static_cast<uint32_t>(requestedIntervalMs);
   strlcpy(samplingMode, requestedMode, sizeof(samplingMode));
-  sendConfigAck(requestId, true, "applied_ram_only_reset_returns_debug");
+  sendConfigAck(requestId, true, "applied_ram_only_reset_returns_offline_logging");
 }
 
 void closeValveForSafety(const char *reason) {
@@ -2035,19 +2192,19 @@ void setup() {
   } else {
     Serial.printf("BMP280/BME280 initialized at I2C address 0x%02X.\n", bmp280Address);
   }
+  initOfflineLog();
 }
 
 void loop() {
-  static uint32_t lastReadMs = 0;
+  static uint32_t nextReadAtMs = 0;
   serviceUsbControl();
   serviceWifi();
   serviceWifiProvisioning();
 
-  if (millis() - lastReadMs < readIntervalMs) {
+  if (static_cast<int32_t>(millis() - nextReadAtMs) < 0) {
     delay(2);
     return;
   }
-  lastReadMs = millis();
 
   Serial.println("========== Sensor Data ==========");
 
@@ -2144,5 +2301,33 @@ void loop() {
   serviceUsbControl();
   updateDisplay(snapshot);
   sendTelemetry(snapshot, edgePrediction);
+
+  // A failed sample is still reported to USB/Wi-Fi for diagnosis, but never
+  // enters offline history.  Retry after 15 seconds and keep retrying until a
+  // fully populated row exists.  A successful row resumes the configured
+  // cadence, which is five minutes after boot without a computer.
+  const bool completeForOfflineLog = offlineSnapshotIsComplete(snapshot);
+  const bool dueForFlashWrite =
+      lastOfflineLogSavedMs == 0 ||
+      snapshot.uptimeMs - lastOfflineLogSavedMs >= OFFLINE_LOG_INTERVAL_MS;
+  if (!completeForOfflineLog) {
+    Serial.printf("[OFFLINE LOG] Missing sensor; retrying in %lu seconds without saving this row.\n",
+                  static_cast<unsigned long>(MISSING_SENSOR_RETRY_INTERVAL_MS / 1000));
+    nextReadAtMs = millis() + MISSING_SENSOR_RETRY_INTERVAL_MS;
+  } else {
+    if (dueForFlashWrite) {
+      if (appendOfflineLog(snapshot)) {
+        Serial.printf("[OFFLINE LOG] Saved complete sample (%u current, %u previous).\n",
+                      static_cast<unsigned>(offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH)),
+                      static_cast<unsigned>(offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH)));
+      } else {
+        Serial.println("[OFFLINE LOG] Complete sample was not saved; retrying in 15 seconds.");
+        nextReadAtMs = millis() + MISSING_SENSOR_RETRY_INTERVAL_MS;
+        Serial.println("=================================");
+        return;
+      }
+    }
+    nextReadAtMs = millis() + readIntervalMs;
+  }
   Serial.println("=================================");
 }
