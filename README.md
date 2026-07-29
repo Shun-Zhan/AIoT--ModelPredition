@@ -347,7 +347,7 @@ USB 仍是默认采集、预测和安全开阀主链路；ESP32 的 Wi-Fi 配网
 
 ### ESP32 脱离电脑的离线采集
 
-固件上电默认以 `OFFLINE_LOGGING` 模式每 5 分钟采集一次，并把**完整样本**写进 ESP32 的 LittleFS Flash。风速、气压、空气温湿度、土壤、两路太阳辐射任一读取失败时，这一条不入库，设备每 15 秒重新采，直到下一条完整样本出现；成功后再恢复 5 分钟周期。Flash 采用两个 4032 条的轮换文件，可断电保存约 28 天，写满时滚动覆盖最早 14 天。该离线日志不依赖电脑或网络；当前版本尚未实现重新连接电脑后自动把二进制离线记录补传进 SQLite/预测历史。
+固件上电默认以 `OFFLINE_LOGGING` 模式每 5 分钟采集一次，并把**完整样本**写进 ESP32 的 LittleFS Flash。风速、气压、空气温湿度、土壤、两路太阳辐射任一读取失败时，这一条不入库，设备每 15 秒重新采，直到下一条完整样本出现；成功后再恢复 5 分钟周期。Flash 采用两个 4032 条的轮换文件，可断电保存约 28 天，写满时滚动覆盖最早 14 天。该离线日志不依赖电脑或网络。重新连接电脑后，运行 `dual-forecast offline-log --serial-port <端口>`，即可交互式查看状态、校验并导出 CSV，或者二次确认后擦除历史并立即启动新一轮采集；记录不会自动补传进 SQLite/预测历史。
 
 ### ESP32 轻量边缘预测（断网降级）
 
@@ -376,6 +376,7 @@ USB 仍是默认采集、预测和安全开阀主链路；ESP32 的 Wi-Fi 配网
 .venv/bin/python -m pytest -q
 arduino-cli compile \
   --fqbn esp32:esp32:adafruit_feather_esp32s3_nopsram \
+  --board-options PartitionScheme=default_8MB,CDCOnBoot=default,UploadMode=default \
   --build-path /tmp/aiot-esp32-build \
   firmware/esp32_s3_all_sensors
 ```

@@ -59,6 +59,9 @@ static const char *USB_ACK_PREFIX = "@ACK ";
 static const char *USB_CONFIG_PREFIX = "@CONFIG ";
 static const char *USB_CONFIG_ACK_PREFIX = "@CONFIG_ACK ";
 static const char *USB_WIFI_RESET_COMMAND = "@WIFI_RESET";
+static const char *USB_OFFLINE_LOG_STATUS_COMMAND = "@OFFLINE_LOG_STATUS";
+static const char *USB_OFFLINE_LOG_DUMP_COMMAND = "@OFFLINE_LOG_DUMP";
+static const char *USB_OFFLINE_LOG_ERASE_COMMAND = "@OFFLINE_LOG_ERASE CONFIRM";
 
 // -------------------- Water valve relay --------------------
 
@@ -79,6 +82,7 @@ char activeRequestId[101] = {};
 char lastRequestId[101] = {};
 uint32_t readIntervalMs = DEFAULT_READ_INTERVAL_MS;
 char samplingMode[32] = "OFFLINE_LOGGING";
+uint32_t nextSensorReadAtMs = 0;
 
 // -------------------- Wi-Fi provisioning and legacy TCP telemetry --------------------
 
@@ -479,6 +483,135 @@ bool appendOfflineLog(const SensorSnapshot &snapshot) {
   return written;
 }
 
+bool offlineLogRecordIsValid(const OfflineLogRecord &record) {
+  return record.magic == OFFLINE_LOG_MAGIC &&
+         record.checksum == offlineLogChecksum(
+             reinterpret_cast<const uint8_t *>(&record),
+             offsetof(OfflineLogRecord, checksum));
+}
+
+void sendOfflineLogStatus() {
+  const size_t current = offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH);
+  const size_t previous = offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH);
+  Serial.printf(
+      "@OFFLINE_LOG_STATUS {\"ready\":%s,\"currentRecords\":%u,"
+      "\"previousRecords\":%u,\"totalRecords\":%u,"
+      "\"samplingMode\":\"%s\",\"readIntervalMs\":%lu}\n",
+      offlineLogReady ? "true" : "false",
+      static_cast<unsigned>(current), static_cast<unsigned>(previous),
+      static_cast<unsigned>(current + previous), samplingMode,
+      static_cast<unsigned long>(readIntervalMs));
+}
+
+void dumpOfflineLogFile(const char *path, const char *source,
+                        size_t &exported, size_t &corrupt) {
+  if (!offlineLogReady || !LittleFS.exists(path)) return;
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file) return;
+  size_t index = 0;
+  OfflineLogRecord record = {};
+  while (file.available() >= static_cast<int>(sizeof(record))) {
+    if (file.read(reinterpret_cast<uint8_t *>(&record), sizeof(record)) !=
+        sizeof(record)) {
+      break;
+    }
+    const bool integrityOk = offlineLogRecordIsValid(record);
+    if (!integrityOk) ++corrupt;
+    Serial.printf(
+        "@OFFLINE_LOG_RECORD {\"source\":\"%s\",\"index\":%u,"
+        "\"integrityOk\":%s,\"bootSessionId\":%lu,\"uptimeMs\":%lu,"
+        "\"windOk\":%s,\"airOk\":%s,\"soilOk\":%s,\"solar1Ok\":%s,"
+        "\"solar2Ok\":%s,\"airPressureHpa\":%u,\"windVoltage\":%.3f,"
+        "\"windSpeedMs\":%.3f,\"airTemperatureC\":%.2f,"
+        "\"airHumidityPercent\":%.2f,\"soilTemperatureC\":%.2f,"
+        "\"soilMoisturePercent\":%.2f,\"solar1Wm2\":%u,"
+        "\"solar2Wm2\":%u}\n",
+        source, static_cast<unsigned>(index), integrityOk ? "true" : "false",
+        static_cast<unsigned long>(record.bootSessionId),
+        static_cast<unsigned long>(record.uptimeMs),
+        record.windOk ? "true" : "false", record.airOk ? "true" : "false",
+        record.soilOk ? "true" : "false", record.solar1Ok ? "true" : "false",
+        record.solar2Ok ? "true" : "false", record.airPressureHpa,
+        record.windVoltage, record.windSpeedMs, record.airTemperatureC,
+        record.airHumidityPercent, record.soilTemperatureC,
+        record.soilMoisturePercent, record.solar1Wm2, record.solar2Wm2);
+    ++index;
+    ++exported;
+    // Yield to the ESP32 runtime without accepting a valve command in the
+    // middle of a potentially long serial export.
+    delay(1);
+  }
+  file.close();
+}
+
+void dumpOfflineLog() {
+  if (!offlineLogReady) {
+    Serial.println(
+        "@OFFLINE_LOG_DUMP_END {\"accepted\":false,\"reason\":\"littlefs_not_ready\","
+        "\"exportedRecords\":0,\"corruptRecords\":0}");
+    return;
+  }
+  if (valveOpen) {
+    Serial.println(
+        "@OFFLINE_LOG_DUMP_END {\"accepted\":false,\"reason\":\"valve_open\","
+        "\"exportedRecords\":0,\"corruptRecords\":0}");
+    return;
+  }
+  const size_t expected = offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH) +
+                          offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH);
+  Serial.printf("@OFFLINE_LOG_DUMP_BEGIN {\"expectedRecords\":%u}\n",
+                static_cast<unsigned>(expected));
+  size_t exported = 0;
+  size_t corrupt = 0;
+  // Previous is the older rotated block; current is the newest block.
+  dumpOfflineLogFile(OFFLINE_LOG_PREVIOUS_PATH, "previous", exported, corrupt);
+  dumpOfflineLogFile(OFFLINE_LOG_CURRENT_PATH, "current", exported, corrupt);
+  Serial.printf(
+      "@OFFLINE_LOG_DUMP_END {\"accepted\":true,\"exportedRecords\":%u,"
+      "\"corruptRecords\":%u}\n",
+      static_cast<unsigned>(exported), static_cast<unsigned>(corrupt));
+}
+
+void eraseOfflineLogAndRestart() {
+  if (!offlineLogReady) {
+    // Formatting is never automatic at boot. It is allowed only behind this
+    // explicit destructive command, which is also confirmed by the PC tool.
+    if (!LittleFS.format() || !LittleFS.begin(false)) {
+      Serial.println(
+          "@OFFLINE_LOG_ERASE_ACK {\"accepted\":false,"
+          "\"reason\":\"format_failed\"}");
+      return;
+    }
+    offlineLogReady = true;
+  }
+  if (valveOpen) {
+    Serial.println(
+        "@OFFLINE_LOG_ERASE_ACK {\"accepted\":false,"
+        "\"reason\":\"valve_open\"}");
+    return;
+  }
+  const bool currentRemoved =
+      !LittleFS.exists(OFFLINE_LOG_CURRENT_PATH) ||
+      LittleFS.remove(OFFLINE_LOG_CURRENT_PATH);
+  const bool previousRemoved =
+      !LittleFS.exists(OFFLINE_LOG_PREVIOUS_PATH) ||
+      LittleFS.remove(OFFLINE_LOG_PREVIOUS_PATH);
+  if (!currentRemoved || !previousRemoved) {
+    Serial.println(
+        "@OFFLINE_LOG_ERASE_ACK {\"accepted\":false,"
+        "\"reason\":\"remove_failed\"}");
+    return;
+  }
+  lastOfflineLogSavedMs = 0;
+  readIntervalMs = OFFLINE_LOG_INTERVAL_MS;
+  strlcpy(samplingMode, "OFFLINE_LOGGING", sizeof(samplingMode));
+  nextSensorReadAtMs = 0;
+  Serial.println(
+      "@OFFLINE_LOG_ERASE_ACK {\"accepted\":true,\"currentRecords\":0,"
+      "\"previousRecords\":0,\"samplingMode\":\"OFFLINE_LOGGING\","
+      "\"readIntervalMs\":300000,\"reason\":\"erased_or_formatted_and_sampling_scheduled\"}");
+}
+
 // This is intentionally not the PC's N-BEATS + LSTM model.  It is a small
 // C++ evapotranspiration-inspired trend estimate that fits comfortably on the
 // ESP32-S3 and remains available without Wi-Fi or a Python runtime.
@@ -683,6 +816,15 @@ void handleHostControlLine(const char *line, bool allowWifiReset) {
     lastHostHeartbeatMs = millis();
   } else if (allowWifiReset && strcmp(line, USB_WIFI_RESET_COMMAND) == 0) {
     resetWifiProvisioningFromUsb();
+  } else if (allowWifiReset &&
+             strcmp(line, USB_OFFLINE_LOG_STATUS_COMMAND) == 0) {
+    sendOfflineLogStatus();
+  } else if (allowWifiReset &&
+             strcmp(line, USB_OFFLINE_LOG_DUMP_COMMAND) == 0) {
+    dumpOfflineLog();
+  } else if (allowWifiReset &&
+             strcmp(line, USB_OFFLINE_LOG_ERASE_COMMAND) == 0) {
+    eraseOfflineLogAndRestart();
   } else if (strncmp(line, USB_COMMAND_PREFIX, strlen(USB_COMMAND_PREFIX)) == 0) {
     lastHostHeartbeatMs = millis();
     handleValveCommand(line + strlen(USB_COMMAND_PREFIX));
@@ -2196,12 +2338,11 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t nextReadAtMs = 0;
   serviceUsbControl();
   serviceWifi();
   serviceWifiProvisioning();
 
-  if (static_cast<int32_t>(millis() - nextReadAtMs) < 0) {
+  if (static_cast<int32_t>(millis() - nextSensorReadAtMs) < 0) {
     delay(2);
     return;
   }
@@ -2313,7 +2454,7 @@ void loop() {
   if (!completeForOfflineLog) {
     Serial.printf("[OFFLINE LOG] Missing sensor; retrying in %lu seconds without saving this row.\n",
                   static_cast<unsigned long>(MISSING_SENSOR_RETRY_INTERVAL_MS / 1000));
-    nextReadAtMs = millis() + MISSING_SENSOR_RETRY_INTERVAL_MS;
+    nextSensorReadAtMs = millis() + MISSING_SENSOR_RETRY_INTERVAL_MS;
   } else {
     if (dueForFlashWrite) {
       if (appendOfflineLog(snapshot)) {
@@ -2322,12 +2463,12 @@ void loop() {
                       static_cast<unsigned>(offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH)));
       } else {
         Serial.println("[OFFLINE LOG] Complete sample was not saved; retrying in 15 seconds.");
-        nextReadAtMs = millis() + MISSING_SENSOR_RETRY_INTERVAL_MS;
+        nextSensorReadAtMs = millis() + MISSING_SENSOR_RETRY_INTERVAL_MS;
         Serial.println("=================================");
         return;
       }
     }
-    nextReadAtMs = millis() + readIntervalMs;
+    nextSensorReadAtMs = millis() + readIntervalMs;
   }
   Serial.println("=================================");
 }

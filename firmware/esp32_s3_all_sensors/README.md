@@ -1,6 +1,6 @@
 # ESP32-S3 全传感器与安全水阀固件
 
-用 Arduino IDE 打开 `esp32_s3_all_sensors.ino`，板型选择 `Adafruit Feather ESP32-S3 No PSRAM`。固件只依赖 ESP32 Arduino Core 自带组件，无需额外安装 Arduino 库。正常运行通过 Wi‑Fi 把传感器数据、心跳和经本机审核的水阀命令传给电脑；USB 保留烧录、查看日志和故障排查用途。
+用 Arduino IDE 打开 `esp32_s3_all_sensors.ino`，板型选择 `Adafruit Feather ESP32-S3 No PSRAM`，并将 **Tools → Partition Scheme** 设为 **`Default (3MB APP/1.5MB SPIFFS)`**。不要使用默认的 TinyUF2 FATFS 分区，否则 `LittleFS.begin()` 无法挂载，串口状态会显示 `LittleFS：不可用`。当前通过 CH340 `/dev/cu.wchusbserial*` 或 Windows `COM*` 连接的实物还应设置 **USB CDC On Boot → Disabled**、**Upload Mode → UART0 / Hardware CDC**。固件只依赖 ESP32 Arduino Core 自带组件，无需额外安装 Arduino 库。正常运行通过 Wi‑Fi 把传感器数据、心跳和经本机审核的水阀命令传给电脑；USB 保留烧录、查看日志和故障排查用途。
 
 ## 引脚总表
 
@@ -98,7 +98,29 @@ esp32-sensors.local:3333
 - 数据断电不丢失。固件使用两个轮换文件，每个保留 4032 条（14 天 × 每 5 分钟一条），总计约 28 天；空间写满后滚动丢弃最早的 14 天。
 - 串口启动会显示 `[OFFLINE LOG] Ready: ...`，完整保存会显示 `[OFFLINE LOG] Saved complete sample ...`；传感器不完整会显示 `Missing sensor; retrying in 15 seconds`。
 
-当前版先完成“离线采集、完整性筛选和本地持久化”。离线二进制记录尚不会在电脑重新连上后自动补传进 SQLite/预测历史；实时 Wi-Fi/USB 数据链路仍照常工作。
+电脑通过 USB 连接后，可以使用项目自带的交互式管理命令（先关闭 Arduino 串口监视器和 Dashboard 串口接收器）：
+
+```bash
+dual-forecast offline-log
+```
+
+Windows 示例：
+
+```powershell
+dual-forecast offline-log
+```
+
+只有存在多个候选串口时才需要通过 `--serial-port /dev/cu.wchusbserial110` 或 `--serial-port COM3` 明确指定。USB 重插后 macOS 端口名可能变化，省略参数可以避免沿用旧名称。菜单可查看记录数量、读取全部记录并导出 `outputs/esp32-offline-log.csv`，或输入二次确认后擦除两个轮换文件。擦除成功会恢复 `OFFLINE_LOGGING` / 300000 ms，并立即安排一次新采集；传感器不完整时仍不会写入。也可使用 `--action status`、`--action export` 或 `--action erase` 非交互执行，其中擦除仍会要求输入 `ERASE`，除非显式传入 `--yes`。
+
+对应的 USB 串口协议为：
+
+```text
+@OFFLINE_LOG_STATUS
+@OFFLINE_LOG_DUMP
+@OFFLINE_LOG_ERASE CONFIRM
+```
+
+导出时固件逐条校验 magic 和 FNV-1a checksum，并在 CSV 的 `integrityOk` 字段标记结果。记录中的 `bootSessionId` 和 `uptimeMs` 可识别同一次启动内的相对顺序；当前硬件没有 RTC，因此历史记录不包含可信的真实日期时间。离线记录不会自动补传进 SQLite/预测历史，需要由上述命令主动导出。
 
 动态配置仅存 RAM；上电或复位恢复 `OFFLINE_LOGGING` / 300000 ms。水阀已打开时，固件拒绝大于 5000 ms 的周期和 `NIGHT_ECO`（原因 `valve_open_requires_fast_sampling`）。本项目不使用 Deep Sleep，因为必须持续保留继电器最长时长保护、8 秒心跳断开关阀和 USB 命令接收能力；这是一项安全设计，并非已测得的低功耗百分比。
 
@@ -138,7 +160,7 @@ ESP32 → Wi-Fi TCP → 电脑接收器 / 本地预测 / Dashboard →（可选�
 
 ```bash
 arduino-cli compile \
-  --fqbn esp32:esp32:adafruit_feather_esp32s3_nopsram \
+  --fqbn 'esp32:esp32:adafruit_feather_esp32s3_nopsram:PartitionScheme=default_8MB,CDCOnBoot=default,UploadMode=default' \
   --build-path /tmp/aiot-esp32-build \
   firmware/esp32_s3_all_sensors
 ```

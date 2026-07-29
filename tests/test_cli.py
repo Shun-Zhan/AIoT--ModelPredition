@@ -16,6 +16,17 @@ def test_serial_receiver_cli_accepts_a_local_usb_port():
     assert args.telemetry_prefix == "@TELEMETRY "
 
 
+def test_offline_log_cli_defaults_to_interactive_management():
+    args = parser().parse_args(
+        ["offline-log", "--serial-port", "/dev/cu.usbmodem-test"]
+    )
+
+    assert args.serial_port == "/dev/cu.usbmodem-test"
+    assert args.action == "interactive"
+    assert args.output == "outputs/esp32-offline-log.csv"
+    assert args.yes is False
+
+
 def test_cloud_configuration_preserves_unrelated_env_settings(tmp_path):
     env_path = tmp_path / ".env"
     env_path.write_text(

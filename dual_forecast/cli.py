@@ -8,15 +8,9 @@ import tempfile
 from dataclasses import asdict, replace
 from pathlib import Path
 
-import pandas as pd
-import uvicorn
-
 from .config import SETTINGS
-from .cloud import CloudConfigurationFailure, CloudFailure, CloudNetworkFailure, OpenAICompatibleGateway
 from .esp32_receiver import add_receiver_parser
-from .history import add_proxy_soil_moisture, load_hongqiao_zip, split_chronologically
-from .storage import Store
-from .training import prepare_soil_frame, train_lstm, train_nbeats, write_metadata
+from .offline_log import add_offline_log_parser
 
 
 def _settings(args):
@@ -24,6 +18,8 @@ def _settings(args):
 
 
 def preprocess(args):
+    from .history import add_proxy_soil_moisture, load_hongqiao_zip
+
     settings = _settings(args)
     source = load_hongqiao_zip(args.zip, settings)
     warnings = source.attrs.get("quality_warnings", [])
@@ -34,6 +30,9 @@ def preprocess(args):
 
 
 def train_all(args):
+    from .history import add_proxy_soil_moisture, load_hongqiao_zip, split_chronologically
+    from .training import prepare_soil_frame, train_lstm, train_nbeats, write_metadata
+
     settings = _settings(args)
     hourly = add_proxy_soil_moisture(load_hongqiao_zip(args.zip, settings), settings)
     train, validation, test = split_chronologically(hourly)
@@ -45,6 +44,9 @@ def train_all(args):
 
 
 def train_et0_only(args):
+    from .history import add_proxy_soil_moisture, load_hongqiao_zip, split_chronologically
+    from .training import train_nbeats, write_metadata
+
     settings = _settings(args)
     hourly = add_proxy_soil_moisture(load_hongqiao_zip(args.zip, settings), settings)
     metrics = train_nbeats(*split_chronologically(hourly), settings, epochs=args.epochs)
@@ -53,6 +55,9 @@ def train_et0_only(args):
 
 
 def train_soil_proxy(args):
+    from .history import add_proxy_soil_moisture, load_hongqiao_zip, split_chronologically
+    from .training import prepare_soil_frame, train_lstm, write_metadata
+
     settings = _settings(args)
     hourly = add_proxy_soil_moisture(load_hongqiao_zip(args.zip, settings), settings)
     parts = [prepare_soil_frame(part, interpolate_to_5min=True) for part in split_chronologically(hourly)]
@@ -62,6 +67,10 @@ def train_soil_proxy(args):
 
 
 def retrain_observed(args):
+    from .history import split_chronologically
+    from .storage import Store
+    from .training import prepare_soil_frame, train_lstm
+
     settings = _settings(args)
     store = Store(settings.database_path)
     days = store.observed_span_days()
@@ -76,6 +85,10 @@ def retrain_observed(args):
 
 
 def export_latest(args):
+    import pandas as pd
+
+    from .storage import Store
+
     response = Store(args.database).latest_forecast()
     if response is None:
         raise SystemExit("no forecast is available")
@@ -140,6 +153,13 @@ def configure_cloud(args):
 
 
 def check_cloud(args):
+    from .cloud import (
+        CloudConfigurationFailure,
+        CloudFailure,
+        CloudNetworkFailure,
+        OpenAICompatibleGateway,
+    )
+
     gateway = OpenAICompatibleGateway(SETTINGS)
     if not gateway.configured:
         raise SystemExit("Cloud is not configured: VEI_API_KEY is missing or AIOT_LLM_ENABLED is disabled")
@@ -161,6 +181,8 @@ def check_cloud(args):
 
 
 def serve(args):
+    import uvicorn
+
     # Environment-independent factory configuration is intentionally simple:
     # CLI paths are passed through environment variables consumed before import.
     if args.database != str(SETTINGS.database_path) or args.artifacts != str(SETTINGS.artifact_dir):
@@ -220,6 +242,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--fast-test-samples", type=int, default=24, help="samples required by --fast-test")
     p.set_defaults(func=serve)
     add_receiver_parser(sub)
+    add_offline_log_parser(sub)
     return root
 
 

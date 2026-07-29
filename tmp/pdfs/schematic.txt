@@ -1,0 +1,121 @@
+         1                                                                2                                                         3                                                                 4                             5                                                      6
+
+
+
+
+    直流可调输出                                                                                                                          直流稳压输出                                                                                   OLED显示
+                                                                                                            VO
+                                                                                                                                                                                                                                   GND
+                                                                                                                                    VIN                                     U3
+                                 VIN                                                                                                                                                                                                                          H2
+                                                                                  U5                                                                             1
+                                       VIN                                                                                                                                  15.5*10.5*21                                                                  1
+A              C6                                  D4                 1                                                                                       1                                                                                             1                                       A
+                                                                                  15.5*10.5*21                    R4                                                               5V
+                                                                                                                                                                                                                             +5V
+                                                                                                                                                                                                                                                          2
+                                                                    1                                                                                                                                                                                       2
+                                                                                                                  2K                                                                                                                SCL                   3
+                                                                                                                                                      U2                                +5V                                                                 3
+                                                                                                                                                                                                                                    SDA                   4
+               330nF                              1N4001                                                                                      C2 1                           3                                                                              4
+                                                                                                                                                       VIN        VOUT
+                                                                                                                                              330nF
+    U4                                                                               VO                                                                                                                                                                  H4
+                                                                                                                                                             GND                              C3
+                    3                                                                                                  LED2                                                                                                         SCL                 1
+              INPUT                                                                                                                                          2                                100nF                                                       1
+                    2                                                                                                                                 GND                                                                           SDA                 2
+             OUTPUT                                                                                                                                                                                                                                       2
+                    1
+             ADJUST                                                                        VO
+                                                                              R3                                                                      LM7805CT
+                                                             D3
+    LM317T                                                                    240Ω
+                                                           1N4001                                                                                                    LED1
+                                        ADJ
+
+                                                                                                 C5                                              R1
+                                                                                                 1uF        VO                          +5V
+                                                                                                                  H3
+                                                                                                                                                 2K
+                                                                                                                 1
+                                                 R2                            C4                                  1
+                                                                                                                 2
+                                                 5kΩ                           10uF                                2
+
+
+
+                                                                                                            VO
+                                                        GND1                                                      H8
+B                                                                                                                1                                                                                                                                                                                  B
+                                                                                                                   1
+                                                                                                                 2
+                                                                                                                   2
+                                                                                                                                                                                                                                                                       C20        C19
+                                                                                                                                                                                                                                                                       10uF       100nF
+                                                                                                                                                                                                                                                                                          3V3
+                                                                                                                                                  H5
+                                                                                                                                                                                                                            C18          C17
+                                                                                                                                                 1                                                                          10uF         100nF
+                                                                                                                                                   1
+                                                                                                                                                 2                                                               +5V
+                                                                                                                                                   2
+                                                                                                                                                 3
+                                                                                                                                                   3
+                                                                                                                                                 4
+                                                                                                                                                   4
+                                                                                                                                                                                                                                                 3
+                                                                                                                                                                                                                                             VIN          U7
+                                                                                                                                                                                                                                                 2
+                                                                                                                                                                                                                                           VOUT
+
+    变压整流电路
+                                                                                                                                                                                                                                                 1
+                                                                                                                                GND                                                                                                         GND
+                                                                                                                              3V3                 H6
+                                                                              整流后                                                                1
+                                                                                                                                                   1
+                                                                                                                                                                                                                                                 VOUT
+                                                        变压后                                VIN                                                   2
+                                                                                                                                                   2
+                                                                                                                                                 3
+                                                                                                                                                   3
+                                                                                                                                                 4                                                                                           4
+                            U1                                                                                                                     4
+                        1                    3
+
+     H1                                                                                                C1
+C                2                                                                                                            +5V                 H7                                                                                                                                                C
+               2                       OUT
+                                                                                                   2200uF
+                 1          IN
+                                                               D1                                                                                1
+               1                                                                                                                                   1
+                                                               1              4                                                                  2
+                                                                 +        AC                                                                       2
+                                                               2              3                                                                  3
+                        2                    4                   AC         -                                                                      3
+                                                                                                                                                 4
+                                                                                                                                                   4
+                                                               2W10
+
+
+
+                                                                                                                                                                                                                                    詹顺-23122637
+                                                                                                                                                                                                                                           更新日期                        2026-07-21
+                                                                                                                              原理图                                                                 Schematic1                               创建日期                        2025-12-29
+                     SCREW1                        SCREW2
+                                                                                                                              图页                                                                            P1                             物料编码
+                                                                                                                              绘制
+
+D                    SCREW3                        SCREW4
+                                                                                                                              审阅                                                                                               生产实习zs                                                               D
+
+
+
+                                                                                                                                                                                                          版本           尺寸                        页                 1          共                 1
+
+                                                                                                                                                                                                          V1.0         A4                                     嘉立创EDA
+         1                                                                2                                                         3                                                                 4                             5                                                      6
+
