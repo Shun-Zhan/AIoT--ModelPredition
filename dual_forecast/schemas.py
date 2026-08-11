@@ -113,6 +113,98 @@ class IrrigationAction(str, Enum):
     NO_OP = "NO_OP"
 
 
+class DeviceForecastPoint(BaseModel):
+    """One point emitted by the ESP32 prediction task."""
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+    timestamp: datetime | None = None
+    et0Mm: float | None = Field(default=None, ge=0)
+    soilMoisturePercent: float | None = Field(default=None, ge=0, le=100)
+
+
+class _DeviceProtocolModel(BaseModel):
+    """Base for display-only packets produced by the device."""
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+    schemaVersion: Literal["2.0"]
+    deviceId: str | None = None
+    generatedAt: datetime | None = None
+    updatedAt: datetime | None = None
+    uptimeMs: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_wire_time_names(cls, value):
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        if "schemaVersion" not in value and "schema_version" in value:
+            value["schemaVersion"] = value["schema_version"]
+        if "generatedAt" not in value:
+            for key in ("generated_at", "timestamp", "ts"):
+                if key in value:
+                    value["generatedAt"] = value[key]
+                    break
+        if "updatedAt" not in value:
+            for key in ("updated_at", "timestamp", "ts"):
+                if key in value:
+                    value["updatedAt"] = value[key]
+                    break
+        return value
+
+
+class DeviceForecast(_DeviceProtocolModel):
+    """ESP32-owned forecast shown in place of the PC reference forecast."""
+
+    status: str = "unknown"
+    modelVersion: str | None = None
+    availableSamples: int = Field(default=0, ge=0)
+    requiredSamples: int = Field(default=0, ge=0)
+    nextHourEt0Mm: float | None = Field(default=None, ge=0)
+    soilMoistureInOneHour: float | None = Field(default=None, ge=0, le=100)
+    historySource: str | None = None
+    forecast: list[DeviceForecastPoint] = Field(default_factory=list)
+
+
+class DeviceIrrigationState(_DeviceProtocolModel):
+    """ESP32-owned actuator/irrigation state; it is not a host decision."""
+
+    state: str = "UNKNOWN"
+    action: IrrigationAction | None = None
+    requestId: str | None = None
+    accepted: bool | None = None
+    durationSeconds: int | None = Field(default=None, ge=0, le=60)
+    remainingSeconds: int | None = Field(default=None, ge=0, le=60)
+    reasonCode: str | None = None
+    reason: str | None = None
+
+
+class DeviceCloudResult(_DeviceProtocolModel):
+    """Cloud/decision status computed by the device-side application."""
+
+    status: str = "unknown"
+    requestId: str | None = None
+    action: IrrigationAction | None = None
+    proposedAction: IrrigationAction | None = None
+    finalAction: IrrigationAction | None = None
+    durationSeconds: int | None = Field(default=None, ge=0, le=60)
+    reasonCode: str | None = None
+    reason: str | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    provider: str | None = None
+    modelVersion: str | None = None
+
+
+class DeviceUiAck(_DeviceProtocolModel):
+    """Acknowledgement for a UI command transported through the device."""
+
+    requestId: str
+    accepted: bool
+    action: str | None = None
+    message: str | None = None
+    reason: str | None = None
+
+
 class IrrigationDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schemaVersion: Literal["1.0"]

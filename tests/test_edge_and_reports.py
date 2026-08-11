@@ -118,13 +118,13 @@ def test_stale_or_failed_sensor_causes_attention_and_event():
     assert {event.code for event in assessment.events} >= {"SENSOR_FAILURE", "DATA_INTERRUPTION"}
 
 
-def test_zero_soil_moisture_is_a_disconnected_sensor_not_severe_dryness():
+def test_zero_soil_moisture_is_a_valid_severe_dryness_reading():
     assessment = assess_environment(live(soil=0), forecast(end_soil=0, et0=0.5), SETTINGS)
 
-    assert assessment.risk_level == "ATTENTION"
-    assert not assessment.irrigation_candidate["eligible"]
-    failure = next(event for event in assessment.events if event.code == "SENSOR_FAILURE")
-    assert "soil" in failure.evidence["failed"]
+    assert assessment.risk_level == "IRRIGATION_CANDIDATE"
+    assert assessment.irrigation_candidate["eligible"]
+    assert assessment.irrigation_candidate["rule"] == "SEVERE_DRY"
+    assert all(event.code != "SENSOR_FAILURE" for event in assessment.events)
 
 
 def test_environment_event_cooldown_and_recovery(tmp_path):

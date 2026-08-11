@@ -8,7 +8,9 @@ import dual_forecast.service as service_module
 from dual_forecast.config import SETTINGS
 from dual_forecast.irrigation import IrrigationService
 from dual_forecast.schemas import SensorSnapshot
+from dual_forecast.schemas import DeviceCloudResult, DeviceForecast, DeviceIrrigationState
 from dual_forecast.service import create_app
+from dual_forecast.storage import Store
 
 
 def payload(i=0, *, solar1=True, solar2=True):
@@ -45,6 +47,47 @@ def test_service_warms_up_and_latest_is_missing(tmp_path):
     assert body["status"] == "warming_up"
     assert body["requiredSamples"] == 288
     assert client.get("/v1/forecast/latest").status_code == 404
+
+
+def test_health_starts_without_desktop_models_when_esp32_is_authoritative(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS,
+        database_path=tmp_path / "db.sqlite",
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+    response = TestClient(create_app(settings)).get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "modelsReady": False,
+        "mode": "device_authoritative",
+        "fastTestMode": settings.fast_test_mode,
+        "requiredSamples": settings.required_samples,
+    }
+
+
+def test_device_dashboard_does_not_present_stale_cached_data_as_live(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS,
+        database_path=tmp_path / "db.sqlite",
+        artifact_dir=tmp_path / "artifacts",
+    )
+    store = Store(settings.database_path)
+    old_received_at = datetime.now(timezone.utc) - timedelta(minutes=11)
+    store.save_live_snapshot(SensorSnapshot.model_validate(payload()), old_received_at)
+    store.insert_snapshot(SensorSnapshot.model_validate(payload()), old_received_at, [])
+
+    latest = TestClient(create_app(settings)).get("/v1/dashboard/latest").json()
+
+    assert latest["snapshot"] is None
 
 
 def test_duplicate_is_reported(tmp_path):
@@ -94,6 +137,32 @@ def test_live_telemetry_refreshes_dashboard_without_storing_model_sample(tmp_pat
     assert client.post("/v1/telemetry/live", json=live_payload).status_code == 200
     latest = client.get("/v1/dashboard/latest").json()
     assert latest["snapshot"]["air"]["temperatureC"] == 26.5
+
+
+def test_dashboard_prefers_device_forecast_decision_and_cloud_result(tmp_path):
+    settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
+    store = Store(settings.database_path)
+    store.save_device_forecast(DeviceForecast(
+        schemaVersion="2.0", generatedAt="2026-08-11T08:00:00Z", status="ok",
+        nextHourEt0Mm=0.18, soilMoistureInOneHour=41.2,
+    ))
+    store.save_device_irrigation_state(DeviceIrrigationState(
+        schemaVersion="2.0", updatedAt="2026-08-11T08:00:01Z", state="CLOSED", action="NO_OP",
+    ))
+    store.save_device_cloud_result(DeviceCloudResult(
+        schemaVersion="2.0", updatedAt="2026-08-11T08:00:02Z", status="offline",
+        finalAction="NO_OP", reason="network unavailable",
+    ))
+
+    client = TestClient(create_app(settings))
+    latest = client.get("/v1/dashboard/latest")
+    assert latest.status_code == 200
+    body = latest.json()
+    assert body["forecast"]["schemaVersion"] == "2.0"
+    assert body["forecast"]["soilMoistureInOneHour"] == 41.2
+    assert body["decision"]["state"] == "CLOSED"
+    assert body["cloud"]["status"] == "offline"
+    assert body["device"]["cloudResult"]["finalAction"] == "NO_OP"
 
 
 def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):

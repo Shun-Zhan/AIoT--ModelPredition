@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 import struct
 import threading
 import time
+from uuid import uuid4
 from urllib.parse import urlparse
 import zlib
 
@@ -20,6 +22,7 @@ from .storage import Store
 
 
 AUTO_ANALYSIS_INTERVAL_SECONDS = 60
+LIVE_TELEMETRY_MAX_AGE_SECONDS = 10 * 60
 
 
 def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> dict:
@@ -92,7 +95,8 @@ def qr_png(url: str, *, border: int = 2, pixel_size: int = 6) -> bytes:
 def create_app(settings: Settings = SETTINGS) -> FastAPI:
     app = FastAPI(title="AIoT Dual Forecast", version="0.1.0")
     store = Store(settings.database_path)
-    models = ModelBundle(settings)
+    device_authoritative = os.getenv("AIOT_DEVICE_AUTHORITATIVE", "0") == "1"
+    models = None if device_authoritative else ModelBundle(settings)
     irrigation = IrrigationService(store, settings)
     state = {
         "last_uptime": None,
@@ -104,8 +108,48 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     stop_periodic = threading.Event()
     wake_periodic = threading.Event()
 
+    def queue_device_command(action: str, **fields):
+        """Queue a UI command for ESP32; no host decision or actuator call."""
+        request_id = str(uuid4())
+        command = {
+            "schemaVersion": "2.0",
+            "requestId": request_id,
+            "action": action,
+            "reasonCode": "UI",
+            "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            "ttlSeconds": 30,
+            "transport": "UI_COMMAND",
+            **fields,
+        }
+        store.enqueue_command(command)
+        return {"status": "queued", "requestId": request_id, "action": action}
+
+    def current_live_snapshot() -> dict | None:
+        """Return only fresh ESP32 telemetry, never an old history row as live."""
+        live = state["last_live_snapshot"]
+        if live is not None:
+            return snapshot_to_dashboard(*live)
+
+        persisted = store.latest_live_snapshot()
+        if not persisted:
+            return None
+        try:
+            received_at = datetime.fromisoformat(
+                persisted["receivedAt"].replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if received_at.tzinfo is None:
+            received_at = received_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - received_at).total_seconds() > LIVE_TELEMETRY_MAX_AGE_SECONDS:
+            return None
+        return persisted
+
     def edge_payload() -> dict:
-        current = store.latest_live_snapshot() or store.latest_snapshot() or {}
+        current = current_live_snapshot()
+        if current is None and not device_authoritative:
+            current = store.latest_snapshot()
+        current = current or {}
         assessment = irrigation.assess_edge(current)
         # This helper is called by the browser polling endpoint.  A GET must
         # never alter the ESP32's sampling policy: otherwise refreshing the
@@ -148,7 +192,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     def daily_report() -> dict:
         now = datetime.now(timezone.utc)
         water = water_report()
-        current = store.latest_live_snapshot() or store.latest_snapshot() or {}
+        current = current_live_snapshot()
+        if current is None and not device_authoritative:
+            current = store.latest_snapshot()
+        current = current or {}
         edge = irrigation.assess_edge(current)
         events = store.environment_event_rows(limit=200)
         risk_events = sum(event["code"] == "HIGH_EVAPOTRANSPIRATION_RISK" for event in events)
@@ -174,6 +221,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         wakes this worker and starts a fresh interval instead of inheriting an
         almost-expired timer from the previous mode.
         """
+        if device_authoritative:
+            return
         mode = irrigation.operation_mode
         interval = (
             AUTO_ANALYSIS_INTERVAL_SECONDS
@@ -226,6 +275,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.on_event("startup")
     def start_periodic_worker():
+        if device_authoritative:
+            return
         thread = threading.Thread(target=periodic_worker, name="aiot-periodic-cloud", daemon=True)
         state["periodic_thread"] = thread
         thread.start()
@@ -501,7 +552,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       if (!s.airOk || !has(air.temperatureC) || !has(air.humidityPercent)) sensorIssues.push('空气温湿度传感器');
       if (!has(s.airPressureHpa) || Number(s.airPressureHpa) <= 0) sensorIssues.push('大气压力传感器');
       if (!s.windOk || !has(s.windSpeedMs)) sensorIssues.push('风速传感器');
-      if (!s.soilOk || !has(soil.temperatureC) || !has(soil.moisturePercent) || Number(soil.moisturePercent) <= 0) sensorIssues.push('土壤温湿度传感器');
+      if (!s.soilOk || !has(soil.temperatureC) || !has(soil.moisturePercent) || Number(soil.moisturePercent) < 0 || Number(soil.moisturePercent) > 100) sensorIssues.push('土壤温湿度传感器');
       if (s.solarSource === 'incoming_invalid' || !has(s.solarIncomingWm2)) sensorIssues.push('入射太阳辐射传感器');
       if (s.solarSource === 'default_albedo_fallback' || !has(s.solarReflectedWm2)) sensorIssues.push('反射太阳辐射传感器');
       setValue('airTemp', s.airOk ? air.temperatureC : null, '°C', 1);
@@ -532,6 +583,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         else if (forecastStatus === 'ok') forecastStatus = '预测正常';
         else if (forecastStatus === 'model_unavailable') forecastStatus = '模型未就绪';
         var modelText = '状态：' + forecastStatus + '\n连续完整样本：' + (forecast.availableSamples || 0) + '/' + (forecast.requiredSamples || '--');
+        if (forecast.historySource === 'synthetic_test') {
+          modelText += '\n测试历史：伪造数据，仅验证模型链路；水阀已锁定';
+        }
         el('model').textContent = modelText;
         el('model').className = forecast.status === 'ok' ? 'model-status ok' : 'model-status warn';
         renderForecastCharts(forecastPoints);
@@ -1603,7 +1657,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     def health():
         return {
             "status": "ok",
-            "modelsReady": models.ready,
+            # The dashboard must start without desktop model artifacts when
+            # ESP32 is the production inference and decision authority.
+            "modelsReady": models is not None and models.ready,
+            "mode": "device_authoritative" if device_authoritative else "desktop_models",
             "fastTestMode": settings.fast_test_mode,
             "requiredSamples": settings.required_samples,
         }
@@ -1635,14 +1692,30 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.get("/v1/dashboard/latest")
     def dashboard_latest():
-        response = state["last_response"] or store.latest_forecast()
-        live = state["last_live_snapshot"]
+        device_results = store.latest_device_results()
+        reference_response = state["last_response"] or store.latest_forecast()
+        device_forecast = device_results["forecast"]
+        device_irrigation_state = device_results["irrigationState"]
+        device_cloud_result = device_results["cloudResult"]
         return {
-            "snapshot": snapshot_to_dashboard(*live) if live else store.latest_snapshot(),
-            "forecast": response.model_dump(mode="json") if response else None,
+            "snapshot": current_live_snapshot() if device_authoritative else (
+                current_live_snapshot() or store.latest_snapshot()
+            ),
+            # Device results are authoritative for production display.  The
+            # local forecast remains as a reference fallback for old devices.
+            "forecast": device_forecast or (reference_response.model_dump(mode="json") if reference_response else None),
+            "decision": device_irrigation_state or (
+                store.latest_decision().model_dump(mode="json") if store.latest_decision() else None
+            ),
+            "cloud": device_cloud_result,
+            "deviceForecast": device_forecast,
+            "deviceIrrigationState": device_irrigation_state,
+            "deviceCloudResult": device_cloud_result,
+            "uiAck": device_results["uiAck"],
+            "device": device_results,
             "edge": edge_payload(),
             "events": store.environment_event_rows(limit=12),
-            "actuator": irrigation.last_device_state,
+            "actuator": device_irrigation_state or irrigation.last_device_state,
             "samplingConfig": store.sampling_config_status(),
             "waterReport": water_report(),
             "fastTest": {
@@ -1659,11 +1732,16 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         store.save_live_snapshot(snapshot, received_at)
         current = snapshot_to_dashboard(snapshot, received_at)
         assessment = irrigation.assess_edge(current)
-        store.enqueue_sampling_config(assessment.recommended_sampling_mode.value, assessment.recommended_read_interval_ms)
+        # In device-authoritative mode this endpoint is display cache only;
+        # sampling configuration is owned by the ESP32 runtime.
+        if not device_authoritative:
+            store.enqueue_sampling_config(assessment.recommended_sampling_mode.value, assessment.recommended_read_interval_ms)
         return {"status": "ok", "edge": assessment.to_dict()}
 
     @app.post("/v1/snapshots", response_model=ForecastResponse)
     def add_snapshot(snapshot: SensorSnapshot):
+        if device_authoritative:
+            raise HTTPException(status_code=409, detail="ESP32 is authoritative; use /v1/telemetry/live")
         received_at = snapshot.receivedAt or datetime.now(timezone.utc)
         warnings: list[str] = []
         previous = state["last_uptime"]
@@ -1697,11 +1775,28 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.post("/v1/models/reload")
     def reload_models():
+        if device_authoritative:
+            return {"modelsReady": False, "mode": "device_authoritative"}
         models.reload()
         return {"modelsReady": models.ready, "modelVersion": models.model_version}
 
     @app.get("/v1/cloud/status")
     def cloud_status():
+        if device_authoritative:
+            latest = store.latest_device_result("cloud_result")
+            return {
+                "enabled": latest is not None,
+                "configured": None,
+                "provider": "esp32-volcengine-gateway",
+                "operationMode": "device_authoritative",
+                "automaticIntervalSeconds": None,
+                "lastAutomaticAnalysisAt": None,
+                "nextAutomaticAnalysisAt": None,
+                "autoIrrigation": {"enabled": None, "requiresForecastReady": True},
+                "latestCall": latest,
+                "decision": store.latest_device_result("irrigation_state"),
+                "actuator": store.latest_device_result("irrigation_state"),
+            }
         decision = store.latest_decision()
         return {
             "enabled": settings.llm_enabled,
@@ -1723,6 +1818,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.post("/v1/operation-mode")
     def set_operation_mode(request: OperationModeRequest):
+        if device_authoritative:
+            return queue_device_command("SET_AUTO_MODE", enabled=request.mode == "automatic")
         mode = irrigation.set_operation_mode(request.mode)
         now = datetime.now(timezone.utc)
         state["next_automatic_analysis_at"] = (
@@ -1739,10 +1836,14 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.post("/v1/cloud/analyze")
     def cloud_analyze():
+        if device_authoritative:
+            return queue_device_command("CLOUD_ANALYZE")
         return irrigation.analyze(trigger="manual").model_dump(mode="json")
 
     @app.post("/v1/cloud/chat")
     def cloud_chat(request: ChatRequest):
+        if device_authoritative:
+            return queue_device_command("CLOUD_CHAT", question=request.question)
         return irrigation.chat(request.question)
 
     @app.get("/v1/reports/latest")
@@ -1783,13 +1884,19 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.post("/v1/decisions/{request_id}/confirm")
     def confirm_decision(request_id: str):
+        if device_authoritative:
+            return queue_device_command("CONFIRM_WATERING", sourceRequestId=request_id)
         try:
-            return irrigation.confirm(request_id).model_dump(mode="json")
+            result = irrigation.confirm(request_id)
+            store.mark_command_for_ui_transport(request_id)
+            return result.model_dump(mode="json")
         except KeyError:
             raise HTTPException(status_code=404, detail="decision not found")
 
     @app.post("/v1/decisions/{request_id}/cancel")
     def cancel_decision(request_id: str):
+        if device_authoritative:
+            return queue_device_command("CANCEL", sourceRequestId=request_id)
         try:
             return irrigation.cancel(request_id).model_dump(mode="json")
         except KeyError:
@@ -1802,14 +1909,24 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.post("/v1/actuator/debug/open")
     def debug_open_valve():
-        return irrigation.queue_debug_actuation(
+        if device_authoritative:
+            return queue_device_command("START_WATERING", durationSeconds=5)
+        result = irrigation.queue_debug_actuation(
             IrrigationAction.START_WATERING,
             duration_seconds=5,
         )
+        if result.get("requestId"):
+            store.mark_command_for_ui_transport(str(result["requestId"]))
+        return result
 
     @app.post("/v1/actuator/debug/close")
     def debug_close_valve():
-        return irrigation.queue_debug_actuation(IrrigationAction.STOP_WATERING)
+        if device_authoritative:
+            return queue_device_command("STOP_WATERING")
+        result = irrigation.queue_debug_actuation(IrrigationAction.STOP_WATERING)
+        if result.get("requestId"):
+            store.mark_command_for_ui_transport(str(result["requestId"]))
+        return result
 
     @app.get("/v1/actuator/debug/{request_id}")
     def debug_command_status(request_id: str):

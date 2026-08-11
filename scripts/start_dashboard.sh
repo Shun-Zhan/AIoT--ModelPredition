@@ -64,6 +64,12 @@ read_pid() {
   python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$pid_file" "$1" 2>/dev/null || true
 }
 
+service_code_hash() {
+  # Track the Python package as one fingerprint so a normal restart command
+  # cannot accidentally keep an older Dashboard process after a code update.
+  shasum "$project_root"/dual_forecast/*.py | shasum | awk '{print $1}'
+}
+
 requested_transport="usb"
 if [[ "$wifi" == true ]]; then requested_transport="wifi"; fi
 
@@ -76,7 +82,7 @@ start_process() {
     printf '%s\n' "$previous_pid"
     return
   fi
-  nohup "$venv_python" -u -m dual_forecast.cli "$@" \
+  AIOT_DEVICE_AUTHORITATIVE=1 nohup "$venv_python" -u -m dual_forecast.cli "$@" \
     </dev/null >"$log_dir/$name.out.log" 2>"$log_dir/$name.err.log" &
   local new_pid=$!
   echo "Started $name (PID $new_pid)." >&2
@@ -108,39 +114,6 @@ if ! "$venv_python" -c 'import serial, qrcode' >/dev/null 2>&1; then
   "$venv_python" -m pip install -r "$project_root/requirements.txt"
 fi
 
-configure_cloud_if_needed() {
-  local check_output check_rc
-  set +e
-  check_output="$("$venv_python" -m dual_forecast.cli cloud-check 2>&1)"
-  check_rc=$?
-  set -e
-  if [[ "$check_rc" -eq 0 ]]; then
-    echo "Cloud model configuration verified."
-    return
-  fi
-
-  # Keep a previously saved key when the Internet is briefly unavailable. The
-  # local prediction, dashboard and manual valve safety chain remain usable.
-  if [[ "$check_rc" -eq 3 ]]; then
-    echo "Cloud gateway is temporarily unreachable; keeping saved configuration and starting in offline-capable mode."
-    echo "$check_output"
-    return
-  fi
-
-  echo "Cloud model configuration is missing or rejected."
-  echo "$check_output"
-  echo "Enter a new Volcengine VEI API Key to continue. The input is hidden and saved only in $project_root/.env."
-  "$venv_python" -m dual_forecast.cli cloud-configure
-  if ! check_output="$("$venv_python" -m dual_forecast.cli cloud-check 2>&1)"; then
-    echo "$check_output" >&2
-    echo "The new cloud configuration could not be verified. Check the Key, model permission, and internet connection." >&2
-    exit 1
-  fi
-  echo "Cloud model configuration verified."
-}
-
-configure_cloud_if_needed
-
 mkdir -p "$log_dir"
 if [[ "$wifi" != true && -z "$serial_port" ]]; then
   ports=(/dev/cu.wchusbserial* /dev/cu.usbserial* /dev/cu.SLAB_USBtoUART* /dev/cu.usbmodem*)
@@ -164,9 +137,18 @@ if [[ "$wifi" != true && ! -e "$serial_port" ]]; then
 fi
 
 previous_service_pid="$(read_pid servicePid)"
+previous_service_hash="$(read_pid serviceCodeHash)"
 previous_receiver_pid="$(read_pid receiverPid)"
 previous_transport="$(read_pid transport)"
 previous_wifi_host="$(read_pid espWifiHost)"
+current_service_hash="$(service_code_hash)"
+# Existing pid files from before this field was added deliberately trigger one
+# restart, because their running process cannot be known to contain this code.
+if is_alive "$previous_service_pid" && [[ "$previous_service_hash" != "$current_service_hash" ]]; then
+  kill "$previous_service_pid"
+  echo "Stopped previous Dashboard service (PID $previous_service_pid) to apply code updates." >&2
+  previous_service_pid=""
+fi
 # A receiver opened for USB cannot switch itself to TCP (or vice versa).
 # It is safe to replace only the managed receiver PID stored by this script.
 # Restart Wi-Fi mode too when its endpoint selection changed, so upgrading from
@@ -199,8 +181,8 @@ else
   receiver_pid="$(start_process esp32-receiver "$previous_receiver_pid" receive-esp32-serial --serial-port "$serial_port")"
 fi
 
-printf '{\n  "servicePid": %s,\n  "receiverPid": %s,\n  "transport": "%s",\n  "serialPort": "%s",\n  "espWifiHost": "%s"\n}\n' \
-  "$service_pid" "$receiver_pid" "$requested_transport" "$serial_port" "$esp_wifi_host" >"$pid_file"
+printf '{\n  "servicePid": %s,\n  "serviceCodeHash": "%s",\n  "receiverPid": %s,\n  "transport": "%s",\n  "serialPort": "%s",\n  "espWifiHost": "%s"\n}\n' \
+  "$service_pid" "$current_service_hash" "$receiver_pid" "$requested_transport" "$serial_port" "$esp_wifi_host" >"$pid_file"
 
 live_ready=false
 for _ in {1..15}; do

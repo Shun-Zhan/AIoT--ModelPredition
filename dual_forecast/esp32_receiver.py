@@ -9,9 +9,11 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from .storage import Store
+from .schemas import DeviceCloudResult, DeviceForecast, DeviceIrrigationState, DeviceUiAck
 
 
 # ESP32 periodically emits this small UDP datagram after it has joined a Wi-Fi
@@ -25,6 +27,13 @@ DISCOVERY_PREFIX = b"AIOT_DISCOVERY "
 MDNS_FALLBACK_HOST = "esp32-sensors.local"
 DEFAULT_DATABASE = "runtime/forecast.sqlite3"
 FAST_TEST_DATABASE = "runtime/forecast-fast-test.sqlite3"
+
+DEVICE_RESULT_MODELS = {
+    "@FORECAST ": ("forecast", DeviceForecast),
+    "@IRRIGATION_STATE ": ("irrigation_state", DeviceIrrigationState),
+    "@CLOUD_RESULT ": ("cloud_result", DeviceCloudResult),
+    "@UI_ACK ": ("ui_ack", DeviceUiAck),
+}
 
 
 # Telemetry is always posted to a service on this same computer.  Do not let a
@@ -135,6 +144,44 @@ def result_to_display_command(result: dict[str, Any]) -> str:
     )
 
 
+def parse_device_result_line(line: str) -> tuple[str, Any] | None:
+    """Parse one schemaVersion 2.0 device result line.
+
+    The prefix is part of the wire protocol and the JSON body is intentionally
+    kept separate from legacy telemetry.  A ``None`` result means either that
+    the line is not a device-result line or that its body is malformed.
+    """
+    for prefix, (result_type, model_type) in DEVICE_RESULT_MODELS.items():
+        if not line.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(line.removeprefix(prefix))
+            if not isinstance(payload, dict):
+                raise ValueError("device result must be a JSON object")
+            return result_type, model_type.model_validate(payload)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            print(f"Ignored malformed ESP32 {result_type}: {exc}")
+            return None
+    return None
+
+
+def _is_device_result_line(line: str) -> bool:
+    return any(line.startswith(prefix) for prefix in DEVICE_RESULT_MODELS)
+
+
+def _handle_device_result_line(line: str, store: Store) -> bool:
+    """Store a v2 device result and prevent it entering the legacy path."""
+    if not _is_device_result_line(line):
+        return False
+    parsed = parse_device_result_line(line)
+    if parsed is None:
+        return True
+    result_type, payload = parsed
+    store.save_device_result(result_type, payload, datetime.now(timezone.utc))
+    print(f"ESP32 {result_type} updated (schemaVersion={payload.schemaVersion}).")
+    return True
+
+
 @dataclass
 class _ReceiverState:
     last_submit_at: float = 0.0
@@ -235,7 +282,12 @@ def _handle_telemetry_message(
     *,
     send_display_command: Any | None = None,
 ) -> None:
-    """Forward one decoded ESP32 message to the dashboard and prediction API."""
+    """Forward one decoded ESP32 message to live telemetry only.
+
+    The v2 device forecast is authoritative for production display.  The
+    legacy snapshot endpoint remains available for training/reference callers,
+    but the unattended receiver must not trigger PC inference from telemetry.
+    """
     display = message.get("display")
     if isinstance(display, dict):
         diagnostic = (
@@ -251,9 +303,7 @@ def _handle_telemetry_message(
             )
             state.last_display_diagnostic = diagnostic
 
-    now = time.monotonic()
     try:
-        raw_pressure_hpa = int(message.get("air_pressure_hpa", 0))
         snapshot = esp32_message_to_snapshot(
             message,
             fallback_air_pressure_hpa=args.fallback_air_pressure_hpa,
@@ -266,36 +316,10 @@ def _handle_telemetry_message(
         print(f"Live dashboard unavailable: {exc}")
         return
 
+    now = time.monotonic()
     if now - state.last_live_log_at >= 10:
         print("Live dashboard updated from ESP32 telemetry.")
         state.last_live_log_at = now
-
-    if now - state.last_submit_at < _prediction_interval_seconds(args):
-        return
-
-    if not snapshot_is_complete_for_prediction(snapshot):
-        print("Skipped incomplete ESP32 packet for prediction; waiting for next packet.")
-        return
-
-    try:
-        result = submit_snapshot(args.api_url, snapshot)
-    except (urllib.error.URLError, urllib.error.HTTPError) as exc:
-        print(f"Prediction service unavailable: {exc}")
-        return
-
-    state.last_submit_at = now
-    if send_display_command is not None:
-        send_display_command(result_to_display_command(result).encode("ascii"))
-    if raw_pressure_hpa <= 0:
-        print(
-            "AirPressure is 0; using fallback "
-            f"{args.fallback_air_pressure_hpa} hPa until the sensor is installed."
-        )
-    print(
-        "Submitted snapshot: "
-        f"status={result.get('status')}, "
-        f"samples={result.get('availableSamples')}/{result.get('requiredSamples')}"
-    )
 
 
 def _handle_ack_line(line: str, store: Store) -> bool:
@@ -337,7 +361,8 @@ def _handle_config_ack_line(line: str, store: Store) -> bool:
 
 def _send_pending_commands(connection: Any, store: Store) -> None:
     for command in store.pending_commands(limit=1):
-        line = "@COMMAND " + json.dumps(command, ensure_ascii=False, separators=(",", ":")) + "\n"
+        prefix = "@UI_COMMAND " if command.get("transport") == "UI_COMMAND" else "@COMMAND "
+        line = prefix + json.dumps(command, ensure_ascii=False, separators=(",", ":")) + "\n"
         max_bytes = getattr(connection, "max_control_line_bytes", None)
         if max_bytes is not None and len(line.rstrip("\n").encode("utf-8")) > max_bytes:
             # pending_commands() has already enforced the real expiresAt. The
@@ -356,7 +381,7 @@ def _send_pending_commands(connection: Any, store: Store) -> None:
                 "expiresAt": "x",
                 "ttlSeconds": command["ttlSeconds"],
             })
-            line = "@COMMAND " + json.dumps(compact, separators=(",", ":")) + "\n"
+            line = prefix + json.dumps(compact, separators=(",", ":")) + "\n"
         if max_bytes is not None and len(line.rstrip("\n").encode("utf-8")) > max_bytes:
             raise OSError("ESP32 TCP command exceeds the deployed firmware control-line limit")
         connection.write(line.encode("utf-8"))
@@ -445,8 +470,12 @@ def receive_esp32(args: argparse.Namespace) -> None:
                             line = line.strip()
                             if not line:
                                 continue
-                            if _handle_ack_line(line, store) or _handle_config_ack_line(line, store):
+                            if (_handle_device_result_line(line, store)
+                                    or _handle_ack_line(line, store)
+                                    or _handle_config_ack_line(line, store)):
                                 continue
+                            if line.startswith("@TELEMETRY "):
+                                line = line.removeprefix("@TELEMETRY ")
                             try:
                                 message = json.loads(line)
                             except json.JSONDecodeError:
@@ -504,6 +533,8 @@ def receive_esp32_serial(args: argparse.Namespace) -> None:
                     if _handle_ack_line(line, store):
                         continue
                     if _handle_config_ack_line(line, store):
+                        continue
+                    if _handle_device_result_line(line, store):
                         continue
                     if not line.startswith(args.telemetry_prefix):
                         if args.print_device_log:

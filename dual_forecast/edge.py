@@ -74,10 +74,10 @@ def _as_float(value: Any) -> float | None:
 
 
 def soil_moisture_is_valid(current: dict[str, Any]) -> bool:
-    """Treat the disconnected-probe sentinel of 0% as invalid telemetry."""
+    """Accept every successful soil reading in the physical 0--100% range."""
     soil = current.get("soil") if isinstance(current.get("soil"), dict) else {}
     moisture = _as_float(soil.get("moisturePercent"))
-    return bool(current.get("soilOk") and moisture is not None and 0 < moisture <= 100)
+    return bool(current.get("soilOk") and moisture is not None and 0 <= moisture <= 100)
 
 
 def _forecast_evidence(forecast: dict[str, Any], settings: Settings) -> dict[str, Any]:

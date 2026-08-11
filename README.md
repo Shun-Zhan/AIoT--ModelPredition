@@ -1,384 +1,160 @@
-# ESP32-S3 智能灌溉：本地预测 + 云端大模型
+# ESP32-S3 智能灌溉
 
-本项目是面向 2026 年全国大学生物联网设计竞赛乐鑫科技赛道的离线优先智能灌溉系统。ESP32-S3 采集空气温湿度、气压、土壤温湿度、双路风速和双路太阳辐射；其中 Solar 2 是入射短波 Rs↓，Solar 1 是地表/作物反射短波 Rs↑，系统计算净短波 Rns=Rs↓−Rs↑ 用于 ET₀。电脑端完成多传感器融合、SQLite 存储、N-BEATS/LSTM 本地预测、实时网页展示，并通过火山引擎 OpenAI 兼容网关调用真实云端大模型。云端建议必须经过本地安全审核，默认还需人工确认，最终才会通过 USB 串口控制 GPIO11 继电器。
+这是一个离线优先的智能灌溉系统。**ESP32-S3 是唯一的生产业务节点**：采集、五分钟历史、N-BEATS/SoilLSTM 推理、灌溉安全规则、水阀执行和可选云端大模型都在设备上完成。电脑或手机网页只是显示数据和转发用户操作；它们断开、关机或无互联网时，ESP32 的采集、预测和本地自动灌溉仍可继续运行。
 
-官方赛题原文：[2026 乐鑫科技赛道 PDF](https://iot.sjtu.edu.cn/ueditor/net/upload/file/20260329/6391039317778793056390288.pdf)。
+官方赛题：[2026 乐鑫科技赛道 PDF](https://iot.sjtu.edu.cn/ueditor/net/upload/file/20260329/6391039317778793056390288.pdf)。
 
-## 赛题必备项对照
-
-| 官方必备项 | 本项目对应实现 | 现场验收证据 |
-| --- | --- | --- |
-| 使用 ESP32-S3/C5/P4 之一 | ESP32-S3 采集固件 | Arduino 编译/烧录日志和串口启动信息 |
-| 至少 1 种传感器数据融合 | 空气、气压、土壤、双风速、双太阳辐射融合为统一 `SensorSnapshot` | dashboard 实时卡片、`@TELEMETRY` JSON、SQLite 历史 |
-| 对接至少 1 个云端大模型 | 火山引擎 OpenAI 兼容网关，实际发起 HTTPS 请求 | 页面“云端已启用/已配置”、调用时间、延迟、Token 和模型回复 |
-| 上行或下行交互 | 上行：趋势/预测/异常/灌溉日志交给大模型；下行：模型建议经审核和确认后控制水阀 | `llm_calls`、`decisions`、`@COMMAND`、ESP32 `@ACK` 和继电器动作 |
-
-项目同时实现了赛题加分方向中的边缘计算、多源融合和节水应用。需要注意：仓库默认关闭真实云调用，正式验收时必须配置真实 Key、模型/推理接入点并完成一次成功调用；只有假数据测试不能证明已满足“对接云端大模型”。
-
-## 离线主干 + 云端增强架构
+## 生产架构
 
 ```mermaid
 flowchart LR
-  S["多路传感器"] --> E["ESP32-S3 采集与融合"]
-  E -- "Wi-Fi TCP（自动发现）" --> P["电脑端 FastAPI + SQLite"]
-  P --> M["本地 N-BEATS / LSTM"]
-  P --> D["实时 Dashboard"]
-  P -- "趋势、预测、异常、日志" --> C["云端大模型"]
-  C -- "结构化灌溉建议" --> G["本地安全审核"]
-  G --> H["网页人工确认"]
-  H -- "@COMMAND" --> E
-  E -- "@ACK" --> P
-  E --> R["GPIO11 继电器 + 24 V 水阀"]
+  S[传感器] --> E[ESP32-S3]
+  E --> H[五分钟 V2 历史和 NTP 时间]
+  H --> M[N-BEATS + SoilLSTM]
+  M --> R[本地灌溉安全规则]
+  R --> V[GPIO11 继电器和水阀]
+  E <-->|Wi-Fi TCP 或 USB| D[电脑 Dashboard]
+  D -->|UI 命令| E
+  E <-->|可选 HTTPS| C[火山引擎云端大模型]
 ```
 
-断网时，传感器采集、SQLite、网页、本地预测和已有本地安全逻辑继续工作；云端问答和非实时分析降级为不可用，云端失败不会直接开阀。云端模型永远不直接访问 GPIO。
+- ESP32 本地规则始终优先于云端建议。云端只能解释、问答和给出建议，不能绕过设备安全门或直接操作 GPIO11。
+- 自动灌溉每次重启均关闭，需在 Dashboard 中人工启用；即使已启用，设备仍会校验 NTP 时间、完整传感器、288 点连续窗口、冷却时间、单次最长 60 秒和每日最长 600 秒。
+- PC 端不运行生产预测、不做生产决策、不调用云端，也不保存或索取云端 API Key。训练和模型导出仍是开发工具，和日常 Dashboard 启动无关。
 
-## 本地边缘风险、环境事件与安全动态采样
+## 一键启动 Dashboard
 
-“边缘智能”运行在**电脑端本地边缘网关**，而不是宣称 ESP32-S3 运行神经网络。它将当前多传感器融合数据、历史趋势、本地 N-BEATS/LSTM 预测和水阀状态组合成可解释风险等级；ESP32-S3 只承担实时采集、快速安全保护和执行已审核的指令。
+仅需 Python 3.10+。首次启动会建立 `.venv` 并安装网页/串口接收依赖；**不检查云端 Key，也不读取 `artifacts/` 模型文件**。
 
-| 风险等级 | 典型依据 | 本地动作 |
-| --- | --- | --- |
-| `NORMAL` | 数据新鲜，环境稳定 | 常规监测 |
-| `ATTENTION` | 传感器失败或实时数据陈旧 | 记录故障，禁止演示自动开阀 |
-| `HIGH_EVAPOTRANSPIRATION` | 完整的一小时预测中累计 ET₀ 达到高蒸散阈值 | 记录预测证据，建议高频监测和低频云端分析 |
-| `IRRIGATION_CANDIDATE` | 当前湿度与未来一小时土壤湿度、ET₀预测满足分段规则 | 记录命中规则和预测证据；仍须经过本地安全审核 |
+### Windows
 
-预测灌溉候选采用以下本地确定性规则：
-
-- 当前湿度 `<20%`：严重干燥，直接形成候选，不要求预测就绪。
-- `20% ≤ 当前湿度 <30%`：完整一小时预测的末值低于当前值，或未来一小时累计 ET₀ `≥0.30 mm`，才形成候选。
-- `30% ≤ 当前湿度 ≤45%`：预测序列一小时内最低值 `<30%`，且未来一小时累计 ET₀ `≥0.30 mm`，才提前形成候选。
-- 当前湿度 `>45%`：不形成候选。
-
-预测相关分支要求预测状态为 `ok`、数据点完整有效且覆盖一小时。传感器异常、实时数据陈旧、冷却中、阀门已开启、单次时长或每日累计达到安全上限时一律不下发开阀命令。上述 `20%`、`30%`、`45%` 和 `0.30 mm` 都是工程初值，可分别通过 `.env` 中的 `AIOT_IRRIGATION_SEVERE_DRY_PERCENT`、`AIOT_IRRIGATION_TRIGGER_PERCENT`、`AIOT_IRRIGATION_PREDICTIVE_MAX_PERCENT` 和 `AIOT_IRRIGATION_HIGH_ET0_1H_MM` 标定；`AIOT_IRRIGATION_TARGET_PERCENT` 配置灌溉目标值。页面的 `76/100` 等数值只是便于排序和着色的规则风险等级，没有物理单位，也不是模型概率。
-
-SQLite 的 `environment_events` 记录事件代码、严重度、发生时间、证据、建议动作和恢复状态，并使用冷却时间去重。当前事件包括 `SOIL_ABNORMALLY_DRY`、`HIGH_EVAPOTRANSPIRATION_RISK`、`NIGHT_STABLE`、`SENSOR_FAILURE`、`DATA_INTERRUPTION` 和 `VALVE_EXECUTION_FAILURE`。页面的事件时间线和接口可审计这些记录。
-
-| 采样模式 | 推荐间隔 | 使用条件 |
-| --- | ---: | --- |
-| `DEBUG` | 2 秒 | 上电默认、安全调试值 |
-| `IRRIGATION_MONITORING` | 2–5 秒 | 灌溉候选、高蒸散或水阀已打开 |
-| `NORMAL_MONITORING` | 30–120 秒 | 环境稳定的正常监测 |
-| `NIGHT_ECO` | 5–15 分钟 | 低光、低风、土壤稳定且没有灌溉候选 |
-
-采样策略只是“电脑端推荐 + ESP32 白名单执行”，不是实测功耗结论。固件**故意不使用 Deep Sleep**：水阀打开时必须保持 2–5 秒监测，且 ESP32 仍要接收关阀命令、维持 8 秒主机心跳超时关阀和最长开阀保护。每次重启都会回到 `DEBUG` / 2 秒，动态配置只保存在 RAM。
-
-## 仓库结构
-
-- `firmware/esp32_s3_all_sensors/`：ESP32-S3 传感器与安全水阀固件。
-- `dual_forecast/`：数据桥接、存储、预测、云端交互和本地安全审核。
-- `artifacts/`：已训练的 N-BEATS/LSTM 权重及标准化器。
-- `tests/`：接口、假云网关、安全规则和串口闭环测试。
-- `runtime/`：本机 SQLite、日志和 PID 文件，不提交 Git。
-
-## 第一次安装与一键启动
-
-要求 Python 3.10 或更高版本，推荐 Python 3.11/3.12。仓库自带模型权重，新电脑无需先训练。当前固件默认使用 **ESP32 → 同一 Wi‑Fi → 电脑接收器** 传输传感器数据；USB 用于烧录、查看日志和无法联网时的备用接收模式。ESP32 与电脑必须加入同一个 2.4 GHz 局域网/手机热点。
-
-### Windows PowerShell
-
-Wi‑Fi 数据链路的正常启动方式：
+Wi-Fi 接收（推荐）：
 
 ```powershell
 cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
 .\start_dashboard.cmd -Wifi -Lan
 ```
 
-首次运行会创建 `.venv`、安装依赖、启动 FastAPI 与 Wi‑Fi 接收器，并用 Edge/Chrome 应用模式打开全屏页面。ESP32 加入同一 Wi‑Fi 后会周期性广播自己的 TCP 服务，接收器自动发现它；DHCP 换 IP、重启手机热点后都无需手填 IP。停止后台服务：
+USB 接收：
+
+```powershell
+.\start_dashboard.cmd -EspSerialPort COM3 -Lan
+```
+
+`-Lan` 让同一局域网中的手机访问 `http://电脑IPv4:8000/dashboard`。Windows 防火墙仅允许“专用网络”。停止后台进程：
 
 ```powershell
 .\stop_dashboard.cmd
 ```
 
-上面的 `-Lan` 允许同一 Wi‑Fi 下的手机访问。若网络开启了“客户端隔离”并同时拦截局域网 UDP 广播，可用 ESP32 串口打印的 DHCP IP 强制指定：
-
-```powershell
-.\start_dashboard.cmd -Wifi -EspWifiHost 172.20.10.2 -Lan
-```
-
-手机与电脑连同一 Wi-Fi 后，在手机输入 `http://电脑IPv4:8000/dashboard`。Windows 防火墙弹窗只允许“专用网络”，不要在公共网络开启。无 Wi‑Fi 时可退回 USB：`.\start_dashboard.cmd -EspSerialPort COM3 -Lan`。
-
-首次一键启动会检查火山引擎配置。没有 Key、Key 失效、模型不可用或网关不可达时，会在终端提示输入新的 VEI API Key（输入不回显），并保存到项目根目录的 `.env`。以后只需要运行同一条启动命令，不需要再次设置环境变量。`.env` 已被 Git 忽略，绝不能提交或发给他人；系统环境变量仍可覆盖其中配置，便于正式部署使用密钥管理服务。
-
-PowerShell 里不使用 `source .venv/bin/activate`；脚本直接调用 `.venv\Scripts\python.exe`，不会误用 Anaconda 或全局 Python。
-
-### Windows CMD
-
-```cmd
-cd C:\Users\你的用户名\Desktop\AIoT--ModelPredition
-start_dashboard.cmd -Wifi -Lan
-```
-
 ### macOS / Linux
 
-macOS 一键启动：
+Wi-Fi 接收（自动发现 ESP32）：
 
 ```bash
 cd /你的路径/AIoT--ModelPredition
-./start_dashboard.sh --wifi
-```
-
-同一 Wi-Fi 的手机巡检演示需要显式加入 `--lan`：
-
-```bash
 ./start_dashboard.sh --wifi --lan
 ```
 
-然后在手机中打开 `http://本机IPv4:8000/dashboard`。默认会自动发现 ESP32，不需要查看或填写它的 DHCP IP。只有网络启用“客户端隔离”并同时禁止局域网广播时，才改用显式 IP：`./start_dashboard.sh --wifi --esp-wifi-host 172.20.10.2 --lan`。macOS 防火墙若提示，允许 Python 在本地网络通信。备用 USB 模式为 `./start_dashboard.sh --serial-port /dev/cu.wchusbserial10 --lan`。
-
-首次执行启动命令时，若没有可用的火山引擎 Key，终端会让你粘贴一次（输入不回显）。它会先用极小的 `Reply exactly OK.` 请求验证 Key、模型和网关；此检查不生成灌溉建议，也不会控制水阀。验证成功后信息保存在本机 `.env`，以后启动无需重复输入。
-
-需要主动换 Key 时，可单独运行：
+USB 接收：
 
 ```bash
-.venv/bin/python -m dual_forecast.cli cloud-configure
+./start_dashboard.sh --serial-port /dev/cu.wchusbserial10 --lan
 ```
 
-停止：
+若热点屏蔽 UDP 广播和 mDNS，可将串口打印的设备 IP 显式传入：
 
 ```bash
-./stop_dashboard.sh
+./start_dashboard.sh --wifi --esp-wifi-host 172.20.10.2 --lan
 ```
 
-`.env.example` 是变量清单。真实 `.env` 会被自动读取、优先级低于系统环境变量，并且已被 Git 忽略。真实 Key 只能放在本机 `.env` 或密钥管理系统中，不要写进源码、截图、SQLite 或 Git。`AIOT_DEMO_AUTO_EXECUTE` 仅为旧配置兼容项，不能再触发开阀；默认仍需要网页人工长按确认。
+## Dashboard 的职责
 
-### 让云端分析理解农田
-
-云端大模型只会依据本地服务整理的事实生成解释和建议，不能直接开阀。除实时数据、本地预测、风险事件和 1 小时/24 小时/7 天趋势外，可以在本机 `.env` 增加已知农田信息：
-
-```dotenv
-AIOT_FARM_CROP=番茄
-AIOT_FARM_GROWTH_STAGE=开花结果期
-AIOT_FARM_SOIL_TYPE=壤土
-AIOT_FARM_PLOT_AREA_M2=12
-AIOT_FARM_IRRIGATION_METHOD=滴灌
-AIOT_FARM_NOTES=下午避免灌溉，优先傍晚短时补水
-```
-
-改完后重新运行 `./start_dashboard.sh --wifi --lan`。这些字段只增强云端解释，不会更改 ESP32、本地阈值、最长开阀时间或人工长按确认。没有填写的字段会明确传给模型为“未知”，不会由模型自行猜测。当前没有接入天气服务，模型也会明确说明不能据此判断降雨或天气预报。
-
-## 手动启动与健康检查
-
-需要排错时打开两个终端。终端 1：
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m dual_forecast.cli serve --host 127.0.0.1 --port 8000
-```
-
-终端 2（端口替换为实际值）：
-
-```bash
-.venv/bin/python -m dual_forecast.cli receive-esp32 \
-  --esp-host auto
-```
-
-`auto` 是默认值：电脑先监听 UDP 3334，ESP32 每 3 秒广播一次当前 TCP 地址，再自动连接 TCP 3333，因此 DHCP IP 变化不需要人工处理。部分手机热点会阻断 UDP 广播；此时接收器会自动回退到固件的 `esp32-sensors.local` mDNS 名称。若网络同时阻断广播和 mDNS，可把 `auto` 换成 ESP32 串口打印的 IP。Windows 将上面的 Python 路径写为 `.venv\Scripts\python.exe`。备用 USB 接收器命令为 `receive-esp32-serial --serial-port COM3`。检查服务：
-
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-页面地址：`http://127.0.0.1:8000/dashboard`。实时卡片每 2 秒刷新；预测历史默认每 5 分钟入库一次。页面右上角不超过 5 秒且为绿色代表 ESP32 数据链路正常，超过 20 秒变红代表中断。
-
-### 手机移动巡检与二维码
-
-在以 `--lan` / `-Lan` 显式启动后，用电脑浏览器打开 Dashboard。页面二维码由本机 `GET /v1/dashboard/qr` 生成为 PNG，二维码内容使用浏览器正在访问的地址，**不调用第三方二维码网站，也不把临时 IP 写入源码**。手机扫二维码前应确认二者在同一 Wi-Fi；如果二维码不能识别局域网 IP，复制页面显示的地址并手动把主机名替换为电脑 IPv4。
-
-手机页面包含实时传感器、边缘风险、采样状态、水阀状态、最近事件、报告摘要、文本问答和可选语音能力提示。Web Speech API / SpeechSynthesis 不可用时自动退回文字问答，页面与本地报告不依赖外网。页面的“确认灌溉”必须长按 1.5 秒，随后仍调用后端安全审核；摇一摇、语音、手势均不能直接开阀。
-
-### 快速测试模式
-
-正式模式需要 288 个五分钟点（约 24 小时）。仅验证采集、预测、决策和接口链路时，可以开启
-快速测试模式：默认每 5 秒提交一次，收集 24 个点后开始预测，约 2 分钟可看到结果。
-
-```bash
-# 终端 1
-make serve-fast
-
-# 终端 2
-make receive-fast
-```
-
-`make receive-fast` 默认使用 USB 串口，可通过 `SERIAL_PORT=/dev/cu.xxx make receive-fast`
-指定端口。Wi-Fi 自动发现模式使用 `make receive-fast-wifi`。
-
-也可以直接运行 `dual-forecast serve --fast-test --fast-test-samples 24` 和
-`dual-forecast receive-esp32-serial --serial-port /dev/cu.xxx --fast-test --fast-test-interval-seconds 5`。
-快速模式会在预测警告中显示 `FAST_TEST_MODE`。它把高频样本视为模型时间步，只用于验证
-端到端流程，不能用于评价模型精度或替代正式的五分钟采样结果。
-
-Windows 查看接收日志：
-
-```powershell
-Get-Content .\runtime\logs\esp32-receiver.out.log -Tail 40 -Wait
-```
-
-`-Wait` 会持续等待新日志，看似“卡住”是正常现象，按 Ctrl+C 退出。macOS 对应：
-
-```bash
-tail -f runtime/logs/esp32-receiver.out.log
-```
-
-## 云端分析、问答和安全灌溉
-
-环境变量配置正确并重新启动服务后，dashboard 应显示云端“已启用、已配置”。
-
-1. 点击“生成云端分析建议”，电脑将当前融合数据、最近 1/24 小时趋势、本地预测、异常和近 7 天灌溉统计发给大模型。
-2. 在问答框输入“今天需要调整灌溉计划吗？”或“过去一周用了多少水？”，页面同时显示回答所依据的数据范围。
-3. 若模型建议 `START_WATERING`，本地会先验证数据新鲜/完整、土壤阈值、置信度、过期时间、15 分钟冷却、单次 60 秒和每日 600 秒限制。
-4. 默认状态是 `awaiting_confirmation`。点击“人工确认并下发”后，命令才进入 SQLite 队列。
-5. 串口接收器发送 `@COMMAND`，ESP32 验证 Schema、TTL、动作白名单、持续时间和最新传感器状态，再把 GPIO11 拉高。
-6. ESP32 返回 `@ACK`，网页显示 `OPEN`；达到持续时间后自动拉低 GPIO11并返回关闭 ACK。
-
-### 半自动 / 全自动灌溉模式
-
-Dashboard 顶部可直接切换运行模式。刷新页面会保持当前选择；每次重新启动服务时都会安全地恢复为半自动模式：
-
-- **半自动模式**：AI 生成建议并经过本地审核；正式开阀仍需人工长按 1.5 秒确认。
-- **全自动模式**：每 60 秒调用一次 AI 决策。建议通过本地审核和自动模式门槛后直接进入 ESP32 命令队列，无需人工确认。
-
-需要全自动运行时，在本次服务启动后从 Dashboard 手动切换。以下 `.env` 项用于配置全自动执行门槛，不会改变“重启后默认半自动”的行为：
-
-```dotenv
-AIOT_AUTO_IRRIGATION_ENABLED=1
-AIOT_AUTO_IRRIGATION_MIN_CONFIDENCE=0.80
-AIOT_AUTO_IRRIGATION_REQUIRE_FORECAST_READY=1
-AIOT_WATERING_COOLDOWN_MINUTES=15
-```
-
-全自动模式下，AI 不能直接操作 GPIO。只有 `START_WATERING` 同时满足以下条件，电脑才会把命令加入 ESP32 队列：AI 置信度不低于阈值、ESP32 数据新鲜且全部有效、本地分段预测规则判断为 `IRRIGATION_CANDIDATE`、自动模式要求的预测已就绪、冷却时间/单次时长/每日总时长均符合限制，并在入队前再次复核。任一条件失败都会记录为暂停或拒绝，不显示可绕过自动门槛的人工确认按钮，并在下一分钟重新分析。云端不可用、模型输出错误或网络中断时不会开阀。
-
-`STOP_WATERING` 是保守动作：仍需有效 AI 决策和本地命令 TTL，但不因预测尚在预热而阻止关阀。所有自动下发会显示为 `auto_confirmed_waiting_device`，命令和 ESP32 `@ACK` 仍会保存到 SQLite。首次启用时建议先断开 24 V 水阀，只观察继电器指示灯、命令队列和 ACK。
-
-### 串口协议示例
-
-设备上行：
+Dashboard 从设备接收 `@TELEMETRY`、`@FORECAST`、`@IRRIGATION_STATE`、`@CLOUD_RESULT` 和 `@UI_ACK`，将最近状态缓存到 SQLite 后展示。网页按钮只写入待转发的 `@UI_COMMAND`；ESP32 收到后必须再次审核，再返回 ACK。
 
 ```text
-@TELEMETRY {"uptime_ms":123456,"wind":{...},"air":{...},"soil":{...},"solar":{...}}
+网页按钮 -> 电脑转发 @UI_COMMAND -> ESP32 安全审核 -> @UI_ACK / @IRRIGATION_STATE -> Dashboard
 ```
 
-电脑下行：
+因此“打开水阀”按钮只是请求，不能保证已经打开。以设备返回的 `@UI_ACK` 和 `@IRRIGATION_STATE` 中的阀门状态为准；`STOP_WATERING` 是任何状态下都允许的保守操作。
 
-```text
-@COMMAND {"schemaVersion":"1.0","requestId":"...","action":"START_WATERING","durationSeconds":30,"reasonCode":"SOIL_DRY","reason":"human-confirmed: ...","confidence":0.91,"expiresAt":"...","ttlSeconds":30}
-```
+电脑断开后重新连接，Dashboard 只请求设备当前状态与后续遥测，不会把 PC 上陈旧的预测或决策下发给设备。
 
-设备确认：
+## ESP32 离线采集与预测
 
-```text
-@ACK {"requestId":"...","accepted":true,"actualState":"OPEN","reason":"started","remainingSeconds":30}
-```
+设备上电默认是 `OFFLINE_LOGGING`，每 **5 分钟**保存一个完整样本。任一必需传感器失败时，该 slot 不写入；设备每 15 秒重试，跨过 slot 仍失败则形成缺口，连续预测窗口从下一条完整样本重新累计。
 
-安全动态采样使用**独立队列和独立协议**，绝不复用水阀 `@COMMAND`：
+- 连续 288 个五分钟样本为 24 小时窗口。满足后 ESP32 运行 float32 N-BEATS 和两层 SoilLSTM，输出下一小时 ET₀ 与 12 个五分钟土壤湿度预测点。
+- 本方案不使用硬件 RTC。设备每次上电必须先成功连接互联网并完成 NTP 校时；Wi-Fi 连通后约 5 秒开始校时重试。当前运行周期内可继续离线采集、预测和自动灌溉，但断网重启后会回到 `clock_unset`，直到下一次 NTP 校时。
+- `warming_up`、`clock_unset` 或模型错误时，可显示轻量 `edge_prediction` 风险提示；它不能直接开阀。
+- 记录采用 V2（二进制版本、长度、连续序号、UTC epoch、slot、传感器有效标志和 CRC）。启动会恢复最新连续 288 条 V2 数据；不会要求再次等待 24 小时。
 
-```text
-@CONFIG {"schemaVersion":"1.0","requestId":"config-...","samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
-@CONFIG_ACK {"requestId":"config-...","accepted":true,"samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
-```
+### 升级旧日志
 
-固件只接受四档白名单模式及对应范围；水阀打开时会拒绝慢采样或 `NIGHT_ECO`，并在 `@CONFIG_ACK` 返回 `valve_open_requires_fast_sampling`。`@CONFIG` 不会进入 `command_queue`，因此无法被误解析为开阀命令。
-
-## 节水与运行报告
-
-以下接口均可在云端关闭时使用：
-
-| 接口 | 内容 |
-| --- | --- |
-| `GET /v1/dashboard/latest` | 当前快照、预测、边缘风险、事件、水阀与采样状态、报告摘要 |
-| `GET /v1/events` | 环境事件时间线与恢复状态 |
-| `GET /v1/edge/status` | 当前风险评估与最近配置 ACK |
-| `GET /v1/reports/water` | 24 小时/7 天灌溉次数、时长、可选用水估算、数据质量、每日趋势 |
-| `GET /v1/reports/daily` | 本地日报、风险、预测摘要、事件统计、传感器健康率 |
-
-`AIOT_VALVE_FLOW_LPM` 仅在阀门标称/实测流量已知时配置；报告按 `开阀秒数 / 60 × 流量(L/min)` 计算**估算**用水量，并清楚标注不是水表实测。未配置时用水升数为未知，不会伪造 0 L。未定义对照基准或历史不足时，页面应显示“数据积累中”，不显示“节水 xx%”或具体电流/功耗节省率。
-
-电脑端验证绝对时间 `expiresAt`，并且只发送未过期命令；ESP32 不依赖联网校时，使用 1–30 秒的传输 TTL、独立的最长 60 秒关阀计时器和 8 秒主机心跳超时保护。重复 `requestId` 不会重复执行。
-
-## 全部硬件接线
-
-| 功能 | ESP32-S3 引脚 | 传感器/模块侧 | 参数 |
-| --- | --- | --- | --- |
-| 风速 1 | GPIO9 ADC | 模拟信号 OUT | 0–5 V 输出必须先分压到 0–3.3 V |
-| 风速 2 | GPIO6 ADC | 模拟信号 OUT | 同上 |
-| AHT20 | GPIO5 / GPIO8 | SDA / SCL | 3.3 V，地址 0x38 |
-| HW-611 BMP280 | GPIO3 / GPIO4 | SDA / SCL | 3.3 V；CSB→3.3 V；SDO→GND 时地址 0x76 |
-| 土壤 RS485 转换器 | GPIO18 / GPIO17 | RO / DI | 4800 8N1，土壤地址 0x03，独立总线 |
-| 太阳 RS485 转换器 | GPIO16 / GPIO15 | RO / DI | 4800 8N1，两个探头地址 0x01/0x02 并联在此总线 |
-| 继电器控制 | GPIO11 | IN | 3.3 V 一路继电器，高电平有效 |
-| Feather I²C 电源控制 | GPIO7 | 不外接 | 固件自动拉高，禁止复用 |
-
-AHT20：VCC→3.3 V，GND→GND，SDA→GPIO5，SCL→GPIO8。BMP280：VCC→3.3 V、GND→GND、SDA→GPIO3、SCL→GPIO4、CSB→3.3 V、SDO→GND；若 SDO 拉高则通常是 0x77，固件也会回退扫描。
-
-土壤探头虽然只暴露 VCC、GND、A、B，但 A/B 是 RS485 差分信号，仍需 3.3 V 逻辑兼容的自动收发 RS485 转换器，不能把 A/B 作为普通 UART 长期直连 ESP32。探头 A/B→转换器 A/B，转换器 RO→GPIO18、DI→GPIO17。太阳辐射使用另一块转换器：两个探头 A 对 A、B 对 B 并联，转换器 RO→GPIO16、DI→GPIO15。A/B 无响应时先核对说明书定义，必要时只在断电后互换 A/B。传感器电源按铭牌独立供电，不能因接口名字相同就接 ESP32 3.3 V。
-
-继电器低压控制侧：模块 DC+/VCC→符合模块要求的 3.3 V 电源，DC-/GND→ESP32 GND，IN→GPIO11。24 V 常闭水阀的触点侧：24 V 电源正极→COM，NO→水阀正极，水阀负极→24 V 电源负极。这样继电器未吸合时水阀无电并保持关闭。COM/NO/NC 是隔离触点，可以切换 24 V，但必须确认触点额定直流电压/电流高于水阀负载；直流水阀线圈建议并联合适的续流二极管或抑制器。24 V 不得接入 ESP32 GPIO 或继电器 IN。
-
-更详细固件说明见 `firmware/esp32_s3_all_sensors/README.md`。当前串口屏方案已停用，GPIO11 专用于继电器。
-
-### ESP32 手机 Wi-Fi 配网（可选增强）
-
-USB 仍是默认采集、预测和安全开阀主链路；ESP32 的 Wi-Fi 配网只解决“换到手机热点、Windows 热点或家用路由器时，无需改代码重烧录”的联网需求。首次烧录或 USB 串口发送 `@WIFI_RESET` 后，ESP32 开启一次性配置热点 `AIOT-SETUP-xxxxxx`，热点统一密码为 `12345678`，访问地址 `http://192.168.4.1/` 会输出到 USB 串口。手机连接后填写当前 **2.4 GHz** 普通 WPA2 网络的 SSID/密码，凭据仅保存在 ESP32 本机 NVS 中，随后通过 DHCP 自动取址。5 GHz、网页认证/扫码/验证码校园网不属于该通用配网范围；校园网 802.1X 需要单独适配学校认证方式。
-
-完成配网不等于手机自动能访问 Dashboard。Dashboard 仍由电脑运行；让手机巡检时，使用 `-Lan` / `--lan` 启动，并让手机与电脑位于同一局域网后访问 `http://电脑IPv4:8000/dashboard`。
-
-## 评委现场演示流程
-
-1. 烧录固件并展示芯片识别为 ESP32-S3、GPIO11 上电 LOW。
-2. 关闭 Arduino 串口监视器，一键启动 dashboard 和 USB receiver。
-3. 展示多路实时传感器和统一 `@TELEMETRY`，拔掉一个传感器展示异常记录，再恢复。
-4. 展示 SQLite 历史、本地 N-BEATS/LSTM 状态；未满 288 个五分钟样本时可解释为约 24 小时预热，也可使用已有连续历史演示完整预测。
-5. 设置真实火山引擎环境变量，重启后展示页面“已启用、已配置”。
-6. 点击云端分析并进行自然语言问答，展示真实调用时间、延迟、Token、回复和数据范围。
-7. 让模型产生灌溉建议，展示其先停留在人工确认状态；确认后观察 `@COMMAND`、继电器动作和 `@ACK`。
-8. 不等待也可看到最长 60 秒后自动关阀；拔掉 USB/停止心跳时，8 秒内安全关阀。
-9. 断开互联网，再展示本地采集、网页、SQLite 和预测不受影响，云端请求明确降级为 `NO_OP`。
-
-建议正式演示前先不接 24 V 水阀，只观察继电器指示灯和万用表通断，确认全部保护逻辑后再接负载。
-
-## 数据和本地预测说明
-
-`AirPressure` 以 hPa 接收，内部转为 kPa。Solar 2 是 ET₀ 必需的入射短波 Rs↓，Solar 1 是反射短波 Rs↑；两者正常时，SQLite 的 `solar_wm2` 保存净短波 `max(Rs↓−Rs↑,0)`。若反射探头暂时无效，系统明确标记并使用 FAO 默认反照率 α=0.23，即 `0.77×Rs↓` 回退；若入射探头无效，该样本不会进入预测。旧版本数据库中“两探头平均辐射”记录会保留，但不会与新净短波数据混入同一个预测窗口，因此升级后须重新积累完整窗口。
-
-模型保持 5 分钟时间格，连续 288 个完整点对应 24 小时输入窗口；ESP32 接收器默认每 30 秒提交一次完整包，因此同一个 5 分钟格可以由多条有效采样补齐。积累不足时显示 `warming_up`（页面显示为“连续完整数据积累中”）；遇到超过插值上限的缺口会跳过缺口前的断裂时间段，从下一条连续完整数据重新计数，而不会返回 `insufficient_data`。不完整数据仍用于实时安全判断和异常记录，但不会污染预测历史；下一条完整数据可立即继续入库。
-
-### ESP32 脱离电脑的离线采集
-
-固件上电默认以 `OFFLINE_LOGGING` 模式每 5 分钟采集一次，并把**完整样本**写进 ESP32 的 LittleFS Flash。风速、气压、空气温湿度、土壤、两路太阳辐射任一读取失败时，这一条不入库，设备每 15 秒重新采，直到下一条完整样本出现；成功后再恢复 5 分钟周期。Flash 采用两个 4032 条的轮换文件，可断电保存约 28 天，写满时滚动覆盖最早 14 天。该离线日志不依赖电脑或网络。重新连接电脑后，运行 `dual-forecast offline-log --serial-port <端口>`，即可交互式查看状态、校验并导出 CSV，或者二次确认后擦除历史并立即启动新一轮采集；记录不会自动补传进 SQLite/预测历史。
-
-### ESP32 轻量边缘预测（断网降级）
-
-完整的 N-BEATS + 两层 LSTM 继续在电脑本地边缘网关运行；它依赖 PyTorch 权重和 24 小时历史窗口，不直接移植到 Arduino。ESP32-S3 同时每 5 分钟运行一次轻量、可解释的干燥趋势估计，输入为空气温湿度、气压、土壤湿度、净短波辐射和可用风速，输出：
-
-- 未来 30 分钟土壤湿度估计；
-- 预计干燥速率（%/h）；
-- `NORMAL` / `ATTENTION` / `DRY_RISK` / `SENSOR_INVALID` 风险等级及原因。
-
-该结果会作为 `edge_prediction` 随 ESP32 JSON telemetry 发送，并显示在网页“ESP32 边缘预测（断网降级）”卡片中。它只用于离线趋势提示、传感器异常可见性和答辩中的边缘计算演示，**不会绕过电脑端安全规则，也不会直接打开 GPIO11 水阀**。
-
-完整预测接口为 `GET /v1/forecast/latest`，服务重启后从 `runtime/forecast.sqlite3` 恢复历史。若 BMP280 暂时上报 0，接收器默认临时使用 1013 hPa 作为预测回退值；安全审核仍以实时有效性为准。
-
-模型训练为可选操作：
+V1 离线记录与 V2 不兼容。升级前先通过 USB 导出旧记录：
 
 ```bash
-.venv/bin/python -m dual_forecast.cli preprocess '虹桥2018-2024逐小时气象数据.zip'
-.venv/bin/python -m dual_forecast.cli train-all '虹桥2018-2024逐小时气象数据.zip' --epochs 35
+dual-forecast offline-log --action export
 ```
 
-虹桥数据不含真实土壤湿度，初始 LSTM 使用桶式水量平衡和虚拟灌溉事件生成代理序列，不能把该指标解释为真实土壤预测精度。积累至少 14 天有效土壤观测后可运行 `retrain-observed --epochs 35`，再调用 `POST /v1/models/reload` 热更新模型。
+确认 CSV 已保存并检查后，再使用交互式二次确认或显式 `erase` 清除旧 V1 文件。固件不会静默删除或伪造迁移旧记录。
 
-## 测试与固件编译
+## 云端大模型
+
+云端是可选增强，设备在有互联网时通过 HTTPS 直接访问火山引擎 OpenAI 兼容网关。API Key、是否启用、模型名和农田档案均由 ESP32 配网页面保存到设备 NVS：
+
+- Key 不回显、不写入串口日志、遥测、SQLite 或 Git。
+- 配网页面只显示“已配置”；提交空 Key 时保留现有 Key，清除需要显式操作。
+- 网络、TLS、JSON 或网关失败只产生设备状态，**不影响**本地采集、预测和安全控制。
+- 曾经暴露在终端、聊天记录或截图中的 Key 必须在正式部署前作废并重新生成。
+
+电脑侧 `.env` 不再是云端配置位置。电脑没有网络时仍能显示设备数据；ESP32 所在局域网若没有互联网，则设备照常离线运行，云端请求显示为不可用即可。
+
+## 硬件接线
+
+| 功能 | ESP32-S3 引脚 | 接线/说明 |
+| --- | --- | --- |
+| 风速（当前使用） | GPIO6 ADC | OUT；若模块输出 0–5 V，必须分压到 0–3.3 V |
+| 风速预留 | GPIO9 | 当前不接、不采样 |
+| AHT20 | GPIO5 / GPIO8 | SDA / SCL，3.3 V，I²C 地址 0x38 |
+| HW-611 BMP280 | GPIO3 / GPIO4 | SDA / SCL，3.3 V；CSB→3.3 V；SDO→GND 通常为 0x76 |
+| ZH-SOIL7 土壤 | GPIO18 / GPIO17 | 设备 TTL UART 的 RX / TX，4800 8N1，Modbus-RTU 地址 0x03 |
+| SN-300AL 太阳辐射 | GPIO16 / GPIO15 | 经自动收发 RS485 转换器的 RO / DI；4800 8N1，地址 0x01/0x02 |
+| 水阀继电器 | GPIO11 | IN，3.3 V 单路继电器，高电平有效；上电默认 LOW |
+| Feather I²C 电源控制 | GPIO7 | 不外接，禁止复用 |
+
+土壤传感器这一版是 **TTL UART 电气层**，不是 RS485 电气层：模块的 TX 接 ESP32 GPIO18（RX），模块的 RX 接 ESP32 GPIO17（TX），并与 ESP32 共地。它传输的帧格式仍可以是 Modbus-RTU；“Modbus-RTU”是通信协议，不能据此判断必须使用 RS485。
+
+太阳辐射总线才使用 RS485：两个探头 A 对 A、B 对 B 并联，接到独立的自动收发 RS485 转换器；转换器 RO→GPIO16，DI→GPIO15。太阳 1（0x01）是反射短波，太阳 2（0x02）是入射短波，净短波为 `max(入射 - 反射, 0)`。
+
+本方案没有硬件 RTC。设备仅在 NTP 校时成功后将 ESP32 系统时钟视为可信时间；当前运行周期内即使暂时断网仍可继续采集、预测和自动灌溉，但断网重启后必须再次联网校时。
+
+水阀的低压侧：继电器 DC+/VCC 接模块要求的 3.3 V，DC-/GND 与 ESP32 共地，IN 接 GPIO11。24 V 常闭水阀的触点侧：24 V 正极→COM，NO→水阀正极，水阀负极→24 V 负极。确认继电器触点的直流额定值高于负载；24 V 不能进入 ESP32 GPIO 或继电器 IN。
+
+## ESP32 配网
+
+无已保存网络、首次烧录或收到 `@WIFI_RESET` 时，ESP32 建立 `AIOT-SETUP-xxxxxx` 热点，密码为 `12345678`，在 `http://192.168.4.1/` 配置 2.4 GHz WPA2 网络。网络凭据和云端配置仅保存在 ESP32 NVS。普通手机热点、Windows 移动热点和家用路由器可用；5 GHz、网页认证/验证码和多数 802.1X 校园网需要专门适配。
+
+## 开发：训练与模型导出
+
+训练只在开发电脑进行；生产 Dashboard 启动不需要 `artifacts/`。模型更新后执行导出，再重新烧录 ESP32：
 
 ```bash
-.venv/bin/python -m pytest -q
+.venv/bin/python scripts/export_esp32_models.py
+.venv/bin/python scripts/export_esp32_models.py --check
+```
+
+导出生成 `firmware/esp32_s3_all_sensors/generated/model_data.h`，其中包含 float32 权重、标准化器、模型版本和 SHA-256。不要手改该文件。
+
+### Arduino 依赖与编译
+
+Arduino IDE / `arduino-cli` 需安装 **ArduinoJson 7.4.2**。板型选择 `Adafruit Feather ESP32-S3 No PSRAM`，分区选择 `Default (3MB APP/1.5MB SPIFFS)`：
+
+```bash
 arduino-cli compile \
-  --fqbn esp32:esp32:adafruit_feather_esp32s3_nopsram \
-  --board-options PartitionScheme=default_8MB,CDCOnBoot=default,UploadMode=default \
+  --fqbn 'esp32:esp32:adafruit_feather_esp32s3_nopsram:PartitionScheme=default_8MB,CDCOnBoot=default,UploadMode=default' \
   --build-path /tmp/aiot-esp32-build \
   firmware/esp32_s3_all_sensors
 ```
 
-仓库未提交原始气象 ZIP，因此测试中依赖该 ZIP 的两项数据处理测试会跳过，其余云网关、安全规则、API、串口和预测流程仍会运行。假网关测试不会访问互联网或消耗 Token，也不能替代正式验收中的真实云调用。
+详细固件协议与离线日志操作见 [firmware/esp32_s3_all_sensors/README.md](firmware/esp32_s3_all_sensors/README.md)。

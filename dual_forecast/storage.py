@@ -10,7 +10,16 @@ from pathlib import Path
 import pandas as pd
 
 from .et0 import fao56_hourly_et0_from_net_shortwave
-from .schemas import DecisionResult, ForecastResponse, IrrigationAction, SensorSnapshot
+from .schemas import (
+    DecisionResult,
+    DeviceCloudResult,
+    DeviceForecast,
+    DeviceIrrigationState,
+    DeviceUiAck,
+    ForecastResponse,
+    IrrigationAction,
+    SensorSnapshot,
+)
 
 
 class Store:
@@ -45,6 +54,10 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS live_telemetry (
               id INTEGER PRIMARY KEY CHECK(id=1), received_at TEXT NOT NULL,
+              payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS device_display_cache (
+              result_type TEXT PRIMARY KEY, received_at TEXT NOT NULL,
               payload_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS llm_calls (
@@ -272,6 +285,60 @@ class Store:
             row = conn.execute("SELECT payload_json FROM forecasts ORDER BY generated_at DESC LIMIT 1").fetchone()
         return ForecastResponse.model_validate_json(row[0]) if row else None
 
+    def save_device_result(self, result_type: str, payload, received_at: datetime | None = None) -> None:
+        """Persist one latest-only device result for display consumption."""
+        received_at = received_at or datetime.now(timezone.utc)
+        payload_json = payload.model_dump_json() if hasattr(payload, "model_dump_json") else json.dumps(payload, ensure_ascii=False)
+        with self.connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO device_display_cache(result_type,received_at,payload_json) VALUES(?,?,?)",
+                (result_type, received_at.isoformat(), payload_json),
+            )
+
+    def latest_device_result(self, result_type: str) -> dict | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM device_display_cache WHERE result_type=?",
+                (result_type,),
+            ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+
+    def latest_device_results(self) -> dict[str, dict | None]:
+        return {
+            "forecast": self.latest_device_result("forecast"),
+            "irrigationState": self.latest_device_result("irrigation_state"),
+            "cloudResult": self.latest_device_result("cloud_result"),
+            "uiAck": self.latest_device_result("ui_ack"),
+        }
+
+    def save_device_forecast(self, forecast: DeviceForecast, received_at: datetime | None = None) -> None:
+        self.save_device_result("forecast", forecast, received_at)
+
+    def latest_device_forecast(self) -> DeviceForecast | None:
+        payload = self.latest_device_result("forecast")
+        return DeviceForecast.model_validate(payload) if payload else None
+
+    def save_device_irrigation_state(self, state: DeviceIrrigationState, received_at: datetime | None = None) -> None:
+        self.save_device_result("irrigation_state", state, received_at)
+
+    def latest_device_irrigation_state(self) -> DeviceIrrigationState | None:
+        payload = self.latest_device_result("irrigation_state")
+        return DeviceIrrigationState.model_validate(payload) if payload else None
+
+    def save_device_cloud_result(self, result: DeviceCloudResult, received_at: datetime | None = None) -> None:
+        self.save_device_result("cloud_result", result, received_at)
+
+    def latest_device_cloud_result(self) -> DeviceCloudResult | None:
+        payload = self.latest_device_result("cloud_result")
+        return DeviceCloudResult.model_validate(payload) if payload else None
+
+    def save_device_ui_ack(self, ack: DeviceUiAck, received_at: datetime | None = None) -> None:
+        self.save_device_result("ui_ack", ack, received_at)
+
+    def latest_device_ui_ack(self) -> DeviceUiAck | None:
+        payload = self.latest_device_result("ui_ack")
+        return DeviceUiAck.model_validate(payload) if payload else None
+
     def save_llm_call(self, request_id: str, purpose: str, context: dict,
                       *, response: dict | None = None, latency_ms: int | None = None,
                       prompt_tokens: int | None = None, completion_tokens: int | None = None,
@@ -322,6 +389,23 @@ class Store:
                 "INSERT INTO command_queue VALUES (?,?,?,?,?,?)",
                 (request_id, json.dumps(command, ensure_ascii=False), "pending",
                  datetime.now(timezone.utc).isoformat(), None, None),
+            )
+        return True
+
+    def mark_command_for_ui_transport(self, request_id: str) -> bool:
+        """Mark an already queued UI action for the v2 wire prefix."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT command_json FROM command_queue WHERE request_id=? AND status='pending'",
+                (request_id,),
+            ).fetchone()
+            if not row:
+                return False
+            command = json.loads(row["command_json"])
+            command["transport"] = "UI_COMMAND"
+            conn.execute(
+                "UPDATE command_queue SET command_json=? WHERE request_id=? AND status='pending'",
+                (json.dumps(command, ensure_ascii=False), request_id),
             )
         return True
 

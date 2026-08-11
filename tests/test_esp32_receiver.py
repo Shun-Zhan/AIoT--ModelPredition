@@ -2,17 +2,20 @@ import json
 from pathlib import Path
 
 from dual_forecast.esp32_receiver import (
+    _handle_device_result_line,
     _handle_ack_line,
     _handle_config_ack_line,
     _send_pending_commands,
     _send_pending_configs,
     esp32_message_to_snapshot,
     parse_discovery_announcement,
+    parse_device_result_line,
     resolve_mdns_fallback_endpoint,
     result_to_display_command,
     snapshot_is_complete_for_prediction,
 )
 from dual_forecast.storage import Store
+from dual_forecast.schemas import DeviceCloudResult, DeviceForecast, DeviceIrrigationState, DeviceUiAck
 
 
 def test_firmware_tcp_control_buffer_accepts_full_command_envelope():
@@ -160,6 +163,96 @@ def test_warming_up_status_without_forecast_keeps_the_display_protocol_valid():
     assert result_to_display_command(
         {"status": "warming_up", "availableSamples": 239, "requiredSamples": 288}
     ) == "DISPLAY status=warming_up samples=239/288 et0=0.000 soil=0.0\n"
+
+
+def test_v2_device_result_prefixes_are_parsed_and_cached(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    lines = [
+        ('@FORECAST {"schemaVersion":"2.0","generatedAt":"2026-08-11T08:00:00Z",'
+         '"status":"ok","nextHourEt0Mm":0.24,"soilMoistureInOneHour":42.5}',
+         "forecast", DeviceForecast),
+        ('@IRRIGATION_STATE {"schemaVersion":"2.0","updatedAt":"2026-08-11T08:00:01Z",'
+         '"state":"CLOSED","action":"NO_OP"}',
+         "irrigation_state", DeviceIrrigationState),
+        ('@CLOUD_RESULT {"schemaVersion":"2.0","updatedAt":"2026-08-11T08:00:02Z",'
+         '"status":"offline","finalAction":"NO_OP","reason":"network unavailable"}',
+         "cloud_result", DeviceCloudResult),
+        ('@UI_ACK {"schemaVersion":"2.0","updatedAt":"2026-08-11T08:00:03Z",'
+         '"requestId":"ui-request-1","accepted":true}',
+         "ui_ack", DeviceUiAck),
+    ]
+
+    for line, result_type, model_type in lines:
+        parsed = parse_device_result_line(line)
+        assert parsed is not None
+        assert parsed[0] == result_type
+        assert isinstance(parsed[1], model_type)
+        assert _handle_device_result_line(line, store)
+
+    cached = store.latest_device_results()
+    assert cached["forecast"]["schemaVersion"] == "2.0"
+    assert cached["forecast"]["soilMoistureInOneHour"] == 42.5
+    assert cached["irrigationState"]["state"] == "CLOSED"
+    assert cached["cloudResult"]["finalAction"] == "NO_OP"
+    assert cached["uiAck"]["accepted"] is True
+
+
+def test_malformed_v2_device_result_is_consumed_without_cache_write(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    assert _handle_device_result_line('@FORECAST {"schemaVersion":"1.0"}', store)
+    assert store.latest_device_forecast() is None
+
+
+def test_telemetry_receiver_updates_live_only_and_does_not_submit_snapshot(monkeypatch):
+    from argparse import Namespace
+    from dual_forecast.esp32_receiver import _ReceiverState, _handle_telemetry_message
+
+    calls = []
+
+    def submit(url, snapshot):
+        calls.append((url, snapshot))
+        return {"status": "ok"}
+
+    monkeypatch.setattr("dual_forecast.esp32_receiver.submit_snapshot", submit)
+    args = Namespace(
+        live_api_url="http://127.0.0.1:8000/v1/telemetry/live",
+        api_url="http://127.0.0.1:8000/v1/snapshots",
+        fallback_air_pressure_hpa=1013,
+        min_interval_seconds=0.1,
+        fast_test=False,
+        fast_test_interval_seconds=0.1,
+    )
+    message = {
+        "uptime_ms": 1,
+        "wind": {"ok": True, "voltage_v": 1.0, "speed_m_s": 1.0},
+        "air_pressure_hpa": 1013,
+        "air": {"ok": True, "temperature_c": 20.0, "humidity_pct": 50.0},
+        "soil": {"ok": True, "temperature_c": 20.0, "moisture_pct": 50.0},
+        "solar": {
+            "sensor_1": {"ok": True, "radiation_w_m2": 100},
+            "sensor_2": {"ok": True, "radiation_w_m2": 200},
+        },
+    }
+
+    _handle_telemetry_message(message, args, _ReceiverState())
+    assert len(calls) == 1
+    assert calls[0][0] == args.live_api_url
+
+
+def test_ui_transport_marker_emits_ui_command_prefix(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    store = Store(tmp_path / "db.sqlite")
+    command = {
+        "schemaVersion": "1.0", "requestId": "ui-request-123", "action": "STOP_WATERING",
+        "durationSeconds": None, "reasonCode": "UI", "reason": "ui action", "confidence": 1,
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), "ttlSeconds": 30,
+    }
+    assert store.enqueue_command(command)
+    assert store.mark_command_for_ui_transport(command["requestId"])
+    serial = FakeSerial()
+    _send_pending_commands(serial, store)
+    assert serial.data.startswith(b"@UI_COMMAND {")
 
 
 def test_auto_discovery_uses_the_current_udp_sender_ip():

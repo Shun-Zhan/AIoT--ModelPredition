@@ -1,168 +1,81 @@
-# ESP32-S3 全传感器与安全水阀固件
+# ESP32-S3 固件
 
-用 Arduino IDE 打开 `esp32_s3_all_sensors.ino`，板型选择 `Adafruit Feather ESP32-S3 No PSRAM`，并将 **Tools → Partition Scheme** 设为 **`Default (3MB APP/1.5MB SPIFFS)`**。不要使用默认的 TinyUF2 FATFS 分区，否则 `LittleFS.begin()` 无法挂载，串口状态会显示 `LittleFS：不可用`。当前通过 CH340 `/dev/cu.wchusbserial*` 或 Windows `COM*` 连接的实物还应设置 **USB CDC On Boot → Disabled**、**Upload Mode → UART0 / Hardware CDC**。固件只依赖 ESP32 Arduino Core 自带组件，无需额外安装 Arduino 库。正常运行通过 Wi‑Fi 把传感器数据、心跳和经本机审核的水阀命令传给电脑；USB 保留烧录、查看日志和故障排查用途。
+该目录的固件是生产业务权威：它在 ESP32-S3 本机完成传感器采集、NTP 校时、离线 V2 历史、float32 N-BEATS/SoilLSTM 推理、灌溉安全审核、水阀控制，以及可选火山引擎云端大模型调用。电脑端仅接收和显示设备消息，并转发网页请求；电脑不参与生产预测、决策或云端调用。
 
-## 引脚总表
+## IDE 与依赖
 
-| 功能 | ESP32-S3 | 外设侧 | 说明 |
-| --- | --- | --- | --- |
-| 风速（当前启用） | GPIO6 | OUT | ADC；0–5 V 必须分压到 0–3.3 V |
-| GPIO9 | 不接 | 保留给未来第二路风速；当前固件不采样 |
-| AHT20 | GPIO5 / GPIO8 | SDA / SCL | 当前启用，3.3 V，地址 0x38 |
-| DHT11 备用 | GPIO10 | OUT | 当前停用 |
-| BMP280/BME280 | GPIO3 / GPIO4 | SDA / SCL | 3.3 V；CSB→3.3 V；SDO→GND（0x76） |
-| 土壤 RS485 转换器 | GPIO18 / GPIO17 | RO / DI | 地址 0x03，4800 8N1，独立总线 |
-| 太阳 RS485 转换器 | GPIO16 / GPIO15 | RO / DI | 地址 0x01/0x02，4800 8N1，共用太阳总线 |
-| 水阀继电器 | GPIO11 | IN | 一路 3.3 V，高电平有效，上电默认 LOW |
-| 板载 I²C 电源控制 | GPIO7 | 不外接 | 程序自动拉高，禁止复用 |
+使用 Arduino IDE 打开 `esp32_s3_all_sensors.ino`。板型选择 **Adafruit Feather ESP32-S3 No PSRAM**，Tools → Partition Scheme 选择 **Default (3MB APP/1.5MB SPIFFS)**。不要选 TinyUF2 FATFS 分区，否则 LittleFS 无法挂载。
 
-土壤探头 VCC/GND/A/B 中的 A/B 必须进入 RS485 转换器，转换器 RO→GPIO18、DI→GPIO17。两个太阳探头 A/B 可在太阳总线上并联，因为地址分别为 0x01 和 0x02；它们不能与土壤总线混用。转换器应为 3.3 V UART 逻辑兼容、自动收发方向型。
+通过 CH340 `/dev/cu.wchusbserial*` 或 Windows `COM*` 烧录时，设置 USB CDC On Boot → Disabled、Upload Mode → UART0 / Hardware CDC。
 
-AHT20 与 BMP280 使用两组独立 I²C。AHT20：VCC→3.3 V、GND→GND、SDA→GPIO5、SCL→GPIO8。BMP280：VCC→3.3 V、GND→GND、SDA→GPIO3、SCL→GPIO4、CSB→3.3 V、SDO→GND。
-
-## 继电器与 24 V 常闭水阀
-
-低压控制侧：继电器 DC+/VCC→模块要求的 3.3 V，DC-/GND→ESP32 GND，IN→GPIO11。高压负载侧：24 V 正极→COM，NO→水阀正极，水阀负极→24 V 负极。COM/NO/NC 与继电器线圈电源相互独立，但触点额定直流电压和电流必须高于水阀负载。24 V 不得进入 ESP32 GPIO。
-
-固件安全行为：
-
-- `setup()` 初始化其他总线前先将 GPIO11 置 LOW。
-- 只接受 `START_WATERING`、`STOP_WATERING`、`NO_OP`。
-- START 持续时间只允许 1–60 秒，并要求最近一次融合采集完整。
-- 设备维护独立关阀计时器，不依赖电脑再次发送 STOP。
-- 8 秒收不到电脑 `@HEARTBEAT` 时提前关阀。
-- 重复 `requestId` 只回复 ACK，不重复执行。
-
-## Wi‑Fi 数据链路（当前默认）
-
-烧录这版固件后，ESP32 加入已保存的 2.4 GHz 网络并拿到 DHCP IP 后，会启动本地 TCP 数据端点：
-
-```text
-esp32-sensors.local:3333
-```
-
-电脑端 Dashboard 通过该端点接收传感器 JSON、发送心跳、采样配置和经后端安全审核后的水阀命令。因此正常运行时可拔掉 USB 数据线；USB 只保留烧录、查看启动日志、发送 `@WIFI_RESET` 和故障排查用途。
-
-同时 ESP32 每 3 秒向同一局域网广播一条 UDP 3334 发现消息。电脑端以 `--esp-host auto`（启动脚本的默认值）监听该消息并连接当前 TCP 3333 地址，因此 DHCP IP 变化、热点重启或 ESP32 重连后无需手工记 IP，也不依赖手机热点是否支持 `esp32-sensors.local` / mDNS。只有网络开启“客户端隔离”并阻止设备间 TCP 和 UDP 时，才需将 ESP32 串口打印的 `IP=...` 显式传给电脑端接收器。
-
-电脑接收器连接到 ESP32 后，所有数据仍先进入本机 FastAPI、SQLite、预测模型和安全规则；手机网页只访问电脑的 Dashboard，不直接向 ESP32 或继电器发控制命令。
-
-## USB 串口调试协议
-
-波特率 115200。每次采样发送：
-
-```text
-@TELEMETRY {JSON}
-```
-
-电脑接收器发送：
-
-```text
-@HEARTBEAT
-@COMMAND {JSON}
-@CONFIG {"schemaVersion":"1.0","requestId":"config-...","samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
-```
-
-设备响应：
-
-```text
-@ACK {"requestId":"...","accepted":true,"actualState":"OPEN","reason":"started","remainingSeconds":30}
-@CONFIG_ACK {"requestId":"config-...","accepted":true,"samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
-```
-
-`@CONFIG` 只调整传感器读取周期，和控制 GPIO11 的 `@COMMAND` 分开处理。固件白名单为：`DEBUG` 固定 2000 ms、`IRRIGATION_MONITORING` 为 2000–5000 ms、`NORMAL_MONITORING` 为 30000–120000 ms、`NIGHT_ECO` 为 300000–900000 ms、`OFFLINE_LOGGING` 固定 300000 ms（5 分钟）。无效模式/范围会被拒绝并 ACK 原有安全值。
-
-每 5 分钟，ESP32 还会在本地根据空气温湿度、气压、土壤湿度、净短波辐射和可用风速生成一个轻量趋势估计，并在 telemetry JSON 中增加：
-
-```json
-"edge_prediction": {
-  "valid": true,
-  "mode": "edge_fallback",
-  "predicted_soil_moisture_30m_pct": 36.4,
-  "drying_rate_pct_per_h": 0.580,
-  "risk_level": "ATTENTION",
-  "reason": "rapid_drying"
-}
-```
-
-它不是电脑端 N-BEATS/LSTM 的移植版，而是断网时仍可运行的低算力、可解释降级预测；只提示风险，不能直接打开水阀。
-
-太阳辐射语义固定为：RS485 地址 `0x01` 的 Solar 1 是反射短波 Rs↑，地址 `0x02` 的 Solar 2 是入射短波 Rs↓。ESP32 使用 `max(Solar2 - Solar1, 0)` 作为净短波；反射探头失败而入射探头正常时，以 `0.77 × Solar2` 作为默认反照率 α=0.23 回退。只有 Solar 2 正常的样本才可用于预测。
-
-### 脱离电脑的离线采集与保存
-
-上电或复位后，默认是 `OFFLINE_LOGGING` / 300000 ms：ESP32 自己每 5 分钟采一次，并保存到自身 Flash 的 LittleFS，不需要 USB、电脑、Dashboard 或 Wi-Fi。只要没有手动改为 `DEBUG` 等临时模式，它会一直按此周期运行。
-
-- 只有风速、气压、AHT20、土壤、Solar 1 和 Solar 2 均成功读取的**完整样本**才会写入；0 W/m² 和 0 m/s 是正常数值，不会被当成缺失。
-- 有任意传感器读失败时，该条不会进入离线历史；设备会在 15 秒后自动重试，直到获得下一条完整样本，再恢复 5 分钟节奏。
-- 数据断电不丢失。固件使用两个轮换文件，每个保留 4032 条（14 天 × 每 5 分钟一条），总计约 28 天；空间写满后滚动丢弃最早的 14 天。
-- 串口启动会显示 `[OFFLINE LOG] Ready: ...`，完整保存会显示 `[OFFLINE LOG] Saved complete sample ...`；传感器不完整会显示 `Missing sensor; retrying in 15 seconds`。
-
-电脑通过 USB 连接后，可以使用项目自带的交互式管理命令（先关闭 Arduino 串口监视器和 Dashboard 串口接收器）：
+除 ESP32 Arduino Core 外，还需安装 **ArduinoJson 7.4.2**。模型权重由仓库根目录的 `scripts/export_esp32_models.py` 生成 `generated/model_data.h`，更新模型后必须重新烧录；不要手动修改生成文件。
 
 ```bash
-dual-forecast offline-log
-```
-
-Windows 示例：
-
-```powershell
-dual-forecast offline-log
-```
-
-只有存在多个候选串口时才需要通过 `--serial-port /dev/cu.wchusbserial110` 或 `--serial-port COM3` 明确指定。USB 重插后 macOS 端口名可能变化，省略参数可以避免沿用旧名称。菜单可查看记录数量、读取全部记录并导出 `outputs/esp32-offline-log.csv`，或输入二次确认后擦除两个轮换文件。擦除成功会恢复 `OFFLINE_LOGGING` / 300000 ms，并立即安排一次新采集；传感器不完整时仍不会写入。也可使用 `--action status`、`--action export` 或 `--action erase` 非交互执行，其中擦除仍会要求输入 `ERASE`，除非显式传入 `--yes`。
-
-对应的 USB 串口协议为：
-
-```text
-@OFFLINE_LOG_STATUS
-@OFFLINE_LOG_DUMP
-@OFFLINE_LOG_ERASE CONFIRM
-```
-
-导出时固件逐条校验 magic 和 FNV-1a checksum，并在 CSV 的 `integrityOk` 字段标记结果。记录中的 `bootSessionId` 和 `uptimeMs` 可识别同一次启动内的相对顺序；当前硬件没有 RTC，因此历史记录不包含可信的真实日期时间。离线记录不会自动补传进 SQLite/预测历史，需要由上述命令主动导出。
-
-动态配置仅存 RAM；上电或复位恢复 `OFFLINE_LOGGING` / 300000 ms。水阀已打开时，固件拒绝大于 5000 ms 的周期和 `NIGHT_ECO`（原因 `valve_open_requires_fast_sampling`）。本项目不使用 Deep Sleep，因为必须持续保留继电器最长时长保护、8 秒心跳断开关阀和 USB 命令接收能力；这是一项安全设计，并非已测得的低功耗百分比。
-
-USB 模式中，Arduino 串口监视器和 `dual-forecast receive-esp32-serial` 不能同时打开。macOS 端口一般类似 `/dev/cu.wchusbserial10`，Windows 为 `COM3` 等。
-
-## 手机 Wi-Fi 配网（普通热点/路由器）
-
-固件不会把 Wi-Fi 名称或密码写在源码中。首次烧录、ESP32 未保存网络、或通过 USB 发送 `@WIFI_RESET` 后，设备会在串口打印类似：
-
-```text
------ Wi-Fi setup portal -----
-Connect phone to: AIOT-SETUP-12AB34
-Setup password: 12345678
-Open: http://192.168.4.1/
-```
-
-操作步骤：
-
-1. 手机连接串口中显示的 `AIOT-SETUP-xxxxxx`，统一密码为 `12345678`。
-2. 在手机浏览器打开 `http://192.168.4.1/`。
-3. 填入当前网络的 SSID 与密码，提交后等待约 20 秒。
-4. ESP32 会用 DHCP 自动获取 IP，并在 USB 串口打印 `Connected. SSID=... IP=...`。
-
-已保存网络会在后续上电时自动尝试连接；连接失败约 20 秒后会开启并持续保持 `AIOT-SETUP-xxxxxx`，让手机重配。真实凭据只保存在该 ESP32 的 NVS 闪存中，不会进入 Git，也不会在串口或网页回显保存的密码。
-
-支持范围：普通 **2.4 GHz** WPA2 Wi-Fi、手机热点、Windows 移动热点、家用路由器。ESP32-S3 不支持 5 GHz；需要网页跳转、扫码、验证码的校园网通常无法直接稳定接入；802.1X 学号/密码校园网需要另行按学校 EAP 认证方式适配。不要尝试绕过学校网络认证或设备接入策略。
-
-这项配网功能只让 ESP32 加入当前局域网；它不会把 Dashboard 或开阀控制暴露到公网。当前默认主链路为：
-
-```text
-ESP32 → Wi-Fi TCP → 电脑接收器 / 本地预测 / Dashboard →（可选）云端大模型
-```
-
-若使用电脑热点供手机查看 Dashboard，电脑用 `-Lan` / `--lan` 启动 Dashboard，手机和电脑连同一个热点后访问电脑 IPv4 的 `/dashboard`；这与 ESP32 是否已完成配网是两件独立的事。
-
-## 编译
-
-```bash
+.venv/bin/python scripts/export_esp32_models.py --check
 arduino-cli compile \
   --fqbn 'esp32:esp32:adafruit_feather_esp32s3_nopsram:PartitionScheme=default_8MB,CDCOnBoot=default,UploadMode=default' \
   --build-path /tmp/aiot-esp32-build \
   firmware/esp32_s3_all_sensors
 ```
 
-`WIFI_TELEMETRY_ENABLED` 当前为 `true`。它与手机配网共用保存在 ESP32 NVS 的凭据，不使用 `wifi_credentials.h`，也不设置静态 IP。若现场网络不可用，电脑端可临时用 USB 串口接收模式继续演示；水阀仍保留最长 60 秒和 8 秒无心跳自动关阀保护。
+## 引脚与接线
+
+| 功能 | ESP32-S3 | 外设侧 | 说明 |
+| --- | --- | --- | --- |
+| 风速（启用） | GPIO6 | OUT | ADC；0–5 V 信号先分压至 0–3.3 V |
+| 风速预留 | GPIO9 | 不接 | 当前不采样 |
+| AHT20 | GPIO5 / GPIO8 | SDA / SCL | 3.3 V，地址 0x38 |
+| BMP280 / HW-611 | GPIO3 / GPIO4 | SDA / SCL | 3.3 V；CSB→3.3 V；SDO→GND 常为 0x76 |
+| ZH-SOIL7 土壤 | GPIO18 / GPIO17 | TX / RX | TTL UART，4800 8N1，Modbus-RTU 地址 0x03 |
+| SN-300AL 太阳辐射 | GPIO16 / GPIO15 | RS485 转换器 RO / DI | 4800 8N1，地址 0x01/0x02 |
+| 水阀继电器 | GPIO11 | IN | 3.3 V、高电平有效；上电先置 LOW |
+| Feather I²C 电源控制 | GPIO7 | 不外接 | 固件自动拉高，禁止复用 |
+
+所有模块必须共地。本方案没有硬件 RTC：设备每次启动后先连接有互联网的 Wi-Fi，通过 NTP 校准 ESP32 系统时钟；Wi-Fi 连通后约 5 秒开始校时重试。校时成功前预测状态为 `clock_unset`，自动灌溉不会开启。校时成功后，在本次运行周期内即使暂时断网，设备仍可继续采集、预测和自动灌溉；断网重启则需再次 NTP 校时。
+
+**土壤不是 RS485 电气层。** 该版本的 ZH-SOIL7 使用 TTL UART：传感器 TX→GPIO18（ESP32 RX），传感器 RX→GPIO17（ESP32 TX），共地。它的帧协议仍为 Modbus-RTU；协议不等于电气层，因此不要额外串接 RS485 转换器。
+
+太阳辐射才需要 RS485 转换器：两个太阳探头 A 对 A、B 对 B 并联在独立太阳总线上，转换器 RO→GPIO16，DI→GPIO15。地址 0x01 是反射短波，0x02 是入射短波；净短波为 `max(入射 - 反射, 0)`。
+
+继电器控制侧：DC+/VCC→模块要求的 3.3 V，DC-/GND→ESP32 GND，IN→GPIO11。24 V 常闭水阀的触点侧：24 V 正极→COM，NO→水阀正极，水阀负极→24 V 负极。24 V 不得接入 GPIO 或 IN；触点额定直流电压/电流应高于水阀负载。
+
+## 离线记录、预测与安全
+
+上电默认是 `OFFLINE_LOGGING`，每 **5 分钟**尝试写入一个完整样本。任一必需传感器失败时，该样本不会写入；设备每 15 秒重试，跨越本 slot 后记录缺口，新的连续窗口从下一条完整样本开始。
+
+- V2 记录包含版本、记录长度、序号、UTC epoch、五分钟 slot、有效传感器标志和 CRC。
+- 从 LittleFS 的轮换文件恢复最新连续 288 条 V2 记录。288 条完整的五分钟样本等于 24 小时，可立即推理。
+- V1 与 V2 不兼容。升级前先用 `dual-forecast offline-log --action export` 导出 CSV；确认文件可用后，才通过明确 `erase` 操作清除旧记录。固件不静默清空 V1。
+- 本方案不使用硬件 RTC。设备在 NTP 校时成功后可将系统时钟作为当前运行周期的可信时间源；断网重启后回到 `clock_unset`，直到再次 NTP 校时。时间无效、窗口未满、缺失数据或模型错误时，仅允许 `edge_prediction` 风险提示，禁止自动开阀。
+- 自动模式只保存在 RAM，**每次重启默认关闭**。即使人工打开自动模式，也要满足完整传感器、预测就绪、冷却、单次 60 秒和每日 600 秒限额。
+- 本地自动开阀不依赖电脑心跳；PC 发起的调试/人工开阀仍受传输心跳保护。任何状态都接受 STOP 并关阀。
+
+## Wi-Fi、云端与配网
+
+首次烧录、没有已保存网络或收到 `@WIFI_RESET` 时，设备会创建 `AIOT-SETUP-xxxxxx` 配置热点，密码 `12345678`，页面为 `http://192.168.4.1/`。支持 2.4 GHz WPA2 网络、手机热点和 Windows 移动热点；5 GHz、网页认证和 802.1X 校园网需额外适配。
+
+配网页面保存 Wi-Fi 凭据，以及云端开关、模型名、农田档案和 API Key。云端 Key 只保存在 ESP32 NVS：页面只显示是否已配置，绝不回显、写日志、出现在遥测或提交到 Git。空 Key 更新保留旧 Key；清除是显式操作。
+
+设备通过 HTTPS 直接调用火山引擎网关，并验证根证书；禁止使用 `setInsecure()`。云端网络/TLS/JSON/服务失败时只返回离线状态，采集、预测和本地安全闭环继续运行。正式部署前应作废历史聊天、终端或截图中泄露过的 Key。
+
+## 与 Dashboard 的协议
+
+设备上行：
+
+```text
+@TELEMETRY { ... }
+@FORECAST { "schemaVersion":"2.0", ... }
+@IRRIGATION_STATE { "schemaVersion":"2.0", ... }
+@CLOUD_RESULT { "schemaVersion":"2.0", ... }
+@UI_ACK { "schemaVersion":"2.0", ... }
+```
+
+电脑/网页下行：
+
+```text
+@UI_COMMAND { "action":"SET_AUTO_MODE" | "CONFIRM_WATERING" | "CANCEL" | "STOP_WATERING" | "CLOUD_ANALYZE" | "CLOUD_CHAT", ... }
+```
+
+设备对所有开阀请求重新执行完整安全审核。Dashboard 的按钮表示“已请求”，不是“已执行”；以 `@UI_ACK` 和 `@IRRIGATION_STATE` 中的设备状态为准。
+
+Wi-Fi 模式下设备以 UDP 3334 广播、TCP 3333 提供遥测端点；电脑可自动发现。USB 波特率为 115200，Arduino 串口监视器不能与电脑接收器同时占用该端口。

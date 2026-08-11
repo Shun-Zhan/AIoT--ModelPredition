@@ -73,13 +73,12 @@ def test_manual_debug_open_is_short_and_uses_the_same_local_safety_gate(tmp_path
     })
     assert store.command_status(queued["requestId"])["status"] == "acked"
 
-    svc2, store2 = service(tmp_path / "invalid")
+    svc2, store2 = service(tmp_path / "zero-moisture")
     store2.save_live_snapshot(snapshot(moisture=0), datetime.now(timezone.utc))
-    rejected = svc2.queue_debug_actuation(IrrigationAction.START_WATERING)
-    assert not rejected["queued"]
-    assert rejected["status"] == "rejected"
-    assert any("incomplete" in reason for reason in rejected["safetyReasons"])
-    assert store2.claim_pending_commands() == []
+    zero_moisture = svc2.queue_debug_actuation(IrrigationAction.START_WATERING)
+    assert zero_moisture["queued"]
+    assert zero_moisture["durationSeconds"] == 5
+    assert store2.claim_pending_commands()[0]["action"] == "START_WATERING"
 
 
 def test_manual_debug_close_can_always_be_queued(tmp_path):
@@ -174,18 +173,17 @@ def test_expired_and_incomplete_sensor_decisions_are_rejected(tmp_path):
     assert any("incomplete" in item for item in invalid.safetyReasons)
 
 
-def test_zero_soil_moisture_cannot_become_or_execute_a_candidate(tmp_path):
+def test_zero_soil_moisture_can_become_or_execute_a_candidate(tmp_path):
     svc, store = service(tmp_path)
     store.save_live_snapshot(snapshot(moisture=0), datetime.now(timezone.utc))
     context = svc.current_context("request-zero-soil")
 
-    assert not context.current["allSensorsValid"]
-    assert context.constraints["edgeRisk"]["riskLevel"] == "ATTENTION"
+    assert context.current["allSensorsValid"]
+    assert context.constraints["edgeRisk"]["riskLevel"] == "IRRIGATION_CANDIDATE"
     result = svc.evaluate(decision("request-zero-soil"), context, trigger="test")
-    assert result.status == "rejected"
-    assert result.finalAction == IrrigationAction.NO_OP
-    assert any("incomplete" in reason for reason in result.safetyReasons)
-    assert store.claim_pending_commands() == []
+    assert result.status == "awaiting_confirmation"
+    assert result.finalAction == IrrigationAction.START_WATERING
+    assert result.safetyReasons == []
 
 
 def test_governance_only_historical_decisions_are_not_sent_back_to_cloud(tmp_path):

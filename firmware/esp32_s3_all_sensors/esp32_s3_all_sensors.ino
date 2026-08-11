@@ -4,13 +4,13 @@
   Sensors:
     1. Selectable AHT20 or DHT11 air temperature/humidity sensor
     2. HW-611 / BMP280 or BME280 air pressure sensor over I2C
-    3. ZH-SOIL7 soil sensor over RS485 / Modbus-RTU, 9600 8N1
+    3. ZH-SOIL7 soil sensor over direct TTL UART carrying Modbus-RTU frames
     4. SN-300AL-RA-N01 solar sensor 1: reflected shortwave Rs↑, RS485/Modbus
     5. SN-300AL-RA-N01 solar sensor 2: incoming shortwave Rs↓, RS485/Modbus
     6. Two analog wind speed sensors on GPIO9 and GPIO6 / ADC1
 
   Important:
-    The soil sensor and solar sensors use separate RS485 / Modbus-RTU buses.
+    Soil uses direct TTL UART; the solar sensors use a separate RS485 bus.
     All devices use 4800 8N1. The soil address is 0x03; solar addresses are
     0x01 and 0x02.
 
@@ -31,6 +31,28 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
+#include <ArduinoJson.h>
+#include <esp_heap_caps.h>
+#include <time.h>
+#include <sys/time.h>
+
+#include "cloud_gateway.h"
+#include "device_runtime.h"
+#include "edge_model.h"
+
+// Synthetic history exists only for a controlled, relay-locked bench test.
+// A generated fixture file may be present in a working tree, so its presence
+// must never turn a deployed field device into test mode by accident.
+#ifndef AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE
+#define AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE 0
+#endif
+
+#if AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE && \
+    __has_include("generated/synthetic_history_fixture.h")
+#include "generated/synthetic_history_fixture.h"
+#else
+#define AIOT_TEST_HISTORY_FIXTURE_ENABLED 0
+#endif
 
 // -------------------- Common --------------------
 
@@ -55,6 +77,11 @@ static const uint32_t EDGE_PREDICTION_INTERVAL_MS = 5UL * 60UL * 1000UL;
 static const bool USB_SERIAL_TELEMETRY_ENABLED = true;
 static const char *USB_TELEMETRY_PREFIX = "@TELEMETRY ";
 static const char *USB_COMMAND_PREFIX = "@COMMAND ";
+static const char *USB_UI_COMMAND_PREFIX = "@UI_COMMAND ";
+static const char *USB_UI_ACK_PREFIX = "@UI_ACK ";
+static const char *USB_FORECAST_PREFIX = "@FORECAST ";
+static const char *USB_IRRIGATION_STATE_PREFIX = "@IRRIGATION_STATE ";
+static const char *USB_CLOUD_RESULT_PREFIX = "@CLOUD_RESULT ";
 static const char *USB_ACK_PREFIX = "@ACK ";
 static const char *USB_CONFIG_PREFIX = "@CONFIG ";
 static const char *USB_CONFIG_ACK_PREFIX = "@CONFIG_ACK ";
@@ -62,6 +89,7 @@ static const char *USB_WIFI_RESET_COMMAND = "@WIFI_RESET";
 static const char *USB_OFFLINE_LOG_STATUS_COMMAND = "@OFFLINE_LOG_STATUS";
 static const char *USB_OFFLINE_LOG_DUMP_COMMAND = "@OFFLINE_LOG_DUMP";
 static const char *USB_OFFLINE_LOG_ERASE_COMMAND = "@OFFLINE_LOG_ERASE CONFIRM";
+static const size_t HOST_CONTROL_LINE_CAPACITY = 1024;
 
 // -------------------- Water valve relay --------------------
 
@@ -77,7 +105,12 @@ static const uint32_t HOST_HEARTBEAT_TIMEOUT_MS = 8000;
 bool valveOpen = false;
 uint32_t valveCloseAtMs = 0;
 uint32_t lastHostHeartbeatMs = 0;
+uint32_t valveOpenedAtMs = 0;
+bool valveRequiresHostHeartbeat = true;
+bool valveOpenedByLocalAuto = false;
 bool latestSensorSnapshotValid = false;
+bool tcpClientJustConnected = false;
+uint32_t lastTcpTelemetryEmitMs = 0;
 char activeRequestId[101] = {};
 char lastRequestId[101] = {};
 uint32_t readIntervalMs = DEFAULT_READ_INTERVAL_MS;
@@ -119,6 +152,7 @@ static const uint16_t TCP_DISCOVERY_PORT = 3334;
 static const uint32_t TCP_DISCOVERY_INTERVAL_MS = 3000;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 static const uint32_t WIFI_STATUS_PRINT_INTERVAL_MS = 10000;
+static const uint32_t TCP_DISPLAY_REFRESH_INTERVAL_MS = 2000;
 
 // -------------------- M-series UART display --------------------
 
@@ -196,12 +230,12 @@ static const uint8_t BMP280_ADDR_FALLBACK = 0x77;
 static const uint8_t BMP280_CHIP_ID = 0x58;
 static const uint8_t BME280_CHIP_ID = 0x60;
 
-// -------------------- Soil RS485 / Modbus-RTU --------------------
+// -------------------- Soil TTL UART / Modbus-RTU --------------------
 
-// Uses its own 3.3V auto-direction RS485 converter.
-static const int SOIL_RS485_RX_PIN = 18;       // ESP32-S3 RX <- converter RO
-static const int SOIL_RS485_TX_PIN = 17;       // ESP32-S3 TX -> converter DI
-static const int SOIL_RS485_DE_RE_PIN = -1;    // -1 for auto-direction module
+// ZH-SOIL7 exposes TTL TX/RX directly; do not insert an RS485 transceiver.
+static const int SOIL_UART_RX_PIN = 18;        // ESP32-S3 RX <- sensor TX
+static const int SOIL_UART_TX_PIN = 17;        // ESP32-S3 TX -> sensor RX
+static const int SOIL_UART_DE_RE_PIN = -1;     // no direction pin on TTL UART
 static const uint32_t SOIL_BAUD = 4800;
 static const uint8_t SOIL_ADDR = 0x03;
 static const uint16_t SOIL_START_REG = 0x0000;
@@ -375,6 +409,86 @@ struct __attribute__((packed)) OfflineLogRecord {
 bool offlineLogReady = false;
 uint32_t offlineLogBootSessionId = 0;
 uint32_t lastOfflineLogSavedMs = 0;
+
+// -------------------- ESP32 authoritative runtime V2 --------------------
+
+static const char *DEVICE_V2_CURRENT_PATH = "/aiot-v2-current.bin";
+static const char *DEVICE_V2_PREVIOUS_PATH = "/aiot-v2-previous.bin";
+static const uint16_t DEVICE_V2_RECORDS_PER_FILE = 4032;
+static const uint32_t DEVICE_NTP_INITIAL_RETRY_INTERVAL_MS = 5000;
+static const uint32_t DEVICE_NTP_RETRY_INTERVAL_MS = 60000;
+static const uint32_t DEVICE_STATUS_INTERVAL_MS = 5000;
+static const int32_t DEVICE_LOCAL_UTC_OFFSET_SECONDS = 8 * 60 * 60;
+// The model kernels use less than 4 KB of call stack. Keep the worker stack
+// in internal SRAM: a large ordinary allocation can be routed to PSRAM, while
+// FreeRTOS stack diagnostics and cache-disabled paths must not touch PSRAM.
+static const uint32_t DEVICE_INFERENCE_TASK_STACK_BYTES = 16 * 1024;
+
+enum DeviceClockSource : uint8_t {
+  DEVICE_CLOCK_UNSET = 0,
+  DEVICE_CLOCK_NTP,
+};
+
+struct DeviceForecastState {
+  char status[24];
+  bool valid;
+  uint32_t generatedEpochUtc;
+  uint16_t availableSamples;
+  uint32_t timestampsUtc[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR];
+  float et0Mm[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR];
+  float soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR];
+  float nextHourEt0Mm;
+};
+
+DeviceRuntime DeviceRuntimeInstance;
+DeviceForecastState deviceForecast = {};
+DeviceSensorSample latestDeviceSample = {};
+edge_model::ModelInput deviceModelInput = {};
+edge_model::ModelOutput deviceModelOutput = {};
+DeviceRuntimeRecordV2 deviceHistoryScratch[DEVICE_RUNTIME_RING_CAPACITY] = {};
+TaskHandle_t deviceInferenceTaskHandle = nullptr;
+TaskHandle_t cloudWorkerTaskHandle = nullptr;
+portMUX_TYPE deviceStateMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool deviceInferenceBusy = false;
+volatile bool deviceInferenceRequested = false;
+volatile bool deviceForecastPendingEmit = false;
+volatile bool cloudWorkerRequested = false;
+bool deviceV2Ready = false;
+bool deviceClockValid = false;
+bool deviceNtpStarted = false;
+bool deviceNtpClockValid = false;
+DeviceClockSource deviceClockSource = DEVICE_CLOCK_UNSET;
+bool deviceSyntheticHistoryActive = false;
+bool deviceSyntheticHistoryInjected = false;
+uint32_t deviceLastNtpAttemptMs = 0;
+uint32_t deviceLastStatusEmitMs = 0;
+uint32_t deviceLastSavedSlot = UINT32_MAX;
+uint32_t deviceDailyWateredSeconds = 0;
+uint32_t deviceWateringDayUtc = 0;
+uint32_t deviceLastWateringEpochUtc = 0;
+uint32_t deviceValveOpenEpochUtc = 0;
+DeviceIrrigationEvaluation latestIrrigationEvaluation = {
+    false, false, false, false, false, false, 0, 0.0f,
+    DEVICE_IRRIGATION_AUTO_DISABLED};
+
+// Private function prototypes for the device-authoritative business layer.
+void sendDeviceProtocol(const char *prefix, const JsonDocument &document);
+void initDeviceRuntime();
+void serviceDeviceRuntime();
+void processDeviceRuntimeSample(const SensorSnapshot &snapshot);
+void handleDeviceUiCommand(const char *json);
+static bool deviceManualStartAllowed(uint32_t durationSeconds, const char *requestId);
+void emitDeviceForecast();
+void emitDeviceIrrigationState(const char *requestId = nullptr);
+void emitDeviceCloudResult(const CloudGatewayResult &result);
+bool appendDeviceV2Record(const DeviceRuntimeRecordV2 &record);
+void closeValveForSafety(const char *reason);
+void setValveRelay(bool open);
+static bool deviceReadTrustedEpoch(uint32_t &epochUtc);
+static const char *deviceClockSourceText();
+static void deviceTryInjectSyntheticHistory();
+static bool deviceSyntheticHistoryBlocksValve();
+static bool deviceRunModelInference(edge_model::ModelOutput &result);
 
 uint32_t offlineLogChecksum(const uint8_t *data, size_t length) {
   // FNV-1a is sufficient here to detect a torn/corrupt flash record before
@@ -624,16 +738,48 @@ struct EdgePrediction {
   uint32_t updatedUptimeMs;
 };
 
+SensorSnapshot lastTelemetrySnapshot = {};
+EdgePrediction lastTelemetryEdgePrediction = {};
+bool lastTelemetrySnapshotAvailable = false;
+
 EdgePrediction latestEdgePrediction = {
     false, 0.0f, 0.0f, "SENSOR_INVALID", "sensor_invalid", 0};
 uint32_t lastEdgePredictionMs = 0;
 
 void setValveRelay(bool open) {
+  const bool wasOpen = valveOpen;
+  if (open && !wasOpen) {
+    valveOpenedAtMs = millis();
+    deviceValveOpenEpochUtc = latestDeviceSample.epochUtc;
+  } else if (!open && wasOpen) {
+    const uint32_t elapsedSeconds =
+        min<uint32_t>((millis() - valveOpenedAtMs + 999) / 1000,
+                      DEVICE_RUNTIME_SINGLE_WATERING_SECONDS);
+    const uint32_t nowEpochUtc = latestDeviceSample.epochUtc;
+    const uint32_t dayUtc = nowEpochUtc / 86400UL;
+    if (dayUtc != 0 && dayUtc != deviceWateringDayUtc) {
+      deviceWateringDayUtc = dayUtc;
+      deviceDailyWateredSeconds = 0;
+    }
+    deviceDailyWateredSeconds = min<uint32_t>(
+        DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS,
+        deviceDailyWateredSeconds + elapsedSeconds);
+    if (nowEpochUtc != 0) deviceLastWateringEpochUtc = nowEpochUtc;
+    Preferences irrigationPreferences;
+    if (irrigationPreferences.begin("aiot_irrig", false)) {
+      irrigationPreferences.putUInt("day_utc", deviceWateringDayUtc);
+      irrigationPreferences.putUInt("daily_sec", deviceDailyWateredSeconds);
+      irrigationPreferences.putUInt("last_epoch", deviceLastWateringEpochUtc);
+      irrigationPreferences.end();
+    }
+  }
   valveOpen = open;
   digitalWrite(VALVE_RELAY_PIN,
                open == VALVE_RELAY_ACTIVE_HIGH ? HIGH : LOW);
   if (!open) {
     valveCloseAtMs = 0;
+    valveRequiresHostHeartbeat = true;
+    valveOpenedByLocalAuto = false;
   }
 }
 
@@ -780,12 +926,13 @@ void handleValveCommand(const char *json) {
       sendValveAck(requestId, false, "invalid_duration");
       return;
     }
-    if (!latestSensorSnapshotValid) {
-      sendValveAck(requestId, false, "sensor_invalid");
+    if (!deviceManualStartAllowed(static_cast<uint32_t>(durationSeconds), requestId)) {
       return;
     }
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
+    valveRequiresHostHeartbeat = true;
+    valveOpenedByLocalAuto = false;
     setValveRelay(true);
     valveCloseAtMs = millis() + static_cast<uint32_t>(durationSeconds) * 1000;
     lastHostHeartbeatMs = millis();
@@ -825,6 +972,9 @@ void handleHostControlLine(const char *line, bool allowWifiReset) {
   } else if (allowWifiReset &&
              strcmp(line, USB_OFFLINE_LOG_ERASE_COMMAND) == 0) {
     eraseOfflineLogAndRestart();
+  } else if (strncmp(line, USB_UI_COMMAND_PREFIX,
+                     strlen(USB_UI_COMMAND_PREFIX)) == 0) {
+    handleDeviceUiCommand(line + strlen(USB_UI_COMMAND_PREFIX));
   } else if (strncmp(line, USB_COMMAND_PREFIX, strlen(USB_COMMAND_PREFIX)) == 0) {
     lastHostHeartbeatMs = millis();
     handleValveCommand(line + strlen(USB_COMMAND_PREFIX));
@@ -836,7 +986,7 @@ void handleHostControlLine(const char *line, bool allowWifiReset) {
 }
 
 void serviceUsbControl() {
-  static char line[1024] = {};
+  static char line[HOST_CONTROL_LINE_CAPACITY] = {};
   static size_t length = 0;
   while (Serial.available()) {
     const int value = Serial.read();
@@ -854,8 +1004,760 @@ void serviceUsbControl() {
 
   if (valveOpen && static_cast<int32_t>(millis() - valveCloseAtMs) >= 0) {
     closeValveForSafety("duration_timeout_closed");
-  } else if (valveOpen && millis() - lastHostHeartbeatMs > HOST_HEARTBEAT_TIMEOUT_MS) {
+  } else if (valveOpen && valveRequiresHostHeartbeat &&
+             millis() - lastHostHeartbeatMs > HOST_HEARTBEAT_TIMEOUT_MS) {
     closeValveForSafety("host_heartbeat_timeout_closed");
+  }
+}
+
+// -------------------- Device-authoritative prediction and control --------------------
+
+static bool deviceFinite(float value) { return isfinite(value) != 0; }
+
+static bool deviceReadTrustedEpoch(uint32_t &epochUtc) {
+  const time_t systemNow = time(nullptr);
+  if (deviceNtpClockValid &&
+      deviceRuntimeIsValidUtcEpoch(static_cast<uint32_t>(systemNow))) {
+    epochUtc = static_cast<uint32_t>(systemNow);
+    deviceClockValid = true;
+    deviceClockSource = DEVICE_CLOCK_NTP;
+    return true;
+  }
+
+  epochUtc = 0;
+  deviceClockValid = false;
+  deviceClockSource = DEVICE_CLOCK_UNSET;
+  return false;
+}
+
+static const char *deviceClockSourceText() {
+  switch (deviceClockSource) {
+    case DEVICE_CLOCK_NTP: return "ntp";
+    default: return "unset";
+  }
+}
+
+static void deviceSetSystemClock(uint32_t epochUtc) {
+  if (!deviceRuntimeIsValidUtcEpoch(epochUtc)) return;
+  timeval tv = {};
+  tv.tv_sec = static_cast<time_t>(epochUtc);
+  settimeofday(&tv, nullptr);
+}
+
+static float deviceSaturationVaporPressure(float temperatureC) {
+  return 0.6108f * expf(17.27f * temperatureC / (temperatureC + 237.3f));
+}
+
+static float deviceFao56HourlyEt0(float temperatureC, float humidityPercent,
+                                  float windMs, float netShortwaveWm2,
+                                  float pressureKpa) {
+  const float rh = constrain(humidityPercent, 0.0f, 100.0f);
+  const float wind = max(windMs, 0.0f);
+  const float es = deviceSaturationVaporPressure(temperatureC);
+  const float ea = es * rh / 100.0f;
+  const float delta = 4098.0f * es / sq(temperatureC + 237.3f);
+  const float gamma = 0.000665f * pressureKpa;
+  const float rn = max(netShortwaveWm2, 0.0f) * 0.0036f;
+  const float numerator = 0.408f * delta * rn +
+                          gamma * (37.0f / (temperatureC + 273.0f)) *
+                              wind * (es - ea);
+  const float denominator = delta + gamma * (1.0f + 0.34f * wind);
+  return max(numerator / max(denominator, 1e-9f), 0.0f);
+}
+
+static bool deviceRecordFileValid(const char *path) {
+  if (!offlineLogReady || !LittleFS.exists(path)) return true;
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file) return false;
+  const bool valid = file.size() % sizeof(DeviceRuntimeRecordV2) == 0;
+  file.close();
+  return valid;
+}
+
+static size_t deviceRecordCount(const char *path) {
+  if (!offlineLogReady || !LittleFS.exists(path)) return 0;
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file) return 0;
+  const size_t count = file.size() / sizeof(DeviceRuntimeRecordV2);
+  file.close();
+  return count;
+}
+
+static bool deviceReadHistoryFile(const char *path) {
+  if (!offlineLogReady || !LittleFS.exists(path)) return true;
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file) return false;
+  DeviceRuntimeRecordV2 record = {};
+  while (file.read(reinterpret_cast<uint8_t *>(&record), sizeof(record)) == sizeof(record)) {
+    if (deviceRuntimeRecordIsValid(record)) {
+      DeviceRuntimeInstance.history().appendRecord(record);
+    }
+  }
+  file.close();
+  return true;
+}
+
+bool appendDeviceV2Record(const DeviceRuntimeRecordV2 &record) {
+  if (!deviceV2Ready) return false;
+  if (deviceRecordCount(DEVICE_V2_CURRENT_PATH) >= DEVICE_V2_RECORDS_PER_FILE) {
+    LittleFS.remove(DEVICE_V2_PREVIOUS_PATH);
+    if (LittleFS.exists(DEVICE_V2_CURRENT_PATH) &&
+        !LittleFS.rename(DEVICE_V2_CURRENT_PATH, DEVICE_V2_PREVIOUS_PATH)) {
+      return false;
+    }
+  }
+  File file = LittleFS.open(DEVICE_V2_CURRENT_PATH, FILE_APPEND);
+  if (!file) return false;
+  const bool written = file.write(reinterpret_cast<const uint8_t *>(&record),
+                                  sizeof(record)) == sizeof(record);
+  file.close();
+  return written;
+}
+
+static void deviceLoadIrrigationCounters() {
+  Preferences preferences;
+  if (!preferences.begin("aiot_irrig", true)) return;
+  deviceWateringDayUtc = preferences.getUInt("day_utc", 0);
+  deviceDailyWateredSeconds = preferences.getUInt("daily_sec", 0);
+  deviceLastWateringEpochUtc = preferences.getUInt("last_epoch", 0);
+  preferences.end();
+}
+
+static void deviceRestoreHistory() {
+  deviceV2Ready = offlineLogReady &&
+                  deviceRecordFileValid(DEVICE_V2_CURRENT_PATH) &&
+                  deviceRecordFileValid(DEVICE_V2_PREVIOUS_PATH);
+  if (!deviceV2Ready) {
+    Serial.println("[DEVICE V2] Invalid record file; export and explicitly erase before reuse.");
+    return;
+  }
+  deviceReadHistoryFile(DEVICE_V2_PREVIOUS_PATH);
+  deviceReadHistoryFile(DEVICE_V2_CURRENT_PATH);
+  const DeviceRuntimeRecordV2 *latest = DeviceRuntimeInstance.history().latest();
+  if (latest != nullptr) {
+    deviceLastSavedSlot = latest->epoch / DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+    latestDeviceSample.epochUtc = latest->epoch;
+  }
+  Serial.printf("[DEVICE V2] Restored %u/%u continuous records.\n",
+                DeviceRuntimeInstance.history().count(), DEVICE_RUNTIME_RING_CAPACITY);
+}
+
+static void deviceSetForecastStatus(const char *status) {
+  portENTER_CRITICAL(&deviceStateMux);
+  memset(&deviceForecast, 0, sizeof(deviceForecast));
+  strlcpy(deviceForecast.status, status, sizeof(deviceForecast.status));
+  deviceForecast.availableSamples = DeviceRuntimeInstance.history().count();
+  portEXIT_CRITICAL(&deviceStateMux);
+}
+
+static void deviceBuildModelInput() {
+  const size_t count = DeviceRuntimeInstance.history().copyChronological(
+      deviceHistoryScratch, DEVICE_RUNTIME_RING_CAPACITY);
+  if (count != DEVICE_RUNTIME_RING_CAPACITY) return;
+
+  for (size_t index = 0; index < count; ++index) {
+    const DeviceRuntimeRecordV2 &record = deviceHistoryScratch[index];
+    const uint32_t localEpoch = record.epoch + DEVICE_LOCAL_UTC_OFFSET_SECONDS;
+    const float hour = static_cast<float>((localEpoch / 3600UL) % 24UL) +
+                       static_cast<float>((localEpoch / 60UL) % 60UL) / 60.0f;
+    deviceModelInput.soil[index][0] = record.soilMoisturePercent;
+    deviceModelInput.soil[index][1] = record.soilTemperatureC;
+    deviceModelInput.soil[index][2] = record.airTemperatureC;
+    deviceModelInput.soil[index][3] = record.airHumidityPercent;
+    deviceModelInput.soil[index][4] = max(record.solarIncomingWm2 -
+                                              record.solarReflectedWm2,
+                                          0.0f);
+    deviceModelInput.soil[index][5] = record.windSpeedMs;
+    deviceModelInput.soil[index][6] = record.airPressureHpa / 10.0f;
+    deviceModelInput.soil[index][7] = sinf(2.0f * PI * hour / 24.0f);
+    deviceModelInput.soil[index][8] = cosf(2.0f * PI * hour / 24.0f);
+  }
+
+  uint32_t hourKey[25] = {};
+  float sums[25][5] = {};
+  uint16_t counts[25] = {};
+  size_t hourCount = 0;
+  for (size_t index = 0; index < count; ++index) {
+    const DeviceRuntimeRecordV2 &record = deviceHistoryScratch[index];
+    const uint32_t key = (record.epoch + DEVICE_LOCAL_UTC_OFFSET_SECONDS) / 3600UL;
+    size_t bucket = hourCount;
+    if (bucket == 0 || hourKey[bucket - 1] != key) {
+      if (hourCount >= 25) return;
+      hourKey[hourCount++] = key;
+      bucket = hourCount - 1;
+    }
+    sums[bucket][0] += record.airTemperatureC;
+    sums[bucket][1] += record.airHumidityPercent;
+    sums[bucket][2] += record.windSpeedMs;
+    sums[bucket][3] += max(record.solarIncomingWm2 - record.solarReflectedWm2, 0.0f);
+    sums[bucket][4] += record.airPressureHpa / 10.0f;
+    ++counts[bucket];
+  }
+  if (hourCount < edge_model::kEt0InputSize) return;
+  const size_t firstHour = hourCount - edge_model::kEt0InputSize;
+  for (size_t index = 0; index < edge_model::kEt0InputSize; ++index) {
+    const size_t bucket = firstHour + index;
+    const float divisor = static_cast<float>(max<uint16_t>(counts[bucket], 1));
+    deviceModelInput.et0[index] = deviceFao56HourlyEt0(
+        sums[bucket][0] / divisor, sums[bucket][1] / divisor,
+        sums[bucket][2] / divisor, sums[bucket][3] / divisor,
+        sums[bucket][4] / divisor);
+  }
+}
+
+static void deviceInferenceTask(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    portENTER_CRITICAL(&deviceStateMux);
+    deviceInferenceRequested = false;
+    deviceInferenceBusy = true;
+    portEXIT_CRITICAL(&deviceStateMux);
+    // Keep the result in static storage so worker-stack diagnostics are not
+    // affected by the output object itself.
+    memset(&deviceModelOutput, 0, sizeof(deviceModelOutput));
+    const bool valid = deviceRunModelInference(deviceModelOutput);
+    portENTER_CRITICAL(&deviceStateMux);
+    if (valid) {
+      deviceForecast.valid = true;
+      deviceForecast.generatedEpochUtc = latestDeviceSample.epochUtc;
+      deviceForecast.nextHourEt0Mm = deviceModelOutput.et0Mm;
+      deviceForecast.availableSamples = DEVICE_RUNTIME_RING_CAPACITY;
+      const uint32_t base = latestDeviceSample.epochUtc;
+      float weights[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR] = {};
+      float weightSum = 0.0f;
+      for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
+        const uint32_t timestamp = base + (index + 1) * DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+        const uint32_t localEpoch = timestamp + DEVICE_LOCAL_UTC_OFFSET_SECONDS;
+        const float localHour = static_cast<float>((localEpoch / 3600UL) % 24UL) +
+                                static_cast<float>((localEpoch / 60UL) % 60UL) / 60.0f;
+        weights[index] = max(sinf(PI * (localHour - 6.0f) / 12.0f), 0.0f);
+        weightSum += weights[index];
+        deviceForecast.timestampsUtc[index] = timestamp;
+        deviceForecast.soilMoisturePercent[index] =
+            deviceModelOutput.soilMoisturePercent[index];
+      }
+      for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
+        const float weight = weightSum > 0.0f ? weights[index] / weightSum : 1.0f / 12.0f;
+        deviceForecast.et0Mm[index] = deviceModelOutput.et0Mm * weight;
+      }
+      strlcpy(deviceForecast.status, "ok", sizeof(deviceForecast.status));
+    } else {
+      deviceForecast.valid = false;
+      strlcpy(deviceForecast.status, "model_error", sizeof(deviceForecast.status));
+    }
+    deviceInferenceBusy = false;
+    deviceForecastPendingEmit = true;
+    portEXIT_CRITICAL(&deviceStateMux);
+  }
+}
+
+static bool deviceRunModelInference(edge_model::ModelOutput &result) {
+#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+  return edge_model::predictEt0(deviceModelInput.et0, &result.et0Mm) &&
+         edge_model::predictSoil(deviceModelInput.soil,
+                                  result.soilMoisturePercent);
+#else
+  return edge_model::predict(deviceModelInput, result);
+#endif
+}
+
+static void deviceCloudWorkerTask(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    CloudGatewayInstance.runWorkerOnce();
+  }
+}
+
+void sendDeviceProtocol(const char *prefix, const JsonDocument &document) {
+  String payload;
+  serializeJson(document, payload);
+  payload += '\n';
+  Serial.print(prefix);
+  Serial.print(payload);
+  if (WIFI_TELEMETRY_ENABLED && TcpClient && TcpClient.connected()) {
+    TcpClient.print(prefix);
+    TcpClient.print(payload);
+  }
+}
+
+void emitDeviceForecast() {
+  JsonDocument document;
+  portENTER_CRITICAL(&deviceStateMux);
+  document["schemaVersion"] = "2.0";
+  document["status"] = deviceForecast.status;
+  document["modelVersion"] = edge_model::metadata().et0ModelVersion;
+  document["modelHash"] = edge_model::metadata().artifactManifestSha256;
+  document["generatedAt"] = deviceForecast.generatedEpochUtc;
+  document["clockSource"] = deviceClockSourceText();
+  document["historySource"] = deviceSyntheticHistoryActive
+                                  ? "synthetic_test"
+                                  : "device_v2";
+  document["availableSamples"] = deviceForecast.availableSamples;
+  document["requiredSamples"] = DEVICE_RUNTIME_RING_CAPACITY;
+  document["nextHourEt0Mm"] = deviceForecast.nextHourEt0Mm;
+  JsonArray points = document["forecast"].to<JsonArray>();
+  for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
+    JsonObject point = points.add<JsonObject>();
+    point["timestamp"] = deviceForecast.timestampsUtc[index];
+    point["et0Mm"] = deviceForecast.et0Mm[index];
+    point["soilMoisturePercent"] = deviceForecast.soilMoisturePercent[index];
+  }
+  portEXIT_CRITICAL(&deviceStateMux);
+  sendDeviceProtocol(USB_FORECAST_PREFIX, document);
+}
+
+static const char *deviceIrrigationReasonText(DeviceIrrigationReason reason) {
+  switch (reason) {
+    case DEVICE_IRRIGATION_ALLOWED: return "allowed";
+    case DEVICE_IRRIGATION_CLOCK_INVALID: return "clock_invalid";
+    case DEVICE_IRRIGATION_SENSOR_INVALID: return "sensor_invalid";
+    case DEVICE_IRRIGATION_VALVE_UNSAFE: return "valve_unsafe";
+    case DEVICE_IRRIGATION_PREDICTION_INVALID: return "prediction_invalid";
+    case DEVICE_IRRIGATION_SOIL_NOT_DRY: return "soil_not_dry";
+    case DEVICE_IRRIGATION_COOLDOWN: return "cooldown";
+    case DEVICE_IRRIGATION_DAILY_LIMIT: return "daily_limit";
+    default: return "auto_disabled";
+  }
+}
+
+void emitDeviceIrrigationState(const char *requestId) {
+  JsonDocument document;
+  document["schemaVersion"] = "2.0";
+  document["requestId"] = requestId == nullptr ? "" : requestId;
+  document["state"] = valveOpen ? "OPEN" : "CLOSED";
+  document["accepted"] = true;
+  document["action"] = latestIrrigationEvaluation.shouldOpenValve ? "START_WATERING" : "NO_OP";
+  document["automaticMode"] = DeviceRuntimeInstance.automaticModeEnabled();
+  document["valveState"] = valveOpen ? "OPEN" : "CLOSED";
+  document["candidate"] = latestIrrigationEvaluation.candidate;
+  document["shouldOpen"] = latestIrrigationEvaluation.shouldOpenValve;
+  document["reasonCode"] = deviceIrrigationReasonText(latestIrrigationEvaluation.reason);
+  document["reason"] = deviceIrrigationReasonText(latestIrrigationEvaluation.reason);
+  document["dailyWateredSeconds"] = deviceDailyWateredSeconds;
+  document["remainingSeconds"] = valveOpen && valveCloseAtMs > millis()
+                                      ? (valveCloseAtMs - millis() + 999) / 1000
+                                      : 0;
+  document["cooldownSeconds"] = DEVICE_RUNTIME_COOLDOWN_SECONDS;
+  document["clockSource"] = deviceClockSourceText();
+  sendDeviceProtocol(USB_IRRIGATION_STATE_PREFIX, document);
+}
+
+static void emitDeviceUiAck(const char *requestId, bool accepted,
+                            const char *action, const char *reason) {
+  JsonDocument document;
+  document["schemaVersion"] = "2.0";
+  document["requestId"] = requestId == nullptr ? "" : requestId;
+  document["accepted"] = accepted;
+  document["action"] = action == nullptr ? "" : action;
+  document["reason"] = reason == nullptr ? "" : reason;
+  document["actualState"] = valveOpen ? "OPEN" : "CLOSED";
+  sendDeviceProtocol(USB_UI_ACK_PREFIX, document);
+}
+
+void emitDeviceCloudResult(const CloudGatewayResult &result) {
+  JsonDocument document;
+  document["schemaVersion"] = "2.0";
+  document["requestId"] = result.requestId;
+  const char *status = result.status == CLOUD_GATEWAY_OK
+                           ? "ok"
+                           : result.status == CLOUD_GATEWAY_DISABLED
+                                 ? "disabled"
+                                 : result.status == CLOUD_GATEWAY_OFFLINE
+                                       ? "offline"
+                                       : result.status == CLOUD_GATEWAY_PENDING
+                                             ? "pending"
+                                             : "invalid_request";
+  document["status"] = status;
+  document["httpStatus"] = result.httpStatus;
+  document["recommendation"] = result.recommendation;
+  document["riskLevel"] = result.riskLevel;
+  document["answer"] = result.answer;
+  document["reason"] = result.reason;
+  document["evidence"] = result.evidence;
+  document["limitations"] = result.limitations;
+  document["error"] = result.error;
+  sendDeviceProtocol(USB_CLOUD_RESULT_PREFIX, document);
+}
+
+static void deviceBuildCloudContext(String &context) {
+  JsonDocument document;
+  document["timestampUtc"] = latestDeviceSample.epochUtc;
+  document["soilMoisturePercent"] = latestDeviceSample.soilMoisturePercent;
+  document["soilTemperatureC"] = latestDeviceSample.soilTemperatureC;
+  document["airTemperatureC"] = latestDeviceSample.airTemperatureC;
+  document["airHumidityPercent"] = latestDeviceSample.airHumidityPercent;
+  document["airPressureHpa"] = latestDeviceSample.airPressureHpa;
+  document["solarIncomingWm2"] = latestDeviceSample.solarIncomingWm2;
+  document["solarReflectedWm2"] = latestDeviceSample.solarReflectedWm2;
+  document["windSpeedMs"] = latestDeviceSample.windSpeedMs;
+  document["forecastStatus"] = deviceForecast.status;
+  document["nextHourEt0Mm"] = deviceForecast.nextHourEt0Mm;
+  document["predictedSoilMoistureInOneHour"] =
+      deviceForecast.soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1];
+  context = "";
+  serializeJson(document, context);
+}
+
+static void deviceSubmitCloud(CloudGatewayRequestType type, const char *requestId,
+                              const char *question) {
+  String context;
+  deviceBuildCloudContext(context);
+  CloudGatewayRequest request = {};
+  request.type = type;
+  request.requestId = requestId;
+  request.sensorContextJson = context.c_str();
+  request.question = question;
+  if (!CloudGatewayInstance.submit(request)) return;
+  if (cloudWorkerTaskHandle != nullptr) xTaskNotifyGive(cloudWorkerTaskHandle);
+}
+
+static bool deviceManualStartAllowed(uint32_t durationSeconds,
+                                     const char *requestId) {
+  if (deviceSyntheticHistoryBlocksValve()) {
+    emitDeviceUiAck(requestId, false, "START_WATERING",
+                    "synthetic_history_test_valve_locked");
+    emitDeviceIrrigationState(requestId);
+    return false;
+  }
+  DeviceRuntimeConfig config = DeviceRuntimeInstance.config();
+  config.automaticModeEnabled = true;
+  DeviceIrrigationInput input = {};
+  input.clockValid = deviceClockValid;
+  input.nowEpochUtc = latestDeviceSample.epochUtc;
+  input.sensors = latestDeviceSample;
+  input.prediction.valid = deviceForecast.valid;
+  input.prediction.complete = deviceForecast.valid;
+  input.prediction.pointCount = DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
+  input.prediction.horizonMinutes = 60;
+  input.prediction.finalSoilMoisturePercent =
+      deviceForecast.soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1];
+  input.prediction.minimumSoilMoisturePercent = 100.0f;
+  for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
+    input.prediction.minimumSoilMoisturePercent = min(
+        input.prediction.minimumSoilMoisturePercent, deviceForecast.soilMoisturePercent[index]);
+  }
+  input.prediction.nextHourEt0Mm = deviceForecast.nextHourEt0Mm;
+  input.valveState = valveOpen ? DEVICE_VALVE_OPEN : DEVICE_VALVE_CLOSED;
+  input.valveDriverHealthy = true;
+  input.dailyWateredSeconds = deviceDailyWateredSeconds;
+  input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
+  const DeviceIrrigationEvaluation evaluation =
+      evaluateLocalIrrigation(input, config);
+  latestIrrigationEvaluation = evaluation;
+  if (!evaluation.clockGatePassed || !evaluation.sensorGatePassed ||
+      !evaluation.predictionGatePassed || !evaluation.valveGatePassed ||
+      durationSeconds == 0 || durationSeconds > evaluation.durationSeconds) {
+    emitDeviceUiAck(requestId, false, "START_WATERING",
+                    deviceIrrigationReasonText(evaluation.reason));
+    emitDeviceIrrigationState(requestId);
+    return false;
+  }
+  return true;
+}
+
+void handleDeviceUiCommand(const char *json) {
+  JsonDocument document;
+  if (deserializeJson(document, json)) {
+    emitDeviceUiAck("unknown", false, "", "invalid_json");
+    return;
+  }
+  const char *requestId = document["requestId"] | "unknown";
+  const char *action = document["action"] | document["command"] | "";
+  if (strcmp(action, "SET_AUTO_MODE") == 0) {
+    const bool enabled = document["enabled"] | false;
+    if (enabled && deviceSyntheticHistoryBlocksValve()) {
+      emitDeviceUiAck(requestId, false, action,
+                      "synthetic_history_test_valve_locked");
+      emitDeviceIrrigationState(requestId);
+      return;
+    }
+    DeviceRuntimeInstance.setAutomaticModeEnabled(enabled);
+    emitDeviceUiAck(requestId, true, action, enabled ? "enabled" : "disabled");
+    emitDeviceIrrigationState(requestId);
+    return;
+  }
+  if (strcmp(action, "SET_TIME") == 0) {
+    const uint32_t epoch = document["epochUtc"] | 0UL;
+    const bool accepted = deviceRuntimeIsValidUtcEpoch(epoch);
+    if (accepted) {
+      deviceClockValid = true;
+      deviceNtpClockValid = true;
+      deviceClockSource = DEVICE_CLOCK_NTP;
+      latestDeviceSample.epochUtc = epoch;
+      deviceSetSystemClock(epoch);
+    }
+    emitDeviceUiAck(requestId, accepted, action, accepted ? "time_set" : "invalid_time");
+    return;
+  }
+  if (strcmp(action, "STOP_WATERING") == 0 || strcmp(action, "CANCEL") == 0) {
+    setValveRelay(false);
+    activeRequestId[0] = '\0';
+    emitDeviceUiAck(requestId, true, action, "stopped");
+    emitDeviceIrrigationState(requestId);
+    return;
+  }
+  if (strcmp(action, "START_WATERING") == 0 || strcmp(action, "CONFIRM_WATERING") == 0) {
+    const uint32_t duration = document["durationSeconds"] | DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
+    if (!deviceManualStartAllowed(duration, requestId)) return;
+    strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
+    strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
+    valveRequiresHostHeartbeat = true;
+    valveOpenedByLocalAuto = false;
+    setValveRelay(true);
+    valveCloseAtMs = millis() + duration * 1000UL;
+    lastHostHeartbeatMs = millis();
+    emitDeviceUiAck(requestId, true, action, "started");
+    emitDeviceIrrigationState(requestId);
+    return;
+  }
+  if (strcmp(action, "CLOUD_ANALYZE") == 0 || strcmp(action, "CLOUD_CHAT") == 0) {
+    const CloudGatewayRequestType type = strcmp(action, "CLOUD_CHAT") == 0
+                                             ? CLOUD_GATEWAY_QUESTION
+                                             : CLOUD_GATEWAY_ANALYSIS;
+    const char *question = document["question"] | "";
+    deviceSubmitCloud(type, requestId, question);
+    emitDeviceUiAck(requestId, true, action, "queued");
+    return;
+  }
+  if (strcmp(action, "REQUEST_STATE") == 0) {
+    emitDeviceForecast();
+    emitDeviceIrrigationState(requestId);
+    return;
+  }
+  emitDeviceUiAck(requestId, false, action, "action_not_allowed");
+}
+
+void processDeviceRuntimeSample(const SensorSnapshot &snapshot) {
+  uint32_t trustedEpochUtc = 0;
+  const bool trustedClock = deviceReadTrustedEpoch(trustedEpochUtc);
+
+  DeviceSensorSample sample = {};
+  sample.epochUtc = trustedEpochUtc;
+  sample.validityMask = 0;
+  if (snapshot.airOk) sample.validityMask |= DEVICE_SENSOR_AIR_TEMPERATURE_VALID | DEVICE_SENSOR_AIR_HUMIDITY_VALID;
+  if (snapshot.AirPressure > 0) sample.validityMask |= DEVICE_SENSOR_AIR_PRESSURE_VALID;
+  if (snapshot.soilOk) sample.validityMask |= DEVICE_SENSOR_SOIL_TEMPERATURE_VALID | DEVICE_SENSOR_SOIL_MOISTURE_VALID;
+  if (snapshot.solar2Ok) sample.validityMask |= DEVICE_SENSOR_SOLAR_INCOMING_VALID;
+  if (snapshot.solar1Ok) sample.validityMask |= DEVICE_SENSOR_SOLAR_REFLECTED_VALID;
+  if (snapshot.wind2Ok || snapshot.wind1Ok) sample.validityMask |= DEVICE_SENSOR_WIND_SPEED_VALID;
+  sample.airTemperatureC = snapshot.air.temperatureC;
+  sample.airHumidityPercent = snapshot.air.humidityPercent;
+  sample.airPressureHpa = snapshot.AirPressure;
+  sample.soilTemperatureC = snapshot.soil.temperatureC;
+  sample.soilMoisturePercent = snapshot.soil.moisturePercent;
+  sample.solarIncomingWm2 = snapshot.solarRadiation2Wm2;
+  sample.solarReflectedWm2 = snapshot.solarRadiation1Wm2;
+  sample.windSpeedMs = snapshot.wind2Ok ? snapshot.wind2SpeedMs : snapshot.wind1SpeedMs;
+  latestDeviceSample = sample;
+  if (deviceSyntheticHistoryActive) return;
+  if (!trustedClock) {
+    deviceSetForecastStatus("clock_unset");
+    DeviceRuntimeInstance.setAutomaticModeEnabled(false);
+    return;
+  }
+  const uint32_t slot = sample.epochUtc / DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+  sample.epochUtc = slot * DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+  latestDeviceSample.epochUtc = sample.epochUtc;
+  if (!deviceRuntimeSampleIsComplete(sample)) {
+    deviceSetForecastStatus("warming_up");
+    return;
+  }
+  if (slot == deviceLastSavedSlot) return;
+  if (deviceInferenceBusy || deviceInferenceRequested) return;
+  DeviceRuntimeInstance.history().appendCompleteSample(sample);
+  const DeviceRuntimeRecordV2 *record = DeviceRuntimeInstance.history().latest();
+  if (record == nullptr) return;
+  if (!deviceV2Ready || appendDeviceV2Record(*record)) {
+    deviceLastSavedSlot = slot;
+  }
+  if (DeviceRuntimeInstance.history().count() < DEVICE_RUNTIME_RING_CAPACITY) {
+    deviceSetForecastStatus("warming_up");
+    return;
+  }
+  if (deviceInferenceBusy || deviceInferenceRequested) return;
+  deviceBuildModelInput();
+  if (deviceInferenceTaskHandle != nullptr) {
+    deviceInferenceRequested = true;
+    xTaskNotifyGive(deviceInferenceTaskHandle);
+  }
+}
+
+void initDeviceRuntime() {
+  CloudGatewayInstance.begin();
+  deviceLoadIrrigationCounters();
+  // This deployment intentionally has no hardware RTC. Time becomes trusted
+  // only after NTP (or an explicit host SET_TIME command) in this boot cycle.
+  deviceClockValid = false;
+  deviceNtpClockValid = false;
+  deviceClockSource = DEVICE_CLOCK_UNSET;
+  deviceSetForecastStatus("clock_unset");
+  deviceRestoreHistory();
+  if (deviceClockValid) deviceSetForecastStatus("warming_up");
+  const BaseType_t inferenceTaskCreated = xTaskCreatePinnedToCoreWithCaps(
+      deviceInferenceTask, "edge-inference", DEVICE_INFERENCE_TASK_STACK_BYTES,
+      nullptr, 1, &deviceInferenceTaskHandle, ARDUINO_RUNNING_CORE,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const BaseType_t cloudTaskCreated = xTaskCreatePinnedToCoreWithCaps(
+      deviceCloudWorkerTask, "cloud-worker", 12288, nullptr, 1,
+      &cloudWorkerTaskHandle, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  Serial.printf("[DEVICE] Tasks inference=%s cloud=%s free_heap=%u\n",
+                inferenceTaskCreated == pdPASS ? "ok" : "failed",
+                cloudTaskCreated == pdPASS ? "ok" : "failed",
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  Serial.printf("[DEVICE] V2 history=%s clock=%s model=%s\n",
+                deviceV2Ready ? "ready" : "disabled",
+                deviceClockSourceText(),
+                edge_model::metadata().artifactManifestSha256);
+  if (deviceClockValid && DeviceRuntimeInstance.history().isContinuousWindow() &&
+      deviceInferenceTaskHandle != nullptr) {
+    deviceBuildModelInput();
+    deviceInferenceRequested = true;
+    xTaskNotifyGive(deviceInferenceTaskHandle);
+  }
+}
+
+static bool deviceSyntheticHistoryBlocksValve() {
+  return deviceSyntheticHistoryActive;
+}
+
+static void deviceTryInjectSyntheticHistory() {
+#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+  if (deviceSyntheticHistoryInjected || !deviceClockValid ||
+      deviceInferenceTaskHandle == nullptr) {
+    return;
+  }
+  if (AIOT_TEST_HISTORY_FIXTURE_COUNT != DEVICE_RUNTIME_RING_CAPACITY) {
+    Serial.println("[SYNTHETIC TEST] Fixture count is not 288; injection skipped.");
+    deviceSyntheticHistoryInjected = true;
+    return;
+  }
+
+  uint32_t trustedEpochUtc = 0;
+  if (!deviceReadTrustedEpoch(trustedEpochUtc)) return;
+  const uint32_t currentSlot =
+      trustedEpochUtc / DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+  if (currentSlot <= AIOT_TEST_HISTORY_FIXTURE_COUNT) return;
+
+  DeviceRuntimeInstance.history().clear();
+  const uint32_t firstEpoch =
+      (currentSlot - AIOT_TEST_HISTORY_FIXTURE_COUNT) *
+      DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+  for (size_t index = 0; index < AIOT_TEST_HISTORY_FIXTURE_COUNT; ++index) {
+    const SyntheticHistoryFixtureSample &source =
+        AIOT_TEST_HISTORY_FIXTURE[index];
+    DeviceSensorSample sample = {};
+    sample.epochUtc = firstEpoch +
+                      static_cast<uint32_t>(index) *
+                          DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+    sample.validityMask = DEVICE_SENSOR_ALL_REQUIRED_VALID;
+    sample.airTemperatureC = source.airTemperatureC;
+    sample.airHumidityPercent = source.airHumidityPercent;
+    sample.airPressureHpa = source.airPressureHpa;
+    sample.soilTemperatureC = source.soilTemperatureC;
+    sample.soilMoisturePercent = source.soilMoisturePercent;
+    sample.solarIncomingWm2 = source.solarIncomingWm2;
+    sample.solarReflectedWm2 = source.solarReflectedWm2;
+    sample.windSpeedMs = source.windSpeedMs;
+    if (!DeviceRuntimeInstance.history().appendCompleteSample(sample)) {
+      Serial.printf("[SYNTHETIC TEST] Fixture row %u is invalid.\n",
+                    static_cast<unsigned>(index));
+      DeviceRuntimeInstance.history().clear();
+      deviceSyntheticHistoryInjected = true;
+      return;
+    }
+  }
+
+  deviceSyntheticHistoryActive =
+      DeviceRuntimeInstance.history().isContinuousWindow();
+  deviceSyntheticHistoryInjected = true;
+  DeviceRuntimeInstance.setAutomaticModeEnabled(false);
+  setValveRelay(false);
+  if (!deviceSyntheticHistoryActive) {
+    Serial.println("[SYNTHETIC TEST] Fixture is not continuous; injection skipped.");
+    return;
+  }
+  deviceBuildModelInput();
+#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+  // Test the same generated weights and input on Arduino's loop task. This
+  // isolates model/data correctness from cross-task Flash-cache scheduling.
+  deviceInferenceBusy = true;
+  const bool inlineInferenceOk = deviceRunModelInference(deviceModelOutput);
+  deviceInferenceBusy = false;
+  Serial.printf("[SYNTHETIC TEST] Inline model=%s ET0=%.4f soil_60m=%.2f%%.\n",
+                inlineInferenceOk ? "ok" : "failed", deviceModelOutput.et0Mm,
+                deviceModelOutput.soilMoisturePercent[
+                    DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1]);
+  return;
+#endif
+  Serial.println("[SYNTHETIC TEST] Model input built; scheduling inference.");
+  deviceInferenceRequested = true;
+  xTaskNotifyGive(deviceInferenceTaskHandle);
+  Serial.println("[SYNTHETIC TEST] Loaded 288 CSV samples in RAM; valve is locked.");
+#endif
+}
+
+static void deviceServiceNtp() {
+  if (!wifiReady || WiFi.status() != WL_CONNECTED) return;
+  if (!deviceNtpStarted) {
+    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    deviceNtpStarted = true;
+    deviceLastNtpAttemptMs = millis();
+  }
+  const uint32_t retryIntervalMs = deviceNtpClockValid
+                                       ? DEVICE_NTP_RETRY_INTERVAL_MS
+                                       : DEVICE_NTP_INITIAL_RETRY_INTERVAL_MS;
+  if (millis() - deviceLastNtpAttemptMs < retryIntervalMs) return;
+  deviceLastNtpAttemptMs = millis();
+  const time_t now = time(nullptr);
+  if (now < static_cast<time_t>(DEVICE_RUNTIME_MIN_VALID_UTC_EPOCH)) return;
+  const uint32_t epochUtc = static_cast<uint32_t>(now);
+  deviceNtpClockValid = true;
+  deviceClockValid = true;
+  deviceClockSource = DEVICE_CLOCK_NTP;
+  latestDeviceSample.epochUtc = epochUtc;
+  Serial.printf("[CLOCK] NTP synchronized UTC=%lu source=%s\n",
+                static_cast<unsigned long>(now), deviceClockSourceText());
+}
+
+void serviceDeviceRuntime() {
+  deviceServiceNtp();
+  deviceTryInjectSyntheticHistory();
+  CloudGatewayResult cloudResult = {};
+  if (CloudGatewayInstance.pollResult(cloudResult)) emitDeviceCloudResult(cloudResult);
+  if (deviceForecastPendingEmit) {
+    deviceForecastPendingEmit = false;
+    emitDeviceForecast();
+  }
+  if (millis() - deviceLastStatusEmitMs >= DEVICE_STATUS_INTERVAL_MS) {
+    deviceLastStatusEmitMs = millis();
+    emitDeviceIrrigationState();
+  }
+  if (!DeviceRuntimeInstance.automaticModeEnabled() || !deviceClockValid || valveOpen) return;
+  DeviceIrrigationInput input = {};
+  input.clockValid = deviceClockValid;
+  input.nowEpochUtc = latestDeviceSample.epochUtc;
+  input.sensors = latestDeviceSample;
+  input.prediction.valid = deviceForecast.valid;
+  input.prediction.complete = deviceForecast.valid;
+  input.prediction.pointCount = DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
+  input.prediction.horizonMinutes = 60;
+  input.prediction.finalSoilMoisturePercent = deviceForecast.soilMoisturePercent[11];
+  input.prediction.minimumSoilMoisturePercent = 100.0f;
+  for (float value : deviceForecast.soilMoisturePercent) input.prediction.minimumSoilMoisturePercent = min(input.prediction.minimumSoilMoisturePercent, value);
+  input.prediction.nextHourEt0Mm = deviceForecast.nextHourEt0Mm;
+  input.valveState = DEVICE_VALVE_CLOSED;
+  input.valveDriverHealthy = true;
+  input.dailyWateredSeconds = deviceDailyWateredSeconds;
+  input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
+  latestIrrigationEvaluation = DeviceRuntimeInstance.evaluateLocalIrrigation(input);
+  if (latestIrrigationEvaluation.shouldOpenValve) {
+    const char *requestId = "local-auto";
+    strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
+    valveRequiresHostHeartbeat = false;
+    valveOpenedByLocalAuto = true;
+    setValveRelay(true);
+    valveCloseAtMs = millis() + latestIrrigationEvaluation.durationSeconds * 1000UL;
+    emitDeviceIrrigationState(requestId);
   }
 }
 
@@ -1333,7 +2235,7 @@ bool readBmp280Pressure(uint16_t &airPressureHpa) {
 bool readSoilSensorAtAddress(uint8_t address, SoilData &data) {
   uint16_t regs[SOIL_REG_COUNT] = {0};
   if (!modbusReadHoldingRegisters(SoilSerial,
-                                  SOIL_RS485_DE_RE_PIN,
+                                  SOIL_UART_DE_RE_PIN,
                                   address,
                                   SOIL_START_REG,
                                   SOIL_REG_COUNT,
@@ -1670,7 +2572,7 @@ bool saveProvisionedWifiCredentials(const String &ssid, const String &password) 
 
 String wifiSetupPage(const String &notice = "") {
   String page;
-  page.reserve(2600);
+  page.reserve(4600);
   page += F("<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<title>AIoT Wi-Fi 配网</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"
@@ -1694,7 +2596,23 @@ String wifiSetupPage(const String &notice = "") {
             "<button type='submit'>保存并连接</button></form>"
             "<form method='post' action='/reset'><button type='submit' style='background:#6b746f'>"
             "清除已保存网络</button></form><p><small>保存后设备会尝试 DHCP 自动获取 IP。若失败，约 20 秒后会回到此配网页面。"
-            "</small></p></main></html>");
+            "</small></p>");
+  CloudGatewayPortalConfig cloud = {};
+  const bool cloudReady = CloudGatewayInstance.readPortalConfig(cloud);
+  page += F("<hr><h2>火山云端增强</h2><p class='note'>云端只分析与问答，不会绕过 ESP32 本地水阀安全规则。"
+            "API Key 仅保存到设备 NVS，页面不会回显。</p><form method='post' action='/cloud-save'>"
+            "<label><input type='checkbox' name='enabled' ");
+  if (cloudReady && cloud.enabled) page += F("checked");
+  page += F("> 启用云端分析</label><label>模型名</label><input name='model' maxlength='95' value='");
+  page += cloudReady ? String(cloud.model) : "doubao-1.5-thinking-pro";
+  page += F("'><label>API Key（留空保持当前 Key）</label><input type='password' name='apiKey' maxlength='255' autocomplete='off'>");
+  page += cloudReady && cloud.apiKeyConfigured ? F("<small>当前状态：API Key 已配置。</small>")
+                                               : F("<small>当前状态：未配置 API Key。</small>");
+  page += F("<label>农田档案 JSON</label><textarea name='farmProfile' rows='5' style='width:100%;box-sizing:border-box'>");
+  page += cloudReady ? String(cloud.farmProfileJson) : "{\"status\":\"not_configured\"}";
+  page += F("</textarea><button type='submit'>保存云端配置</button></form><form method='post' action='/cloud-clear-key'>"
+            "<button type='submit' style='background:#6b746f'>清除云端 API Key</button></form>"
+            "<p><small>云端不可用时，设备仍能离线采集、预测和执行本地安全策略。</small></p></main></html>");
   return page;
 }
 
@@ -1730,6 +2648,31 @@ void handleWifiSetupReset() {
   Serial.println("[Wi-Fi setup] Stored credentials cleared from local NVS.");
 }
 
+void handleCloudSetupSave() {
+  CloudGatewayPortalConfig config = {};
+  if (!CloudGatewayInstance.readPortalConfig(config)) {
+    WifiSetupServer.send(503, "text/plain; charset=utf-8", "cloud gateway not initialized");
+    return;
+  }
+  config.enabled = WifiSetupServer.hasArg("enabled");
+  const String model = WifiSetupServer.arg("model");
+  const String profile = WifiSetupServer.arg("farmProfile");
+  if (!model.isEmpty()) strlcpy(config.model, model.c_str(), sizeof(config.model));
+  if (!profile.isEmpty()) strlcpy(config.farmProfileJson, profile.c_str(), sizeof(config.farmProfileJson));
+  const String apiKey = WifiSetupServer.arg("apiKey");
+  const bool saved = CloudGatewayInstance.savePortalConfig(config, apiKey.c_str(), false);
+  WifiSetupServer.send(saved ? 200 : 400, "text/html; charset=utf-8",
+                       wifiSetupPage(saved ? "云端配置已保存；Key 仅保存在设备 NVS。"
+                                            : "云端配置无效，请检查模型名和农田档案 JSON。"));
+}
+
+void handleCloudSetupClearKey() {
+  const bool cleared = CloudGatewayInstance.clearApiKey();
+  WifiSetupServer.send(cleared ? 200 : 400, "text/html; charset=utf-8",
+                       wifiSetupPage(cleared ? "云端 API Key 已清除。"
+                                              : "没有清除 API Key，或云端模块尚未初始化。"));
+}
+
 void registerWifiSetupRoutes() {
   if (wifiSetupRoutesRegistered) {
     return;
@@ -1737,6 +2680,8 @@ void registerWifiSetupRoutes() {
   WifiSetupServer.on("/", HTTP_GET, handleWifiSetupRoot);
   WifiSetupServer.on("/save", HTTP_POST, handleWifiSetupSave);
   WifiSetupServer.on("/reset", HTTP_POST, handleWifiSetupReset);
+  WifiSetupServer.on("/cloud-save", HTTP_POST, handleCloudSetupSave);
+  WifiSetupServer.on("/cloud-clear-key", HTTP_POST, handleCloudSetupClearKey);
   WifiSetupServer.onNotFound([]() {
     WifiSetupServer.sendHeader("Location", "/");
     WifiSetupServer.send(302, "text/plain", "");
@@ -1984,6 +2929,7 @@ void acceptTcpClient() {
   TcpClient = newClient;
   TcpClient.setNoDelay(true);
   TcpClient.println("ESP32-S3 IOT sensor server ready");
+  tcpClientJustConnected = true;
   Serial.println("[TCP] Client connected.");
 }
 
@@ -1992,7 +2938,7 @@ void forwardTcpToUsbSerial() {
     return;
   }
 
-  static char line[192] = {};
+  static char line[HOST_CONTROL_LINE_CAPACITY] = {};
   static size_t lineLength = 0;
   while (TcpClient.available()) {
     const int value = TcpClient.read();
@@ -2261,7 +3207,7 @@ void setup() {
   Wire.begin(BMP280_SDA_PIN, BMP280_SCL_PIN);
   Wire.setClock(AHT20_I2C_BAUD);
 
-  setupRs485DirectionPin(SOIL_RS485_DE_RE_PIN);
+  setupRs485DirectionPin(SOIL_UART_DE_RE_PIN);
   setupRs485DirectionPin(SOLAR_RS485_DE_RE_PIN);
 
   analogReadResolution(WIND_ADC_RESOLUTION_BITS);
@@ -2272,7 +3218,7 @@ void setup() {
     analogSetPinAttenuation(WIND_2_ADC_PIN, ADC_11db);
   }
 
-  SoilSerial.begin(SOIL_BAUD, SERIAL_8N1, SOIL_RS485_RX_PIN, SOIL_RS485_TX_PIN);
+  SoilSerial.begin(SOIL_BAUD, SERIAL_8N1, SOIL_UART_RX_PIN, SOIL_UART_TX_PIN);
   SolarSerial.begin(SOLAR_BAUD, SERIAL_8N1, SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN);
   if (DISPLAY_ENABLED) {
     DisplaySerial.begin(DISPLAY_BAUD, SERIAL_8N1, DISPLAY_UART_RX_PIN, DISPLAY_UART_TX_PIN);
@@ -2295,8 +3241,8 @@ void setup() {
   }
   Serial.println("HW-611: BMP280/BME280 I2C addr 0x76 or 0x77");
   Serial.printf("BMP280 SDA=GPIO%d SCL=GPIO%d\n", BMP280_SDA_PIN, BMP280_SCL_PIN);
-  Serial.printf("Soil RS485: RX=GPIO%d TX=GPIO%d baud=%u addr=0x%02X\n",
-                SOIL_RS485_RX_PIN, SOIL_RS485_TX_PIN, SOIL_BAUD, SOIL_ADDR);
+  Serial.printf("Soil TTL UART: RX=GPIO%d TX=GPIO%d baud=%u addr=0x%02X\n",
+                SOIL_UART_RX_PIN, SOIL_UART_TX_PIN, SOIL_BAUD, SOIL_ADDR);
   Serial.printf("Solar RS485: RX=GPIO%d TX=GPIO%d baud=%u addr=0x%02X/0x%02X\n",
                 SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN, SOLAR_BAUD,
                 SOLAR_1_ADDR, SOLAR_2_ADDR);
@@ -2335,12 +3281,31 @@ void setup() {
     Serial.printf("BMP280/BME280 initialized at I2C address 0x%02X.\n", bmp280Address);
   }
   initOfflineLog();
+  initDeviceRuntime();
 }
 
 void loop() {
   serviceUsbControl();
   serviceWifi();
   serviceWifiProvisioning();
+  serviceDeviceRuntime();
+
+  // A dashboard may connect between two five-minute sensor acquisitions.
+  // Replay the latest complete sample immediately instead of making it wait
+  // for the next acquisition slot.
+  if (tcpClientJustConnected && lastTelemetrySnapshotAvailable) {
+    sendTelemetry(lastTelemetrySnapshot, lastTelemetryEdgePrediction);
+    lastTcpTelemetryEmitMs = millis();
+    tcpClientJustConnected = false;
+  }
+
+  // Refresh the computer display from the cached sample. This does not read
+  // sensors or run either prediction model; those remain on their own cadence.
+  if (lastTelemetrySnapshotAvailable && TcpClient && TcpClient.connected() &&
+      millis() - lastTcpTelemetryEmitMs >= TCP_DISPLAY_REFRESH_INTERVAL_MS) {
+    sendTelemetry(lastTelemetrySnapshot, lastTelemetryEdgePrediction);
+    lastTcpTelemetryEmitMs = millis();
+  }
 
   if (static_cast<int32_t>(millis() - nextSensorReadAtMs) < 0) {
     delay(2);
@@ -2441,7 +3406,13 @@ void loop() {
   }
   serviceUsbControl();
   updateDisplay(snapshot);
+  lastTelemetrySnapshot = snapshot;
+  lastTelemetryEdgePrediction = edgePrediction;
+  lastTelemetrySnapshotAvailable = true;
   sendTelemetry(snapshot, edgePrediction);
+  lastTcpTelemetryEmitMs = millis();
+  tcpClientJustConnected = false;
+  processDeviceRuntimeSample(snapshot);
 
   // A failed sample is still reported to USB/Wi-Fi for diagnosis, but never
   // enters offline history.  Retry after 15 seconds and keep retrying until a
@@ -2456,7 +3427,7 @@ void loop() {
                   static_cast<unsigned long>(MISSING_SENSOR_RETRY_INTERVAL_MS / 1000));
     nextSensorReadAtMs = millis() + MISSING_SENSOR_RETRY_INTERVAL_MS;
   } else {
-    if (dueForFlashWrite) {
+    if (dueForFlashWrite && !deviceInferenceBusy && !deviceInferenceRequested) {
       if (appendOfflineLog(snapshot)) {
         Serial.printf("[OFFLINE LOG] Saved complete sample (%u current, %u previous).\n",
                       static_cast<unsigned>(offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH)),
