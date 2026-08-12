@@ -99,6 +99,36 @@ dual-forecast offline-log --action export
 
 确认 CSV 已保存并检查后，再使用交互式二次确认或显式 `erase` 清除旧 V1 文件。固件不会静默删除或伪造迁移旧记录。
 
+### 从导出 CSV 回灌预测历史
+
+同一份由 `offline-log --action export` 导出的 CSV 可以通过 USB 回灌到 ESP32，作为模型的初始历史；无需切换到另一份演示固件。回灌只替换 ESP32 的 **V2 预测历史窗口**，不会删除普通离线导出日志、Wi-Fi 配置或云端配置；开始时会强制关阀并关闭自动灌溉。
+
+先停止占用 USB 串口的 Dashboard/Arduino 串口监视器，再执行：
+
+```bash
+./stop_dashboard.sh
+.venv/bin/python -m dual_forecast.cli offline-log \
+  --serial-port /dev/cu.wchusbserial10 \
+  --action import \
+  --input "/完整路径/esp32-offline-log.csv"
+```
+
+Windows PowerShell：
+
+```powershell
+.\stop_dashboard.cmd
+.\.venv\Scripts\python.exe -m dual_forecast.cli offline-log `
+  --serial-port COM3 `
+  --action import `
+  --input "C:\完整路径\esp32-offline-log.csv"
+```
+
+电脑会校验原始导出列、传感器有效标志和五分钟连续性，并选取 CSV 中最长的一段连续完整记录，最多 288 条。旧 CSV 没有 UTC 时间列，ESP32 会按导入完成时刻向前连续排列这些历史点，再继续追加之后的真实五分钟采样。
+
+- 导入 288 条：ESP32 立即排队运行模型，Dashboard 收到 `@FORECAST` 后自动画出一小时趋势图。
+- 导入少于 288 条：Dashboard 显示 `N/288`，设备继续采集到 288 条后自动推理。例如导入 94 条，还需 194 条完整真实样本。
+- CSV 中跨重启、缺采样或传感器失败的段不会拼接，避免把不连续时间序列误用于模型。
+
 ## 云端大模型
 
 云端是可选增强，设备在有互联网时通过 HTTPS 直接访问火山引擎 OpenAI 兼容网关。API Key、是否启用、模型名和农田档案均由 ESP32 配网页面保存到设备 NVS：

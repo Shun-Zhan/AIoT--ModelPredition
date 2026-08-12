@@ -15,6 +15,16 @@ STATUS_PREFIX = "@OFFLINE_LOG_STATUS "
 RECORD_PREFIX = "@OFFLINE_LOG_RECORD "
 DUMP_END_PREFIX = "@OFFLINE_LOG_DUMP_END "
 ERASE_ACK_PREFIX = "@OFFLINE_LOG_ERASE_ACK "
+IMPORT_ACK_PREFIX = "@HISTORY_IMPORT_ACK "
+IMPORT_MAX_RECORDS = 288
+IMPORT_INTERVAL_MS = 5 * 60 * 1000
+IMPORT_MAX_GAP_MS = IMPORT_INTERVAL_MS + 60 * 1000
+IMPORT_REQUIRED_COLUMNS = (
+    "integrityOk", "bootSessionId", "uptimeMs", "windOk", "airOk", "soilOk",
+    "solar1Ok", "solar2Ok", "airPressureHpa", "windSpeedMs",
+    "airTemperatureC", "airHumidityPercent", "soilTemperatureC",
+    "soilMoisturePercent", "solar1Wm2", "solar2Wm2",
+)
 
 
 def _json_after_prefix(line: str, prefix: str) -> dict[str, Any]:
@@ -132,6 +142,116 @@ def erase_and_restart(device: serial.Serial) -> dict[str, Any]:
     return response
 
 
+def _truthy(value: str) -> bool:
+    return value.strip().casefold() in {"true", "1", "yes"}
+
+
+def _complete_import_row(row: dict[str, str]) -> bool:
+    return all(_truthy(row.get(key, "")) for key in (
+        "integrityOk", "windOk", "airOk", "soilOk", "solar1Ok", "solar2Ok"
+    ))
+
+
+def _compact_import_sample(row: dict[str, str]) -> dict[str, float]:
+    try:
+        sample = {
+            "t": float(row["airTemperatureC"]),
+            "h": float(row["airHumidityPercent"]),
+            "p": float(row["airPressureHpa"]),
+            "st": float(row["soilTemperatureC"]),
+            "sm": float(row["soilMoisturePercent"]),
+            "si": float(row["solar2Wm2"]),
+            "sr": float(row["solar1Wm2"]),
+            "w": float(row["windSpeedMs"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"CSV 数值列无效：{exc}") from exc
+    if not (0 <= sample["h"] <= 100 and 0 <= sample["sm"] <= 100):
+        raise ValueError("CSV 中空气湿度或土壤湿度不在 0-100% 范围")
+    if sample["p"] <= 0 or sample["si"] < 0 or sample["sr"] < 0 or sample["w"] < 0:
+        raise ValueError("CSV 中气压、太阳辐射或风速存在无效负值")
+    return sample
+
+
+def load_recent_continuous_import_window(input_path: Path) -> list[dict[str, float]]:
+    """Read the existing offline-log CSV and select its longest valid run.
+
+    A device reboot starts a new ``bootSessionId`` and commonly leaves a very
+    short final run.  Keeping the longest run preserves the actual five-minute
+    cadence instead of accidentally importing that one post-reboot row.
+    """
+    with input_path.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if not reader.fieldnames:
+            raise ValueError("CSV 没有表头")
+        missing = [name for name in IMPORT_REQUIRED_COLUMNS if name not in reader.fieldnames]
+        if missing:
+            raise ValueError("CSV 缺少导出字段：" + "、".join(missing))
+        rows = list(reader)
+    if not rows:
+        raise ValueError("CSV 没有数据行")
+
+    run: list[dict[str, float]] = []
+    selected: list[dict[str, float]] = []
+    previous_session: str | None = None
+    previous_uptime: int | None = None
+    for row in rows:
+        try:
+            session = row["bootSessionId"].strip()
+            uptime = int(row["uptimeMs"])
+        except (KeyError, TypeError, ValueError):
+            run = []
+            previous_session = None
+            previous_uptime = None
+            continue
+        continuous = (
+            bool(run)
+            and session == previous_session
+            and previous_uptime is not None
+            and IMPORT_INTERVAL_MS - 60_000 <= uptime - previous_uptime <= IMPORT_MAX_GAP_MS
+        )
+        if not _complete_import_row(row):
+            run = []
+        else:
+            try:
+                sample = _compact_import_sample(row)
+            except ValueError:
+                run = []
+            else:
+                if not continuous:
+                    run = []
+                run.append(sample)
+                if len(run) >= len(selected):
+                    selected = run[-IMPORT_MAX_RECORDS:]
+        previous_session = session
+        previous_uptime = uptime
+    if not selected:
+        raise ValueError("CSV 中没有连续的完整传感器记录")
+    return selected
+
+
+def import_records(device: serial.Serial, input_path: Path) -> dict[str, Any]:
+    """Safely stream the newest valid CSV run into ESP32 V2 model history."""
+    samples = load_recent_continuous_import_window(input_path)
+    device.reset_input_buffer()
+    _send_line(device, "@HISTORY_IMPORT_BEGIN " + json.dumps({"count": len(samples)}))
+    begin = _json_after_prefix(_wait_for_prefix(device, IMPORT_ACK_PREFIX), IMPORT_ACK_PREFIX)
+    if not begin.get("accepted"):
+        raise RuntimeError(f"ESP32 拒绝导入：{begin.get('reason', 'unknown')}")
+    for sample in samples:
+        _send_line(device, "@HISTORY_IMPORT_RECORD " + json.dumps(sample, separators=(",", ":")))
+        time.sleep(0.02)
+    _send_line(device, "@HISTORY_IMPORT_END")
+    result = _json_after_prefix(
+        _wait_for_prefix(device, IMPORT_ACK_PREFIX, timeout_seconds=45), IMPORT_ACK_PREFIX
+    )
+    if not result.get("accepted"):
+        raise RuntimeError(f"ESP32 导入失败：{result.get('reason', 'unknown')}")
+    if int(result.get("importedRecords", -1)) != len(samples):
+        raise RuntimeError("ESP32 导入条数与电脑发送条数不一致")
+    return result
+
+
 def _print_status(status: dict[str, Any]) -> None:
     print(
         "LittleFS：{ready}；当前文件 {current} 条；轮换文件 {previous} 条；"
@@ -151,9 +271,10 @@ def _interactive_action() -> str:
     print("  1. 查看记录状态")
     print("  2. 读取并导出为 CSV")
     print("  3. 擦除记录并立即启动新一轮采集")
+    print("  4. 从现有导出 CSV 回灌预测历史")
     print("  0. 退出")
     choice = input("请选择：").strip()
-    return {"1": "status", "2": "export", "3": "erase", "0": "quit"}.get(
+    return {"1": "status", "2": "export", "3": "erase", "4": "import", "0": "quit"}.get(
         choice, "invalid"
     )
 
@@ -211,6 +332,18 @@ def manage_offline_log(args: argparse.Namespace) -> None:
                             "记录已擦除或初始化，ESP32 已恢复 OFFLINE_LOGGING 模式，"
                             "并已安排立即采集；只有完整传感器样本才会写入。"
                         )
+                elif selected == "import":
+                    input_path = Path(args.input) if args.input else Path(
+                        input("请输入之前导出的 CSV 路径：").strip()
+                    )
+                    result = import_records(device, input_path)
+                    imported = int(result["importedRecords"])
+                    required = int(result["requiredRecords"])
+                    print(
+                        f"已回灌 {imported}/{required} 条到 ESP32 V2 历史；"
+                        + ("模型推理已排队，稍候会显示趋势图。" if imported == required
+                           else f"还需连续采集 {required - imported} 条完整真实样本。")
+                    )
                 if action != "interactive":
                     return
     except (TimeoutError, RuntimeError) as exc:
@@ -228,12 +361,13 @@ def add_offline_log_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument(
         "--action",
-        choices=("interactive", "status", "export", "erase"),
+        choices=("interactive", "status", "export", "erase", "import"),
         default="interactive",
     )
     parser.add_argument(
         "--output", default="outputs/esp32-offline-log.csv", help="CSV export path"
     )
+    parser.add_argument("--input", help="previously exported ESP32 offline-log CSV for --action import")
     parser.add_argument(
         "--yes", action="store_true", help="confirm erase without an interactive prompt"
     )

@@ -27,6 +27,16 @@ def test_offline_log_cli_defaults_to_interactive_management():
     assert args.yes is False
 
 
+def test_offline_log_cli_accepts_exported_csv_import():
+    args = parser().parse_args([
+        "offline-log", "--serial-port", "/dev/cu.usbmodem-test",
+        "--action", "import", "--input", "outputs/esp32-offline-log.csv",
+    ])
+
+    assert args.action == "import"
+    assert args.input == "outputs/esp32-offline-log.csv"
+
+
 def test_cloud_configuration_preserves_unrelated_env_settings(tmp_path):
     env_path = tmp_path / ".env"
     env_path.write_text(

@@ -95,6 +95,9 @@ static const char *USB_WIFI_RESET_COMMAND = "@WIFI_RESET";
 static const char *USB_OFFLINE_LOG_STATUS_COMMAND = "@OFFLINE_LOG_STATUS";
 static const char *USB_OFFLINE_LOG_DUMP_COMMAND = "@OFFLINE_LOG_DUMP";
 static const char *USB_OFFLINE_LOG_ERASE_COMMAND = "@OFFLINE_LOG_ERASE CONFIRM";
+static const char *USB_HISTORY_IMPORT_BEGIN_PREFIX = "@HISTORY_IMPORT_BEGIN ";
+static const char *USB_HISTORY_IMPORT_RECORD_PREFIX = "@HISTORY_IMPORT_RECORD ";
+static const char *USB_HISTORY_IMPORT_END_COMMAND = "@HISTORY_IMPORT_END";
 static const size_t HOST_CONTROL_LINE_CAPACITY = 1024;
 
 // -------------------- Water valve relay --------------------
@@ -457,6 +460,7 @@ DeviceSensorSample latestDeviceSample = {};
 edge_model::ModelInput deviceModelInput = {};
 edge_model::ModelOutput deviceModelOutput = {};
 DeviceRuntimeRecordV2 deviceHistoryScratch[DEVICE_RUNTIME_RING_CAPACITY] = {};
+DeviceSensorSample deviceImportSamples[DEVICE_RUNTIME_RING_CAPACITY] = {};
 TaskHandle_t deviceInferenceTaskHandle = nullptr;
 TaskHandle_t cloudWorkerTaskHandle = nullptr;
 portMUX_TYPE deviceStateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -478,6 +482,9 @@ uint32_t deviceDailyWateredSeconds = 0;
 uint32_t deviceWateringDayUtc = 0;
 uint32_t deviceLastWateringEpochUtc = 0;
 uint32_t deviceValveOpenEpochUtc = 0;
+bool deviceHistoryImportActive = false;
+uint16_t deviceHistoryImportCount = 0;
+uint16_t deviceHistoryImportExpected = 0;
 DeviceIrrigationEvaluation latestIrrigationEvaluation = {
     false, false, false, false, false, false, 0, 0.0f,
     DEVICE_IRRIGATION_AUTO_DISABLED};
@@ -497,9 +504,17 @@ void closeValveForSafety(const char *reason);
 void setValveRelay(bool open);
 static bool deviceReadTrustedEpoch(uint32_t &epochUtc);
 static const char *deviceClockSourceText();
+static bool deviceFinite(float value);
+static void deviceSetForecastStatus(const char *status);
+static void deviceBuildModelInput();
 static void deviceTryInjectSyntheticHistory();
 static bool deviceSyntheticHistoryBlocksValve();
 static bool deviceRunModelInference(edge_model::ModelOutput &result);
+static void deviceSendHistoryImportAck(bool accepted, const char *stage,
+                                       const char *reason);
+static void deviceBeginHistoryImport(const char *payload);
+static void deviceAddHistoryImportRecord(const char *payload);
+static void deviceFinishHistoryImport();
 
 uint32_t offlineLogChecksum(const uint8_t *data, size_t length) {
   // FNV-1a is sufficient here to detect a torn/corrupt flash record before
@@ -735,6 +750,174 @@ void eraseOfflineLogAndRestart() {
       "@OFFLINE_LOG_ERASE_ACK {\"accepted\":true,\"currentRecords\":0,"
       "\"previousRecords\":0,\"samplingMode\":\"OFFLINE_LOGGING\","
       "\"readIntervalMs\":300000,\"reason\":\"erased_or_formatted_and_sampling_scheduled\"}");
+}
+
+// -------------------- USB CSV history import --------------------
+//
+// The PC validates the exported CSV and streams compact JSON records.  The
+// device assigns a continuous five-minute UTC timeline ending before the
+// current slot, then persists the same V2 records used by normal sampling.
+// This lets imported history warm the model while later real samples continue
+// naturally in the following slots.
+
+static void deviceSendHistoryImportAck(bool accepted, const char *stage,
+                                       const char *reason) {
+  JsonDocument document;
+  document["accepted"] = accepted;
+  document["stage"] = stage;
+  document["reason"] = reason;
+  document["importedRecords"] = deviceHistoryImportCount;
+  document["expectedRecords"] = deviceHistoryImportExpected;
+  document["requiredRecords"] = DEVICE_RUNTIME_RING_CAPACITY;
+  document["automaticMode"] = false;
+  Serial.print("@HISTORY_IMPORT_ACK ");
+  serializeJson(document, Serial);
+  Serial.println();
+}
+
+static void deviceBeginHistoryImport(const char *payload) {
+  if (valveOpen) {
+    deviceSendHistoryImportAck(false, "begin", "valve_open");
+    return;
+  }
+  if (!deviceV2Ready) {
+    deviceSendHistoryImportAck(false, "begin", "littlefs_not_ready");
+    return;
+  }
+  if (deviceInferenceBusy || deviceInferenceRequested) {
+    deviceSendHistoryImportAck(false, "begin", "inference_busy_retry");
+    return;
+  }
+  uint32_t epochUtc = 0;
+  if (!deviceReadTrustedEpoch(epochUtc)) {
+    deviceSendHistoryImportAck(false, "begin", "clock_unset");
+    return;
+  }
+  JsonDocument document;
+  if (deserializeJson(document, payload)) {
+    deviceSendHistoryImportAck(false, "begin", "invalid_json");
+    return;
+  }
+  const uint16_t expected = document["count"] | 0;
+  if (expected == 0 || expected > DEVICE_RUNTIME_RING_CAPACITY) {
+    deviceSendHistoryImportAck(false, "begin", "invalid_count");
+    return;
+  }
+  deviceHistoryImportActive = true;
+  deviceHistoryImportCount = 0;
+  deviceHistoryImportExpected = expected;
+  DeviceRuntimeInstance.setAutomaticModeEnabled(false);
+  setValveRelay(false);
+  deviceSendHistoryImportAck(true, "begin", "ready");
+}
+
+static void deviceAddHistoryImportRecord(const char *payload) {
+  if (!deviceHistoryImportActive) {
+    deviceSendHistoryImportAck(false, "record", "not_started");
+    return;
+  }
+  if (deviceHistoryImportCount >= deviceHistoryImportExpected) {
+    deviceHistoryImportActive = false;
+    deviceSendHistoryImportAck(false, "record", "too_many_records");
+    return;
+  }
+  JsonDocument document;
+  if (deserializeJson(document, payload)) {
+    deviceHistoryImportActive = false;
+    deviceSendHistoryImportAck(false, "record", "invalid_json");
+    return;
+  }
+  DeviceSensorSample sample = {};
+  sample.validityMask = DEVICE_SENSOR_ALL_REQUIRED_VALID;
+  sample.airTemperatureC = document["t"] | NAN;
+  sample.airHumidityPercent = document["h"] | NAN;
+  sample.airPressureHpa = document["p"] | NAN;
+  sample.soilTemperatureC = document["st"] | NAN;
+  sample.soilMoisturePercent = document["sm"] | NAN;
+  sample.solarIncomingWm2 = document["si"] | NAN;
+  sample.solarReflectedWm2 = document["sr"] | NAN;
+  sample.windSpeedMs = document["w"] | NAN;
+  if (!deviceFinite(sample.airTemperatureC) || !deviceFinite(sample.airHumidityPercent) ||
+      !deviceFinite(sample.airPressureHpa) || !deviceFinite(sample.soilTemperatureC) ||
+      !deviceFinite(sample.soilMoisturePercent) || !deviceFinite(sample.solarIncomingWm2) ||
+      !deviceFinite(sample.solarReflectedWm2) || !deviceFinite(sample.windSpeedMs) ||
+      sample.airHumidityPercent < 0.0f || sample.airHumidityPercent > 100.0f ||
+      sample.soilMoisturePercent < 0.0f || sample.soilMoisturePercent > 100.0f ||
+      sample.airPressureHpa <= 0.0f || sample.solarIncomingWm2 < 0.0f ||
+      sample.solarReflectedWm2 < 0.0f || sample.windSpeedMs < 0.0f) {
+    deviceHistoryImportActive = false;
+    deviceSendHistoryImportAck(false, "record", "invalid_sensor_values");
+    return;
+  }
+  deviceImportSamples[deviceHistoryImportCount++] = sample;
+}
+
+static void deviceFinishHistoryImport() {
+  if (!deviceHistoryImportActive || deviceHistoryImportCount == 0) {
+    deviceHistoryImportActive = false;
+    deviceSendHistoryImportAck(false, "end", "not_started_or_empty");
+    return;
+  }
+  if (deviceHistoryImportCount != deviceHistoryImportExpected) {
+    deviceHistoryImportActive = false;
+    deviceSendHistoryImportAck(false, "end", "record_count_mismatch");
+    return;
+  }
+  uint32_t nowEpochUtc = 0;
+  if (!deviceReadTrustedEpoch(nowEpochUtc)) {
+    deviceHistoryImportActive = false;
+    deviceSendHistoryImportAck(false, "end", "clock_unset");
+    return;
+  }
+  const uint32_t currentSlot = nowEpochUtc / DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+  if (currentSlot <= deviceHistoryImportCount) {
+    deviceHistoryImportActive = false;
+    deviceSendHistoryImportAck(false, "end", "clock_range_invalid");
+    return;
+  }
+
+  // Replace only the V2 prediction history.  The ordinary 28-day export log
+  // stays intact, so the original CSV can still be exported later.
+  LittleFS.remove(DEVICE_V2_CURRENT_PATH);
+  LittleFS.remove(DEVICE_V2_PREVIOUS_PATH);
+  DeviceRuntimeInstance.history().clear();
+  const uint32_t firstSlot = currentSlot - deviceHistoryImportCount;
+  bool written = true;
+  for (uint16_t index = 0; index < deviceHistoryImportCount; ++index) {
+    DeviceSensorSample sample = deviceImportSamples[index];
+    sample.epochUtc = (firstSlot + index) * DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+    written = DeviceRuntimeInstance.history().appendCompleteSample(sample) && written;
+    const DeviceRuntimeRecordV2 *record = DeviceRuntimeInstance.history().latest();
+    written = record != nullptr && appendDeviceV2Record(*record) && written;
+  }
+  deviceHistoryImportActive = false;
+  DeviceRuntimeInstance.setAutomaticModeEnabled(false);
+  setValveRelay(false);
+  if (!written || (!DeviceRuntimeInstance.history().isContinuousWindow() &&
+                   deviceHistoryImportCount == DEVICE_RUNTIME_RING_CAPACITY)) {
+    DeviceRuntimeInstance.history().clear();
+    deviceSetForecastStatus("model_error");
+    deviceForecastPendingEmit = true;
+    deviceSendHistoryImportAck(false, "end", "persist_failed");
+    return;
+  }
+
+  deviceLastSavedSlot = currentSlot - 1;
+  latestDeviceSample = deviceImportSamples[deviceHistoryImportCount - 1];
+  latestDeviceSample.epochUtc = deviceLastSavedSlot * DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+  deviceSetForecastStatus("warming_up");
+  if (DeviceRuntimeInstance.history().isContinuousWindow() &&
+      deviceInferenceTaskHandle != nullptr) {
+    deviceBuildModelInput();
+    deviceInferenceRequested = true;
+    xTaskNotifyGive(deviceInferenceTaskHandle);
+  } else {
+    deviceForecastPendingEmit = true;
+  }
+  deviceSendHistoryImportAck(true, "end",
+                             deviceHistoryImportCount == DEVICE_RUNTIME_RING_CAPACITY
+                                 ? "inference_scheduled"
+                                 : "history_imported_waiting_for_samples");
 }
 
 // This is intentionally not the PC's N-BEATS + LSTM model.  It is a small
@@ -983,6 +1166,17 @@ void handleHostControlLine(const char *line, bool allowWifiReset) {
   } else if (allowWifiReset &&
              strcmp(line, USB_OFFLINE_LOG_ERASE_COMMAND) == 0) {
     eraseOfflineLogAndRestart();
+  } else if (allowWifiReset &&
+             strncmp(line, USB_HISTORY_IMPORT_BEGIN_PREFIX,
+                     strlen(USB_HISTORY_IMPORT_BEGIN_PREFIX)) == 0) {
+    deviceBeginHistoryImport(line + strlen(USB_HISTORY_IMPORT_BEGIN_PREFIX));
+  } else if (allowWifiReset &&
+             strncmp(line, USB_HISTORY_IMPORT_RECORD_PREFIX,
+                     strlen(USB_HISTORY_IMPORT_RECORD_PREFIX)) == 0) {
+    deviceAddHistoryImportRecord(line + strlen(USB_HISTORY_IMPORT_RECORD_PREFIX));
+  } else if (allowWifiReset &&
+             strcmp(line, USB_HISTORY_IMPORT_END_COMMAND) == 0) {
+    deviceFinishHistoryImport();
   } else if (strncmp(line, USB_UI_COMMAND_PREFIX,
                      strlen(USB_UI_COMMAND_PREFIX)) == 0) {
     handleDeviceUiCommand(line + strlen(USB_UI_COMMAND_PREFIX));
@@ -1560,6 +1754,7 @@ void processDeviceRuntimeSample(const SensorSnapshot &snapshot) {
   sample.solarReflectedWm2 = snapshot.solarRadiation1Wm2;
   sample.windSpeedMs = snapshot.wind2Ok ? snapshot.wind2SpeedMs : snapshot.wind1SpeedMs;
   latestDeviceSample = sample;
+  if (deviceHistoryImportActive) return;
   if (deviceSyntheticHistoryActive) return;
   if (!trustedClock) {
     deviceSetForecastStatus("clock_unset");
@@ -2984,6 +3179,10 @@ void acceptTcpClient() {
   TcpClient.setNoDelay(true);
   TcpClient.println("ESP32-S3 IOT sensor server ready");
   tcpClientJustConnected = true;
+  // The computer may reconnect long after the last inference. Replay the
+  // current device-owned result so the Dashboard can draw its curves at once.
+  emitDeviceForecast();
+  emitDeviceIrrigationState();
   Serial.println("[TCP] Client connected.");
 }
 
