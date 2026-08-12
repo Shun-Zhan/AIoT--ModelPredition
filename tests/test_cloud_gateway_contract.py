@@ -39,13 +39,21 @@ def test_preferences_store_all_required_fields_without_a_secret_readback():
     assert "_apiKey" in source
 
 
+def test_first_boot_creates_cloud_preferences_namespace():
+    _, source = read_sources()
+    loader = source[source.index("bool CloudGateway::loadStoredConfig()"):source.index("bool CloudGateway::readPortalConfig")]
+    assert 'preferences.begin(CLOUD_GATEWAY_PREFERENCES_NAMESPACE, false)' in loader
+
+
 def test_request_and_response_use_arduinojson_v7_and_strict_shapes():
     header, source = read_sources()
     assert '#include <ArduinoJson.h>' in source
     assert "JsonDocument" in source
     assert "serializeJson(request, payload)" in source
     assert "deserializeJson" in source
-    assert 'request["response_format"]["type"] = "json_object"' in source
+    assert 'request["response_format"]' not in source
+    assert 'userMessage["content"] = userContentJson' in source
+    assert "Volcengine OpenAI-compatible endpoint expects messages[].content" in source
     assert '"kind", "recommendation", "riskLevel",' in source
     assert '"schemaVersion", "kind", "answer", "evidence", "limitations"' in source
     assert "hasOnlyFields" in source
@@ -62,6 +70,35 @@ def test_worker_api_does_not_force_network_work_into_loop():
     assert "bool CloudGateway::runWorkerOnce()" in source
     assert "WiFi.status() != WL_CONNECTED" in source
     assert "offlineFallback" in header + source
+    assert "CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS = 30000" in header
+    assert "explicit CloudGateway(uint16_t timeoutMs = CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS)" in header
+
+
+def test_portal_cloud_save_returns_small_closed_response_without_network_call():
+    sketch = (ROOT / "firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino").read_text(
+        encoding="utf-8"
+    )
+    handler = sketch[sketch.index("void handleCloudSetupSave()"):sketch.index("void handleCloudSetupClearKey()")]
+    assert 'WifiSetupServer.sendHeader("Connection", "close")' in handler
+    assert 'WifiSetupServer.send(saved ? 200 : 400' in handler
+    assert "wifiSetupPage(saved" not in handler
+    assert "CloudGatewayInstance.savePortalConfig" in handler
+
+
+def test_cloud_gateway_initializes_before_wifi_portal():
+    sketch = (ROOT / "firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino").read_text(
+        encoding="utf-8"
+    )
+    setup = sketch[sketch.index("void setup()"):sketch.index("void loop()")]
+    assert setup.index("CloudGatewayInstance.begin()") < setup.index("initWifiProvisioning()")
+
+
+def test_http_errors_keep_gateway_status_detail_without_exposing_credentials():
+    _, source = read_sources()
+    assert 'gatewayError = "gateway returned HTTP " + String(responseCode)' in source
+    assert 'errorDocument["error"]["message"]' in source
+    assert 'gatewayError.c_str()' in source
+    assert 'gatewayError += _apiKey' not in source
 
 
 def test_cloud_output_is_advice_only_and_never_gpio_control():

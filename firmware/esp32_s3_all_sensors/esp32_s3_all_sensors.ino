@@ -1594,7 +1594,6 @@ void processDeviceRuntimeSample(const SensorSnapshot &snapshot) {
 }
 
 void initDeviceRuntime() {
-  CloudGatewayInstance.begin();
   deviceLoadIrrigationCounters();
   // This deployment intentionally has no hardware RTC. Time becomes trusted
   // only after NTP (or an explicit host SET_TIME command) in this boot cycle.
@@ -2704,16 +2703,28 @@ void handleCloudSetupSave() {
   if (!profile.isEmpty()) strlcpy(config.farmProfileJson, profile.c_str(), sizeof(config.farmProfileJson));
   const String apiKey = WifiSetupServer.arg("apiKey");
   const bool saved = CloudGatewayInstance.savePortalConfig(config, apiKey.c_str(), false);
-  WifiSetupServer.send(saved ? 200 : 400, "text/html; charset=utf-8",
-                       wifiSetupPage(saved ? "云端配置已保存；Key 仅保存在设备 NVS。"
-                                            : "云端配置无效，请检查模型名和农田档案 JSON。"));
+  // Return a small, self-contained response. Re-rendering the full portal here
+  // can leave captive-portal browsers waiting while the AP is being refreshed.
+  // Saving the cloud config never performs an HTTPS request or changes Wi-Fi.
+  WifiSetupServer.sendHeader("Connection", "close");
+  const char *message = saved
+                            ? "云端配置已保存。Key 仅保存在 ESP32 NVS；现在可以关闭此页面并连接设备的目标 Wi-Fi。"
+                            : "云端配置无效，请检查模型名和农田档案 JSON。";
+  String response = F("<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
+                      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                      "<title>AIoT 云端配置</title><body style='font-family:sans-serif;"
+                      "padding:24px'><h1>AIoT 云端配置</h1><p>");
+  response += message;
+  response += F("</p><p>豆包请求只会在 ESP32 连接到有互联网的 Wi-Fi 后异步执行。</p>"
+                "<a href='/'>返回配置页</a></body></html>");
+  WifiSetupServer.send(saved ? 200 : 400, "text/html; charset=utf-8", response);
 }
 
 void handleCloudSetupClearKey() {
   const bool cleared = CloudGatewayInstance.clearApiKey();
-  WifiSetupServer.send(cleared ? 200 : 400, "text/html; charset=utf-8",
-                       wifiSetupPage(cleared ? "云端 API Key 已清除。"
-                                              : "没有清除 API Key，或云端模块尚未初始化。"));
+  WifiSetupServer.sendHeader("Connection", "close");
+  WifiSetupServer.send(cleared ? 200 : 400, "text/plain; charset=utf-8",
+                       cleared ? "云端 API Key 已清除。" : "没有清除 API Key，或云端模块尚未初始化。");
 }
 
 void registerWifiSetupRoutes() {
@@ -3300,6 +3311,11 @@ void setup() {
   } else {
     Serial.println("Wi-Fi provisioning disabled.");
   }
+  // Load the NVS-backed cloud configuration before the setup portal can serve
+  // /cloud-save. Otherwise the portal is reachable but reports that the cloud
+  // gateway has not been initialized.
+  const bool cloudInitialized = CloudGatewayInstance.begin();
+  Serial.printf("Cloud gateway module: %s\n", cloudInitialized ? "initialized" : "initialization failed");
   initWifiProvisioning();
 
   printI2cScan(Wire, "BMP280 bus");

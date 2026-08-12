@@ -231,6 +231,9 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert 'id="cloudConnectionBadge"' in html
     assert 'id="decisionAction"' in html
     assert 'id="decisionReason"' in html
+    assert 'id="cloudRecommendation"' in html
+    assert 'id="cloudResultStatus"' in html
+    assert 'id="cloudLimitations"' in html
     assert 'id="decisionSafetyBox"' in html
     assert 'id="decisionDetails"' in html
     assert 'id="decisionNextStep"' in html
@@ -253,6 +256,10 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "灌溉已完成" in app_js.text
     assert "云端分析功能未启用" in app_js.text
     assert "translateSafetyReason" in app_js.text
+    assert "renderCloudResult" in app_js.text
+    assert "本次云端 AI 返回" in html
+    assert "等待 ESP32 完成云端分析" in app_js.text
+    assert "pendingCloudRequestId" in app_js.text
     assert "isGovernanceOnlyDecision" in app_js.text
     assert "该历史结果混淆了灌溉建议与硬件执行权限" in app_js.text
     assert "云端把执行权限误作灌溉依据，结果已被系统拒绝" in app_js.text

@@ -90,6 +90,27 @@ def test_device_dashboard_does_not_present_stale_cached_data_as_live(
     assert latest["snapshot"] is None
 
 
+def test_device_command_response_has_user_visible_feedback(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS,
+        database_path=tmp_path / "db.sqlite",
+        artifact_dir=tmp_path / "artifacts",
+    )
+    client = TestClient(create_app(settings))
+
+    response = client.post("/v1/actuator/debug/open")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["queued"] is True
+    assert body["requestId"]
+    assert body["action"] == "START_WATERING"
+    assert body["message"]
+    assert body["safetyReasons"] == []
+
+
 def test_duplicate_is_reported(tmp_path):
     settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
     client = TestClient(create_app(settings))

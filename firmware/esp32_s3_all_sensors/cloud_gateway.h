@@ -17,6 +17,7 @@ static const size_t CLOUD_GATEWAY_REASON_CAPACITY = 512;
 static const size_t CLOUD_GATEWAY_EVIDENCE_CAPACITY = 768;
 static const size_t CLOUD_GATEWAY_LIMITATIONS_CAPACITY = 512;
 static const size_t CLOUD_GATEWAY_ERROR_CAPACITY = 160;
+static const uint16_t CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS = 30000;
 
 // -------------------- Intermediate variables calculated by private functions --------------------
 
@@ -72,7 +73,7 @@ class CloudGateway {
 public:
   // The object owns only configuration and request buffers. It does not
   // create a background task, so the caller controls task priority and stack.
-  explicit CloudGateway(uint16_t timeoutMs = 8000);
+  explicit CloudGateway(uint16_t timeoutMs = CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS);
 
   bool begin();
 

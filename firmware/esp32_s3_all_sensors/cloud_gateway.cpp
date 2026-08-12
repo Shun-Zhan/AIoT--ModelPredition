@@ -103,7 +103,11 @@ bool CloudGateway::begin() {
 
 bool CloudGateway::loadStoredConfig() {
   Preferences preferences;
-  if (!preferences.begin(CLOUD_GATEWAY_PREFERENCES_NAMESPACE, true)) {
+  // Open read-write during startup so the namespace is created on a fresh
+  // device. A read-only open fails when `vei_cloud` does not exist yet, which
+  // would make the portal report "cloud gateway not initialized" before the
+  // first API key could ever be saved.
+  if (!preferences.begin(CLOUD_GATEWAY_PREFERENCES_NAMESPACE, false)) {
     return false;
   }
 
@@ -317,7 +321,20 @@ bool CloudGateway::executeRequest(CloudGatewayResult &result) {
   const String responseBody = http.getString();
   http.end();
   if (responseCode < 200 || responseCode >= 300) {
-    makeOfflineResult(result, CLOUD_GATEWAY_OFFLINE, "gateway returned a non-success status");
+    String gatewayError = "gateway returned HTTP " + String(responseCode);
+    JsonDocument errorDocument;
+    if (!deserializeJson(errorDocument, responseBody)) {
+      const char *errorMessage = errorDocument["error"]["message"] | "";
+      const char *errorType = errorDocument["error"]["type"] | "";
+      if (errorMessage != nullptr && errorMessage[0] != '\0') {
+        gatewayError += ": ";
+        gatewayError += errorMessage;
+      } else if (errorType != nullptr && errorType[0] != '\0') {
+        gatewayError += ": ";
+        gatewayError += errorType;
+      }
+    }
+    makeOfflineResult(result, CLOUD_GATEWAY_OFFLINE, gatewayError.c_str());
     return false;
   }
   if (!parseOpenAiResponse(responseBody, result)) {
@@ -346,7 +363,6 @@ bool CloudGateway::buildOpenAiRequest(String &payload) const {
   request["model"] = _model;
   request["temperature"] = 0.2;
   request["max_tokens"] = _pendingType == CLOUD_GATEWAY_ANALYSIS ? 500 : 700;
-  request["response_format"]["type"] = "json_object";
   JsonArray messages = request["messages"].to<JsonArray>();
   JsonObject systemMessage = messages.add<JsonObject>();
   systemMessage["role"] = "system";
@@ -355,7 +371,7 @@ bool CloudGateway::buildOpenAiRequest(String &payload) const {
                                    : CLOUD_GATEWAY_QUESTION_SYSTEM_PROMPT;
   JsonObject userMessage = messages.add<JsonObject>();
   userMessage["role"] = "user";
-  JsonObject userContent = userMessage["content"].to<JsonObject>();
+  JsonDocument userContent;
   userContent["schemaVersion"] = "1.0";
   userContent["requestId"] = _pendingRequestId;
   userContent["sensorContext"] = context.as<JsonObjectConst>();
@@ -363,6 +379,13 @@ bool CloudGateway::buildOpenAiRequest(String &payload) const {
   if (_pendingType == CLOUD_GATEWAY_QUESTION) {
     userContent["question"] = _pendingQuestion;
   }
+  // The Volcengine OpenAI-compatible endpoint expects messages[].content to
+  // be a string, matching its documented curl example. Keep the structured
+  // sensor context inside that JSON string instead of sending an object as
+  // the content value.
+  String userContentJson;
+  serializeJson(userContent, userContentJson);
+  userMessage["content"] = userContentJson;
 
   payload.clear();
   serializeJson(request, payload);

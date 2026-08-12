@@ -122,7 +122,14 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             **fields,
         }
         store.enqueue_command(command)
-        return {"status": "queued", "requestId": request_id, "action": action}
+        return {
+            "status": "queued",
+            "queued": True,
+            "requestId": request_id,
+            "action": action,
+            "message": "指令已进入 ESP32 队列，等待设备安全审核。",
+            "safetyReasons": [],
+        }
 
     def current_live_snapshot() -> dict | None:
         """Return only fresh ESP32 telemetry, never an old history row as live."""
@@ -311,6 +318,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   var voiceGotResult = false;
   var analyzeBusy = false;
   var analyzeStatusTimer = null;
+  var pendingCloudRequestId = '';
+  var pendingCloudStartedAt = 0;
   var lastRenderedDecisionId = '';
   var modeSwitchBusy = false;
   var tcpLastReceivedAt = '';
@@ -747,6 +756,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       return '自动执行已暂停：' + translateSafetyReason(raw.substring(26));
     }
     var translations = [
+      ['prediction_invalid', 'ESP32 当前预测无效，尚未满足开阀条件'],
+      ['clock_unset', '设备时间尚未校准，暂不能执行需要时间依据的灌溉'],
+      ['warming_up', '设备完整历史数据尚未积累完成'],
+      ['model_error', 'ESP32 推理模型异常'],
       ['AIOT_LLM_ENABLED is false', '云端分析功能未启用'],
       ['model used execution authority as the irrigation recommendation reason', '云端把执行权限误作灌溉依据，结果已被系统拒绝'],
       ['required sensor data is incomplete or stale', '必需传感器数据不完整或已经过期'],
@@ -782,6 +795,58 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     if (!value) return '--';
     var parsed = new Date(value);
     return isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString('zh-CN', {hour12: false});
+  }
+  function cloudStatusLabel(status) {
+    return {
+      ok: '分析完成',
+      pending: '正在分析',
+      offline: '云端暂时不可达',
+      disabled: '云端未启用',
+      invalid_request: '云端返回无效结果',
+      unknown: '等待云端结果'
+    }[status] || '云端状态：' + (status || '未知');
+  }
+  function cloudRiskLabel(risk) {
+    return {
+      low: '低风险',
+      medium: '中风险',
+      high: '高风险',
+      NORMAL: '正常',
+      ATTENTION: '需要关注',
+      DRY_RISK: '干旱风险',
+      SENSOR_INVALID: '传感器异常'
+    }[risk] || (risk || '未返回');
+  }
+  function renderCloudResult(cloud) {
+    var empty = el('cloudResultEmpty'), result = el('cloudResult');
+    if (!cloud) {
+      empty.hidden = false;
+      result.hidden = true;
+      return;
+    }
+    empty.hidden = true;
+    result.hidden = false;
+    var status = String(cloud.status || 'unknown');
+    var waitingForThisRequest = !!pendingCloudRequestId && cloud.requestId !== pendingCloudRequestId;
+    el('cloudResultStatus').textContent = waitingForThisRequest ? '等待本次分析' : cloudStatusLabel(status);
+    el('cloudResultStatus').className = 'decision-status ' + (waitingForThisRequest || status === 'pending' ? 'warn' : (status === 'ok' ? 'ok' : 'bad'));
+    el('cloudRecommendation').textContent = waitingForThisRequest
+      ? 'ESP32 正在等待云端返回，请稍候…'
+      : (cloud.recommendation || cloud.answer || (status === 'disabled' ? '云端分析未启用' : '云端没有返回分析内容'));
+    el('cloudRecommendation').className = 'decision-action ' + (status === 'ok' && !waitingForThisRequest ? 'ok' : '');
+    el('cloudRisk').textContent = waitingForThisRequest ? '本次结果尚未返回' : ('风险：' + cloudRiskLabel(cloud.riskLevel));
+    el('cloudReason').textContent = waitingForThisRequest
+      ? '本次请求已发送，页面不会继续使用上一次结果。'
+      : (cloud.reason || cloud.evidence || (status === 'offline' ? '网关暂时不可达，设备保持离线可用。' : '--'));
+    el('cloudLimitations').textContent = waitingForThisRequest
+      ? ''
+      : (cloud.limitations || '云端建议只用于分析，水阀动作仍由 ESP32 本地安全规则审核。');
+    var technical = [];
+    if (cloud.requestId) technical.push('请求 ID：' + cloud.requestId);
+    if (cloud.httpStatus) technical.push('HTTP：' + cloud.httpStatus);
+    if (cloud.updatedAt || cloud.generatedAt) technical.push('返回时间：' + formatDecisionTime(cloud.updatedAt || cloud.generatedAt));
+    if (cloud.provider) technical.push('网关：' + cloud.provider);
+    el('cloudTechnical').textContent = technical.length ? technical.join('\n') : '暂无额外技术信息';
   }
   function renderDecision(decision) {
     var empty = el('decisionEmpty'), result = el('decisionResult');
@@ -846,7 +911,20 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   }
   function refreshCloud() {
     request('GET', '/v1/cloud/status', null, function (data) {
-      var decision = data.decision, actuator = data.actuator || {};
+      var decision = data.decision, actuator = data.actuator || {}, cloud = data.latestCall || data.cloud || null;
+      if (pendingCloudRequestId && cloud && cloud.requestId === pendingCloudRequestId && cloud.status !== 'pending') {
+        var completedStatus = cloud.status === 'ok' ? 'success' : 'error';
+        var completedText = cloud.status === 'ok'
+          ? '本次云端分析已返回，下面显示的是最新 AI 内容。'
+          : '本次云端分析返回：' + cloudStatusLabel(cloud.status) + '。';
+        pendingCloudRequestId = '';
+        pendingCloudStartedAt = 0;
+        finishAnalyze(completedStatus, completedText);
+      } else if (pendingCloudRequestId && pendingCloudStartedAt && (Date.now() - pendingCloudStartedAt) > 35000) {
+        pendingCloudRequestId = '';
+        pendingCloudStartedAt = 0;
+        finishAnalyze('error', '等待 ESP32 云端回执超时；请查看设备网络和串口/TCP 接收器日志。');
+      }
       var confirm = el('confirm');
       var automatic = data.autoIrrigation || {};
       var automaticMode = data.operationMode === 'automatic';
@@ -881,6 +959,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       el('cloudAvailability').textContent = data.enabled
         ? ''
         : '云端分析当前未启用；本地传感器监测、预测和水阀安全保护仍正常运行。';
+      renderCloudResult(cloud);
       renderDecision(decision);
 
       var awaiting = !!(decision && decision.status === 'awaiting_confirmation' && !automaticMode);
@@ -1117,8 +1196,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         watchDebugCommand(result.requestId, result.action, 0);
       } else {
         var reasons = result.safetyReasons || [];
+        var fallbackReason = result.message || result.reason || result.reasonCode || '设备未接受该指令';
         setDebugStatus(
-          '未发送调试开阀指令：' + (reasons.length ? reasons.map(translateSafetyReason).join('；') : result.message),
+          '未发送调试开阀指令：' + (reasons.length ? reasons.map(translateSafetyReason).join('；') : translateSafetyReason(fallbackReason)),
           'bad'
         );
       }
@@ -1151,6 +1231,14 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     analyzeBusy = true;
     setAnalyzeState('loading', '正在向云端提交当前传感器、趋势和预测摘要…');
     request('POST', '/v1/cloud/analyze', {}, function (result) {
+      if (result.status === 'queued' && result.requestId) {
+        pendingCloudRequestId = result.requestId;
+        pendingCloudStartedAt = Date.now();
+        setAnalyzeState('loading', '请求已发送，等待 ESP32 完成云端分析…');
+        renderCloudResult({status: 'pending', requestId: result.requestId});
+        refreshCloud();
+        return;
+      }
       var action = result.proposedAction || result.finalAction || 'NO_OP';
       finishAnalyze('success', '分析已完成：' + actionLabel(action) + '。结论和原因已更新。');
       refreshCloud();
@@ -1418,6 +1506,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .decision-outcome { margin-top: 8px; color: var(--muted); font-size: 13px; line-height: 1.55; }
     .decision-reason-box, .decision-safety-box { padding: 15px 17px; border-radius: 18px; box-shadow: var(--shadow-inset); }
     .decision-reason { margin-top: 7px; color: var(--text); font-size: 16px; font-weight: 680; line-height: 1.65; }
+    .cloud-result-box { padding: 17px; border-radius: 20px; box-shadow: var(--shadow-inset); }
+    .cloud-result-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+    .cloud-recommendation { margin-top: 7px; color: var(--text); font-size: 20px; font-weight: 760; line-height: 1.55; white-space: pre-wrap; }
+    .cloud-result-meta { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.65; white-space: pre-wrap; }
+    .cloud-result-empty { padding: 17px; border-radius: 18px; box-shadow: var(--shadow-inset); color: var(--muted); line-height: 1.65; }
     .decision-safety-box { color: var(--danger); }
     .decision-safety-list { margin: 7px 0 0; padding-left: 20px; line-height: 1.65; font-size: 13px; }
     .decision-next-step { padding: 14px 16px; border-radius: 17px; color: var(--warning); box-shadow: var(--shadow-inset); font-size: 13px; font-weight: 700; line-height: 1.6; }
@@ -1583,6 +1676,23 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         <span id="cloudAutoBadge" class="status-badge">自动灌溉：读取中</span>
       </div>
       <div id="cloudAvailability" class="cloud-alert" hidden></div>
+      <div id="cloudResultEmpty" class="cloud-result-empty">尚未收到本次云端 AI 返回。点击“请求一次分析”后，这里会显示模型的分析、风险和依据。</div>
+      <div id="cloudResult" class="cloud-result-box" aria-live="polite" hidden>
+        <div class="cloud-result-head">
+          <div>
+            <div class="decision-section-title">本次云端 AI 返回</div>
+            <div id="cloudRecommendation" class="cloud-recommendation">--</div>
+          </div>
+          <span id="cloudResultStatus" class="decision-status">--</span>
+        </div>
+        <div id="cloudRisk" class="cloud-result-meta"></div>
+        <div class="cloud-result-meta"><strong>分析依据：</strong><span id="cloudReason">--</span></div>
+        <div class="cloud-result-meta"><strong>限制说明：</strong><span id="cloudLimitations">--</span></div>
+        <details class="decision-details">
+          <summary>查看云端技术信息</summary>
+          <div id="cloudTechnical" class="decision-technical"></div>
+        </details>
+      </div>
       <div id="decisionEmpty" class="decision-empty">尚未进行云端分析。点击下方按钮后，将结合当前传感器、历史趋势和本地预测给出建议。</div>
       <div id="decisionResult" class="decision-result" aria-live="polite" hidden>
         <div class="decision-head">
