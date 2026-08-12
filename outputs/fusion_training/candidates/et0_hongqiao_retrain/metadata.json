@@ -1,0 +1,16 @@
+{
+  "candidate_only": true,
+  "seed": 20260812,
+  "model_class": "NBeatsET0",
+  "history_hours": 24,
+  "training_data_type": "hongqiao_fao56_et0_retrain",
+  "proxy_train_windows": 42910,
+  "proxy_validation_windows": 9182,
+  "git": {
+    "commit": "ef79cf35120c53b61e46756e88eae5237bb1a6b9",
+    "status": "?? outputs/fusion_training/\n?? outputs/model_accuracy_report/\n?? scripts/analyze_field_accuracy.py\n?? scripts/extract_accuracy_sources.py\n?? scripts/train_fusion_candidates.py\n?? tests/test_fusion_training.py"
+  },
+  "generated_at": "2026-08-12T21:26:41.629712+09:00",
+  "production_artifacts_unchanged_by_design": true,
+  "deployment_status": "expert_material_candidate_only"
+}

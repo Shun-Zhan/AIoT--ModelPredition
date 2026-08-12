@@ -9,7 +9,7 @@ from dual_forecast.config import SETTINGS
 from dual_forecast.irrigation import IrrigationService
 from dual_forecast.schemas import SensorSnapshot
 from dual_forecast.schemas import DeviceCloudResult, DeviceForecast, DeviceIrrigationState
-from dual_forecast.service import create_app
+from dual_forecast.service import create_app, demo_forecast_from_live_snapshot
 from dual_forecast.storage import Store
 
 
@@ -106,7 +106,7 @@ def test_device_command_response_has_user_visible_feedback(tmp_path, monkeypatch
     assert body["status"] == "queued"
     assert body["queued"] is True
     assert body["requestId"]
-    assert body["action"] == "START_WATERING"
+    assert body["action"] == "DEBUG_VALVE_PULSE"
     assert body["message"]
     assert body["safetyReasons"] == []
 
@@ -143,6 +143,9 @@ def test_dashboard_exposes_latest_snapshot(tmp_path):
     assert "💧" in page.text
     assert "🌱" in page.text
     assert "☀️" in page.text
+    app_js = client.get("/v1/dashboard/app.js")
+    assert app_js.status_code == 200
+    assert "当前 ESP32 固件不支持人工调试开阀动作" in app_js.text
     edge = latest.json()["edge"]
     assert edge["thresholds"]["irrigationSoilMoisturePercent"] == 30.0
     assert edge["thresholds"]["unit"] == "%"
@@ -158,6 +161,24 @@ def test_live_telemetry_refreshes_dashboard_without_storing_model_sample(tmp_pat
     assert client.post("/v1/telemetry/live", json=live_payload).status_code == 200
     latest = client.get("/v1/dashboard/latest").json()
     assert latest["snapshot"]["air"]["temperatureC"] == 26.5
+    assert latest["forecast"]["status"] == "demo_preview"
+    assert latest["forecast"]["historySource"] == "live_demo_projection"
+    assert latest["forecast"]["displayOnly"] is True
+    assert len(latest["forecast"]["forecast"]) == 12
+    assert client.get("/v1/forecast/latest").status_code == 404
+
+
+def test_demo_forecast_requires_live_soil_and_et0_and_is_bounded():
+    assert demo_forecast_from_live_snapshot(None) is None
+    assert demo_forecast_from_live_snapshot({"soil": {"moisturePercent": 50}}) is None
+    preview = demo_forecast_from_live_snapshot({
+        "soil": {"moisturePercent": 55},
+        "et0MmPerHour": 0.24,
+    })
+    assert preview["status"] == "demo_preview"
+    assert preview["safetyLocked"] is True
+    assert len(preview["forecast"]) == 12
+    assert preview["forecast"][-1]["soilMoisturePercent"] < 55
 
 
 def test_dashboard_prefers_device_forecast_decision_and_cloud_result(tmp_path):
@@ -181,9 +202,30 @@ def test_dashboard_prefers_device_forecast_decision_and_cloud_result(tmp_path):
     body = latest.json()
     assert body["forecast"]["schemaVersion"] == "2.0"
     assert body["forecast"]["soilMoistureInOneHour"] == 41.2
-    assert body["decision"]["state"] == "CLOSED"
+    assert body["decision"]["finalAction"] == "NO_OP"
     assert body["cloud"]["status"] == "offline"
     assert body["device"]["cloudResult"]["finalAction"] == "NO_OP"
+
+
+def test_device_dashboard_marks_old_rejection_as_expired_not_current_safety(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
+    )
+    store = Store(settings.database_path)
+    store.save_device_cloud_result(DeviceCloudResult(
+        schemaVersion="2.0", status="rejected", requestId="old-cloud-result",
+        action="START_WATERING", proposedAction="START_WATERING", finalAction="NO_OP",
+        durationSeconds=39, reason="soil is dry",
+        expiresAt=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+        safetyReasons=["watering cooldown is active"],
+    ))
+
+    body = TestClient(create_app(settings)).get("/v1/dashboard/latest").json()
+
+    assert body["decision"]["status"] == "expired"
+    assert body["decision"]["safetyReasons"] == ["decision has expired"]
+    assert body["decision"]["finalAction"] == "NO_OP"
 
 
 def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):

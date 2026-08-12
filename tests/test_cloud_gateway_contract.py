@@ -52,9 +52,11 @@ def test_request_and_response_use_arduinojson_v7_and_strict_shapes():
     assert "serializeJson(request, payload)" in source
     assert "deserializeJson" in source
     assert 'request["response_format"]' not in source
-    assert 'userMessage["content"] = userContentJson' in source
-    assert "Volcengine OpenAI-compatible endpoint expects messages[].content" in source
-    assert '"kind", "recommendation", "riskLevel",' in source
+    assert 'userMessage["content"] = contextJson' in source
+    assert 'contractMessage["content"] = contract' in source
+    assert 'messages = request["messages"].to<JsonArray>()' in source
+    assert '"requestId", "action", "durationSeconds",' in source
+    assert '"reasonCode", "reason", "confidence", "expiresAt"' in source
     assert '"schemaVersion", "kind", "answer", "evidence", "limitations"' in source
     assert "hasOnlyFields" in source
     assert "CLOUD_GATEWAY_ANALYSIS" in header
@@ -111,6 +113,36 @@ def test_cloud_output_is_advice_only_and_never_gpio_control():
     assert "digitalWrite" not in combined
     assert "pinMode" not in combined
     assert "ledcWrite" not in combined
+
+
+def test_cloud_prompt_matches_original_action_decision_contract():
+    _, source = read_sources()
+    assert "START_WATERING、STOP_WATERING、NO_OP" in source
+    assert "IRRIGATION_CANDIDATE" in source
+    assert "NO_OP的原因必须是明确的环境、传感器、预测或灌溉必要性依据" in source
+
+
+def test_cloud_gateway_uses_demo_farm_profile_instead_of_legacy_unconfigured_placeholder():
+    _, source = read_sources()
+    assert '\\"crop\\\":\\\"番茄\\\"' in source
+    assert '\\"source\\\":\\\"demo_default\\\"' in source
+    assert "shouldUseDefaultFarmProfile(_farmProfileJson)" in source
+    assert "text == CLOUD_GATEWAY_LEGACY_EMPTY_FARM_PROFILE" in source
+    assert "context[\"constraints\"][\"farmProfile\"]" in source
+
+
+def test_device_cloud_context_keeps_original_decision_context_shape_and_separates_execution_mode():
+    sketch = (ROOT / "firmware/esp32_s3_all_sensors/esp32_s3_all_sensors.ino").read_text(
+        encoding="utf-8"
+    )
+    builder = sketch[sketch.index("static void deviceBuildCloudContext(String &context)"):
+                     sketch.index("static void deviceSubmitCloud")]
+    for key in ('"current"', '"trends"', '"windows"', '"last1Hour"',
+                '"last24Hours"', '"last7Days"', '"forecast"', '"actuator"',
+                '"constraints"', '"edgeRisk"', '"farmProfile"', '"weather"'):
+        assert key in builder or key in read_sources()[1]
+    assert "deviceCloudIrrigationCandidate(&candidateRule)" in builder
+    assert "automaticModeEnabled" not in builder
 
 
 def test_required_code_order_markers_are_present():

@@ -193,6 +193,8 @@ class DeviceCloudResult(_DeviceProtocolModel):
     confidence: float | None = Field(default=None, ge=0, le=1)
     provider: str | None = None
     modelVersion: str | None = None
+    expiresAt: datetime | None = None
+    safetyReasons: list[str] = Field(default_factory=list)
 
 
 class DeviceUiAck(_DeviceProtocolModel):
@@ -203,6 +205,11 @@ class DeviceUiAck(_DeviceProtocolModel):
     action: str | None = None
     message: str | None = None
     reason: str | None = None
+    actualState: str | None = None
+    remainingSeconds: int | None = Field(default=None, ge=0, le=60)
+    relayGpio: int | None = Field(default=None, ge=0)
+    relayOutputLevel: str | None = None
+    physicalFeedbackAvailable: bool | None = None
 
 
 class IrrigationDecision(BaseModel):

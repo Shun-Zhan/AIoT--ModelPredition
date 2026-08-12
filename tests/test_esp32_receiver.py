@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dual_forecast.esp32_receiver import (
@@ -197,6 +198,27 @@ def test_v2_device_result_prefixes_are_parsed_and_cached(tmp_path):
     assert cached["uiAck"]["accepted"] is True
 
 
+def test_v2_ui_ack_updates_the_matching_command_queue(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.enqueue_command({
+        "schemaVersion": "2.0", "requestId": "ui-debug-pulse-1",
+        "action": "DEBUG_VALVE_PULSE", "durationSeconds": 5,
+    })
+    store.mark_command_sent("ui-debug-pulse-1")
+
+    assert _handle_device_result_line(
+        '@UI_ACK {"schemaVersion":"2.0","requestId":"ui-debug-pulse-1",'
+        '"accepted":false,"action":"DEBUG_VALVE_PULSE",'
+        '"reason":"daily_limit","actualState":"CLOSED"}',
+        store,
+    )
+
+    status = store.command_status("ui-debug-pulse-1")
+    assert status["status"] == "rejected"
+    assert status["ack"]["reason"] == "daily_limit"
+    assert status["ack"]["actualState"] == "CLOSED"
+
+
 def test_malformed_v2_device_result_is_consumed_without_cache_write(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     assert _handle_device_result_line('@FORECAST {"schemaVersion":"1.0"}', store)
@@ -354,6 +376,55 @@ def test_wifi_command_is_compacted_for_deployed_192_byte_firmware_buffer(tmp_pat
     assert payload["ttlSeconds"] == 30
     assert "reason" not in payload
     assert "confidence" not in payload
+
+
+def test_debug_valve_pulse_compaction_keeps_fixed_duration(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    store = Store(tmp_path / "db.sqlite")
+    request_id = "13a1d447-2192-4947-b933-b8671a7176ec"
+    assert store.enqueue_command({
+        "schemaVersion": "2.0",
+        "requestId": request_id,
+        "action": "DEBUG_VALVE_PULSE",
+        "durationSeconds": 5,
+        "reasonCode": "UI",
+        "reason": "long audit reason retained only in SQLite",
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "ttlSeconds": 30,
+        "transport": "UI_COMMAND",
+    })
+    writer = FakeTcpWriter()
+
+    _send_pending_commands(writer, store)
+
+    wire = writer.data.decode().rstrip("\n")
+    assert len(wire.encode()) <= writer.max_control_line_bytes
+    payload = json.loads(wire.removeprefix("@UI_COMMAND "))
+    assert payload["action"] == "DEBUG_VALVE_PULSE"
+    assert payload["durationSeconds"] == 5
+
+
+def test_confirm_watering_compaction_keeps_cloud_decision_binding(tmp_path):
+    store = Store(tmp_path / "commands.sqlite")
+    command = {
+        "schemaVersion": "2.0",
+        "requestId": "confirm-command-12345678",
+        "action": "CONFIRM_WATERING",
+        "sourceRequestId": "cloud-decision-12345678",
+        "durationSeconds": 27,
+        "reasonCode": "UI",
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "ttlSeconds": 30,
+        "transport": "UI_COMMAND",
+        "extraLongField": "x" * 300,
+    }
+    assert store.enqueue_command(command)
+    connection = FakeTcpWriter()
+    _send_pending_commands(connection, store)
+    payload = json.loads(connection.data.decode().removeprefix("@UI_COMMAND "))
+    assert payload["durationSeconds"] == 27
+    assert payload["sourceRequestId"] == "cloud-decision-12345678"
 
 
 def test_failed_serial_write_keeps_command_pending(tmp_path):

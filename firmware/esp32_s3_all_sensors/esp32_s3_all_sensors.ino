@@ -101,8 +101,7 @@ static const size_t HOST_CONTROL_LINE_CAPACITY = 1024;
 
 // One-channel 3.3 V relay input, configured as HIGH-level active. The
 // normally-closed water valve power circuit uses relay COM + NO, so LOW is
-// always the safe/off state. The display experiment is disabled; GPIO11 is
-// now reserved exclusively for this relay.
+// always the safe/off state. GPIO11 is reserved exclusively for this relay.
 static const uint8_t VALVE_RELAY_PIN = 11;
 static const bool VALVE_RELAY_ACTIVE_HIGH = true;
 static const uint32_t MAX_WATERING_MS = 60000;
@@ -478,6 +477,10 @@ uint32_t deviceDailyWateredSeconds = 0;
 uint32_t deviceWateringDayUtc = 0;
 uint32_t deviceLastWateringEpochUtc = 0;
 uint32_t deviceValveOpenEpochUtc = 0;
+bool valveCountsForFormalCooldown = false;
+char pendingCloudWateringRequestId[CLOUD_GATEWAY_REQUEST_ID_CAPACITY] = {};
+uint32_t pendingCloudWateringDurationSeconds = 0;
+uint32_t pendingCloudWateringExpiresAtMs = 0;
 DeviceIrrigationEvaluation latestIrrigationEvaluation = {
     false, false, false, false, false, false, 0, 0.0f,
     DEVICE_IRRIGATION_AUTO_DISABLED};
@@ -500,6 +503,8 @@ static const char *deviceClockSourceText();
 static void deviceTryInjectSyntheticHistory();
 static bool deviceSyntheticHistoryBlocksValve();
 static bool deviceRunModelInference(edge_model::ModelOutput &result);
+static bool deviceCloudIrrigationCandidate(const char **rule = nullptr);
+static String deviceIsoUtc(uint32_t epochUtc);
 
 uint32_t offlineLogChecksum(const uint8_t *data, size_t length) {
   // FNV-1a is sufficient here to detect a torn/corrupt flash record before
@@ -775,12 +780,17 @@ void setValveRelay(bool open) {
     deviceDailyWateredSeconds = min<uint32_t>(
         DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS,
         deviceDailyWateredSeconds + elapsedSeconds);
-    if (nowEpochUtc != 0) deviceLastWateringEpochUtc = nowEpochUtc;
+    if (valveCountsForFormalCooldown && nowEpochUtc != 0) {
+      deviceLastWateringEpochUtc = nowEpochUtc;
+    }
     Preferences irrigationPreferences;
     if (irrigationPreferences.begin("aiot_irrig", false)) {
       irrigationPreferences.putUInt("day_utc", deviceWateringDayUtc);
       irrigationPreferences.putUInt("daily_sec", deviceDailyWateredSeconds);
       irrigationPreferences.putUInt("last_epoch", deviceLastWateringEpochUtc);
+      if (valveCountsForFormalCooldown) {
+        irrigationPreferences.putBool("formal_v2", true);
+      }
       irrigationPreferences.end();
     }
   }
@@ -791,6 +801,7 @@ void setValveRelay(bool open) {
     valveCloseAtMs = 0;
     valveRequiresHostHeartbeat = true;
     valveOpenedByLocalAuto = false;
+    valveCountsForFormalCooldown = false;
   }
 }
 
@@ -944,6 +955,7 @@ void handleValveCommand(const char *json) {
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
     valveRequiresHostHeartbeat = true;
     valveOpenedByLocalAuto = false;
+    valveCountsForFormalCooldown = true;
     setValveRelay(true);
     valveCloseAtMs = millis() + static_cast<uint32_t>(durationSeconds) * 1000;
     lastHostHeartbeatMs = millis();
@@ -1131,7 +1143,19 @@ static void deviceLoadIrrigationCounters() {
   deviceWateringDayUtc = preferences.getUInt("day_utc", 0);
   deviceDailyWateredSeconds = preferences.getUInt("daily_sec", 0);
   deviceLastWateringEpochUtc = preferences.getUInt("last_epoch", 0);
+  const bool formalCooldownTagged = preferences.getBool("formal_v2", false);
   preferences.end();
+  // Firmware before the formal_v2 marker updated last_epoch for every relay
+  // diagnostic pulse. That timestamp cannot prove a real irrigation cycle,
+  // so migrate it to no cooldown while retaining the daily water total.
+  if (!formalCooldownTagged && deviceLastWateringEpochUtc != 0) {
+    deviceLastWateringEpochUtc = 0;
+    if (preferences.begin("aiot_irrig", false)) {
+      preferences.putUInt("last_epoch", 0);
+      preferences.putBool("formal_v2", true);
+      preferences.end();
+    }
+  }
 }
 
 static void deviceRestoreHistory() {
@@ -1362,6 +1386,9 @@ static void emitDeviceUiAck(const char *requestId, bool accepted,
   document["action"] = action == nullptr ? "" : action;
   document["reason"] = reason == nullptr ? "" : reason;
   document["actualState"] = valveOpen ? "OPEN" : "CLOSED";
+  document["relayGpio"] = VALVE_RELAY_PIN;
+  document["relayOutputLevel"] = digitalRead(VALVE_RELAY_PIN) == HIGH ? "HIGH" : "LOW";
+  document["physicalFeedbackAvailable"] = false;
   sendDeviceProtocol(USB_UI_ACK_PREFIX, document);
 }
 
@@ -1378,35 +1405,273 @@ void emitDeviceCloudResult(const CloudGatewayResult &result) {
                                        : result.status == CLOUD_GATEWAY_PENDING
                                              ? "pending"
                                              : "invalid_request";
-  document["status"] = status;
+  const bool startSuggested = result.status == CLOUD_GATEWAY_OK &&
+                              strcmp(result.action, "START_WATERING") == 0;
+  const bool stopSuggested = result.status == CLOUD_GATEWAY_OK &&
+                             strcmp(result.action, "STOP_WATERING") == 0;
+  const bool cloudCandidate = deviceCloudIrrigationCandidate();
+  const bool sensorsValid = latestDeviceSample.validityMask ==
+                                DEVICE_SENSOR_ALL_REQUIRED_VALID &&
+                            latestDeviceSample.soilMoisturePercent > 0.0f &&
+                            latestDeviceSample.soilMoisturePercent <= 100.0f;
+  const bool durationValid = !startSuggested ||
+                             (result.durationSeconds >= 1 &&
+                              result.durationSeconds <= DEVICE_RUNTIME_SINGLE_WATERING_SECONDS);
+  const bool confidenceValid = !startSuggested ||
+                               (result.hasConfidence && result.confidence >= 0.5f);
+  const bool valveSafe = !startSuggested || !valveOpen;
+  const bool dailyLimitSafe = !startSuggested ||
+                              deviceDailyWateredSeconds + result.durationSeconds <=
+                                  DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS;
+  const bool cooldownSafe = !startSuggested || deviceLastWateringEpochUtc == 0 ||
+                            (latestDeviceSample.epochUtc >= deviceLastWateringEpochUtc &&
+                             latestDeviceSample.epochUtc - deviceLastWateringEpochUtc >=
+                                 DEVICE_RUNTIME_COOLDOWN_SECONDS);
+  const bool localAccepted = !startSuggested ||
+                             (cloudCandidate && sensorsValid && durationValid &&
+                              confidenceValid && valveSafe && dailyLimitSafe && cooldownSafe);
+  pendingCloudWateringRequestId[0] = '\0';
+  pendingCloudWateringDurationSeconds = 0;
+  pendingCloudWateringExpiresAtMs = 0;
+  if (startSuggested && localAccepted) {
+    strlcpy(pendingCloudWateringRequestId, result.requestId,
+            sizeof(pendingCloudWateringRequestId));
+    pendingCloudWateringDurationSeconds = result.durationSeconds;
+    pendingCloudWateringExpiresAtMs = millis() + 55UL * 1000UL;
+  }
+  document["status"] = result.status == CLOUD_GATEWAY_OK
+                           ? ((startSuggested || stopSuggested) && localAccepted
+                                  ? "awaiting_confirmation"
+                                  : (localAccepted ? "suggested" : "rejected"))
+                           : status;
   document["httpStatus"] = result.httpStatus;
-  document["recommendation"] = result.recommendation;
-  document["riskLevel"] = result.riskLevel;
+  document["action"] = result.action;
+  document["proposedAction"] = result.action;
+  document["finalAction"] = localAccepted ? result.action : "NO_OP";
+  if (result.durationSeconds > 0) {
+    document["durationSeconds"] = result.durationSeconds;
+  } else {
+    document["durationSeconds"] = serialized("null");
+  }
+  document["reasonCode"] = result.reasonCode;
+  if (result.hasConfidence) {
+    document["confidence"] = result.confidence;
+  } else {
+    document["confidence"] = serialized("null");
+  }
+  document["expiresAt"] = result.expiresAt;
   document["answer"] = result.answer;
   document["reason"] = result.reason;
   document["evidence"] = result.evidence;
-  document["limitations"] = result.limitations;
+  JsonArray safetyReasons = document["safetyReasons"].to<JsonArray>();
+  if (startSuggested && !sensorsValid) {
+    safetyReasons.add("required sensor data is incomplete or stale");
+  }
+  if (startSuggested && !cloudCandidate) {
+    safetyReasons.add("local predictive irrigation candidate criteria are not met");
+  }
+  if (startSuggested && latestDeviceSample.soilMoisturePercent >=
+                            DEVICE_RUNTIME_TARGET_SOIL_PERCENT) {
+    safetyReasons.add("soil moisture is already at or above target");
+  }
+  if (!durationValid) safetyReasons.add("duration exceeds local limit");
+  if (!confidenceValid) safetyReasons.add("model confidence is below local threshold");
+  if (!valveSafe) safetyReasons.add("valve is already open");
+  if (!cooldownSafe) safetyReasons.add("watering cooldown is active");
+  if (!dailyLimitSafe) safetyReasons.add("daily watering limit would be exceeded");
   document["error"] = result.error;
   sendDeviceProtocol(USB_CLOUD_RESULT_PREFIX, document);
 }
 
 static void deviceBuildCloudContext(String &context) {
   JsonDocument document;
-  document["timestampUtc"] = latestDeviceSample.epochUtc;
-  document["soilMoisturePercent"] = latestDeviceSample.soilMoisturePercent;
-  document["soilTemperatureC"] = latestDeviceSample.soilTemperatureC;
-  document["airTemperatureC"] = latestDeviceSample.airTemperatureC;
-  document["airHumidityPercent"] = latestDeviceSample.airHumidityPercent;
-  document["airPressureHpa"] = latestDeviceSample.airPressureHpa;
-  document["solarIncomingWm2"] = latestDeviceSample.solarIncomingWm2;
-  document["solarReflectedWm2"] = latestDeviceSample.solarReflectedWm2;
-  document["windSpeedMs"] = latestDeviceSample.windSpeedMs;
-  document["forecastStatus"] = deviceForecast.status;
-  document["nextHourEt0Mm"] = deviceForecast.nextHourEt0Mm;
-  document["predictedSoilMoistureInOneHour"] =
-      deviceForecast.soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1];
+  document["schemaVersion"] = "1.0";
+  JsonObject current = document["current"].to<JsonObject>();
+  current["uptimeMs"] = millis();
+  current["receivedAt"] = deviceIsoUtc(latestDeviceSample.epochUtc);
+  current["airOk"] = (latestDeviceSample.validityMask &
+                       (DEVICE_SENSOR_AIR_TEMPERATURE_VALID |
+                        DEVICE_SENSOR_AIR_HUMIDITY_VALID)) != 0;
+  JsonObject currentAir = current["air"].to<JsonObject>();
+  currentAir["temperatureC"] = latestDeviceSample.airTemperatureC;
+  currentAir["humidityPercent"] = latestDeviceSample.airHumidityPercent;
+  current["soilOk"] = (latestDeviceSample.validityMask &
+                        (DEVICE_SENSOR_SOIL_TEMPERATURE_VALID |
+                         DEVICE_SENSOR_SOIL_MOISTURE_VALID)) != 0;
+  JsonObject currentSoil = current["soil"].to<JsonObject>();
+  currentSoil["temperatureC"] = latestDeviceSample.soilTemperatureC;
+  currentSoil["moisturePercent"] = latestDeviceSample.soilMoisturePercent;
+  current["windOk"] = (latestDeviceSample.validityMask &
+                        DEVICE_SENSOR_WIND_SPEED_VALID) != 0;
+  current["windSpeedMs"] = latestDeviceSample.windSpeedMs;
+  current["solar1Ok"] = (latestDeviceSample.validityMask &
+                          DEVICE_SENSOR_SOLAR_REFLECTED_VALID) != 0;
+  current["solar2Ok"] = (latestDeviceSample.validityMask &
+                          DEVICE_SENSOR_SOLAR_INCOMING_VALID) != 0;
+  current["solarRadiation1Wm2"] = latestDeviceSample.solarReflectedWm2;
+  current["solarRadiation2Wm2"] = latestDeviceSample.solarIncomingWm2;
+  current["solarOk"] = (latestDeviceSample.validityMask &
+                         DEVICE_SENSOR_SOLAR_INCOMING_VALID) != 0;
+  current["solarRadiationWm2"] = max(latestDeviceSample.solarIncomingWm2 -
+                                      latestDeviceSample.solarReflectedWm2, 0.0f);
+  current["airPressureHpa"] = latestDeviceSample.airPressureHpa;
+  current["allSensorsValid"] =
+      latestDeviceSample.validityMask == DEVICE_SENSOR_ALL_REQUIRED_VALID &&
+      latestDeviceSample.soilMoisturePercent > 0.0f &&
+      latestDeviceSample.soilMoisturePercent <= 100.0f;
+  current["fresh"] = true;
+
+  JsonObject trends = document["trends"].to<JsonObject>();
+  const size_t historyCount = DeviceRuntimeInstance.history().copyChronological(
+      deviceHistoryScratch, DEVICE_RUNTIME_RING_CAPACITY);
+  trends["samples"] = historyCount;
+  JsonObject windows = trends["windows"].to<JsonObject>();
+  if (historyCount > 0) {
+    const uint32_t endEpoch = deviceHistoryScratch[historyCount - 1].epoch;
+    const char *labels[] = {"last1Hour", "last24Hours", "last7Days"};
+    const uint32_t seconds[] = {3600UL, 24UL * 3600UL, 7UL * 24UL * 3600UL};
+    for (size_t windowIndex = 0; windowIndex < 3; ++windowIndex) {
+      size_t first = 0;
+      while (first + 1 < historyCount &&
+             deviceHistoryScratch[first].epoch < endEpoch - min(endEpoch, seconds[windowIndex])) {
+        ++first;
+      }
+      const size_t count = historyCount - first;
+      JsonObject summary = windows[labels[windowIndex]].to<JsonObject>();
+      summary["samples"] = count;
+      const char *names[] = {"air_temp_c", "rh_percent", "soil_temp_c",
+                             "soil_moisture_percent", "wind_ms", "solar_wm2",
+                             "pressure_kpa"};
+      for (size_t metric = 0; metric < 7; ++metric) {
+        float sum = 0.0f, minimum = INFINITY, maximum = -INFINITY;
+        float firstValue = 0.0f, latestValue = 0.0f;
+        for (size_t index = first; index < historyCount; ++index) {
+          const DeviceRuntimeRecordV2 &record = deviceHistoryScratch[index];
+          const float values[] = {
+              record.airTemperatureC, record.airHumidityPercent,
+              record.soilTemperatureC, record.soilMoisturePercent,
+              record.windSpeedMs,
+              max(record.solarIncomingWm2 - record.solarReflectedWm2, 0.0f),
+              record.airPressureHpa / 10.0f};
+          const float value = values[metric];
+          if (index == first) firstValue = value;
+          latestValue = value;
+          sum += value;
+          minimum = min(minimum, value);
+          maximum = max(maximum, value);
+        }
+        JsonObject values = summary[names[metric]].to<JsonObject>();
+        values["latest"] = latestValue;
+        values["mean"] = sum / max<size_t>(count, 1);
+        values["min"] = minimum;
+        values["max"] = maximum;
+        if (count >= 2) {
+          const float spanHours = max(
+              static_cast<float>(deviceHistoryScratch[historyCount - 1].epoch -
+                                 deviceHistoryScratch[first].epoch) / 3600.0f,
+              1.0f / 60.0f);
+          values["change"] = latestValue - firstValue;
+          values["changePerHour"] = (latestValue - firstValue) / spanHours;
+        }
+      }
+    }
+    trends["dataStart"] = deviceIsoUtc(deviceHistoryScratch[0].epoch);
+    trends["dataEnd"] = deviceIsoUtc(endEpoch);
+  }
+
+  JsonObject forecast = document["forecast"].to<JsonObject>();
+  forecast["status"] = deviceForecast.status;
+  forecast["generatedAt"] = deviceIsoUtc(deviceForecast.generatedEpochUtc);
+  forecast["requiredSamples"] = DEVICE_RUNTIME_RING_CAPACITY;
+  forecast["availableSamples"] = deviceForecast.availableSamples;
+  JsonArray forecastPoints = forecast["forecast"].to<JsonArray>();
+  if (deviceForecast.valid) {
+    for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
+      JsonObject point = forecastPoints.add<JsonObject>();
+      point["timestamp"] = deviceIsoUtc(deviceForecast.timestampsUtc[index]);
+      point["et0Mm"] = deviceForecast.et0Mm[index];
+      point["soilMoisturePercent"] = deviceForecast.soilMoisturePercent[index];
+    }
+  }
+
+  JsonObject actuator = document["actuator"].to<JsonObject>();
+  actuator["state"] = valveOpen ? "OPEN" : "CLOSED";
+  actuator["dailyWateredSeconds"] = deviceDailyWateredSeconds;
+
+  JsonObject constraints = document["constraints"].to<JsonObject>();
+  constraints["maxWateringSeconds"] = DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
+  constraints["severeDryPercent"] = DEVICE_RUNTIME_SOIL_SEVERE_DRY_PERCENT;
+  constraints["triggerPercent"] = DEVICE_RUNTIME_SOIL_TRIGGER_PERCENT;
+  constraints["predictiveMaxPercent"] = DEVICE_RUNTIME_SOIL_PREDICTIVE_MAX_PERCENT;
+  constraints["highEt0OneHourMm"] = DEVICE_RUNTIME_ET0_TRIGGER_MM;
+  constraints["targetPercent"] = DEVICE_RUNTIME_TARGET_SOIL_PERCENT;
+  constraints["cloudNeverDirectlyControlsGPIO"] = true;
+  constraints["activeAnomalies"].to<JsonArray>();
+  constraints["recentAnomalies"].to<JsonArray>();
+  JsonObject watering = constraints["wateringLast7Days"].to<JsonObject>();
+  watering["wateringCount"] = 0;
+  watering["wateringSeconds"] = deviceDailyWateredSeconds;
+  constraints["recentReviewedDecisions"].to<JsonArray>();
+  JsonObject weather = constraints["weather"].to<JsonObject>();
+  weather["status"] = "not_configured";
+  weather["instruction"] = "不得假设降雨、天气预报或地理位置";
+  const char *candidateRule = nullptr;
+  const bool candidate = deviceCloudIrrigationCandidate(&candidateRule);
+  JsonObject edgeRisk = constraints["edgeRisk"].to<JsonObject>();
+  edgeRisk["riskLevel"] = candidate ? "IRRIGATION_CANDIDATE" : "NORMAL";
+  edgeRisk["riskScore"] = candidate ? 76 : 20;
+  JsonArray reasons = edgeRisk["reasons"].to<JsonArray>();
+  reasons.add(candidate ? "土壤严重干燥，形成灌溉候选" : "当前多传感器状态稳定");
+  JsonObject irrigationCandidate = edgeRisk["irrigationCandidate"].to<JsonObject>();
+  irrigationCandidate["eligible"] = candidate;
+  if (candidateRule != nullptr) irrigationCandidate["rule"] = candidateRule;
+  irrigationCandidate["moisturePercent"] = latestDeviceSample.soilMoisturePercent;
+  irrigationCandidate["forecastReady"] = deviceForecast.valid;
   context = "";
   serializeJson(document, context);
+}
+
+static bool deviceCloudIrrigationCandidate(const char **rule) {
+  if (rule != nullptr) *rule = nullptr;
+  const bool sensorsValid =
+      latestDeviceSample.validityMask == DEVICE_SENSOR_ALL_REQUIRED_VALID &&
+      latestDeviceSample.soilMoisturePercent > 0.0f &&
+      latestDeviceSample.soilMoisturePercent <= 100.0f;
+  if (!sensorsValid) return false;
+  const float moisture = latestDeviceSample.soilMoisturePercent;
+  if (moisture < DEVICE_RUNTIME_SOIL_SEVERE_DRY_PERCENT) {
+    if (rule != nullptr) *rule = "SEVERE_DRY";
+    return true;
+  }
+  if (!deviceForecast.valid) return false;
+  const float endMoisture =
+      deviceForecast.soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1];
+  float minimumMoisture = 100.0f;
+  for (float value : deviceForecast.soilMoisturePercent) {
+    minimumMoisture = min(minimumMoisture, value);
+  }
+  const bool declining = endMoisture < moisture;
+  const bool highEt0 = deviceForecast.nextHourEt0Mm >= DEVICE_RUNTIME_ET0_TRIGGER_MM;
+  if (moisture < DEVICE_RUNTIME_SOIL_TRIGGER_PERCENT && (declining || highEt0)) {
+    if (rule != nullptr) *rule = "DECLINING_OR_HIGH_ET0";
+    return true;
+  }
+  if (moisture <= DEVICE_RUNTIME_SOIL_PREDICTIVE_MAX_PERCENT &&
+      minimumMoisture < DEVICE_RUNTIME_SOIL_TRIGGER_PERCENT && highEt0) {
+    if (rule != nullptr) *rule = "PREDICTED_CROSSING_AND_HIGH_ET0";
+    return true;
+  }
+  return false;
+}
+
+static String deviceIsoUtc(uint32_t epochUtc) {
+  if (!deviceRuntimeIsValidUtcEpoch(epochUtc)) return "";
+  const time_t value = static_cast<time_t>(epochUtc);
+  struct tm utc = {};
+  gmtime_r(&value, &utc);
+  char text[24] = {};
+  strftime(text, sizeof(text), "%Y-%m-%dT%H:%M:%SZ", &utc);
+  return String(text);
 }
 
 static void deviceSubmitCloud(CloudGatewayRequestType type, const char *requestId,
@@ -1507,16 +1772,74 @@ void handleDeviceUiCommand(const char *json) {
     emitDeviceIrrigationState(requestId);
     return;
   }
+  if (strcmp(action, "DEBUG_VALVE_PULSE") == 0) {
+    // Explicit, human-initiated relay diagnostic. It never authorizes formal
+    // irrigation and is deliberately fixed at five seconds. Keep the hard
+    // actuator protections that remain meaningful without a model forecast.
+    const uint32_t duration = document["durationSeconds"] | 0UL;
+    if (deviceSyntheticHistoryBlocksValve()) {
+      emitDeviceUiAck(requestId, false, action,
+                      "synthetic_history_test_valve_locked");
+      return;
+    }
+    if (duration != 5UL) {
+      emitDeviceUiAck(requestId, false, action, "debug_duration_must_be_5s");
+      return;
+    }
+    if (valveOpen) {
+      emitDeviceUiAck(requestId, false, action, "valve_already_open");
+      return;
+    }
+    if (strcmp(requestId, lastRequestId) == 0) {
+      emitDeviceUiAck(requestId, true, action, "duplicate_idempotent");
+      return;
+    }
+    if (deviceDailyWateredSeconds >
+        DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS - duration) {
+      emitDeviceUiAck(requestId, false, action, "daily_limit");
+      return;
+    }
+    strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
+    strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
+    valveRequiresHostHeartbeat = true;
+    valveOpenedByLocalAuto = false;
+    valveCountsForFormalCooldown = false;
+    setValveRelay(true);
+    valveCloseAtMs = millis() + duration * 1000UL;
+    lastHostHeartbeatMs = millis();
+    emitDeviceUiAck(requestId, true, action, "debug_started_5s");
+    emitDeviceIrrigationState(requestId);
+    return;
+  }
   if (strcmp(action, "START_WATERING") == 0 || strcmp(action, "CONFIRM_WATERING") == 0) {
     const uint32_t duration = document["durationSeconds"] | DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
+    if (strcmp(action, "CONFIRM_WATERING") == 0) {
+      const char *sourceRequestId = document["sourceRequestId"] | "";
+      if (pendingCloudWateringRequestId[0] == '\0' ||
+          strcmp(sourceRequestId, pendingCloudWateringRequestId) != 0) {
+        emitDeviceUiAck(requestId, false, action, "cloud_decision_mismatch");
+        return;
+      }
+      if (static_cast<int32_t>(millis() - pendingCloudWateringExpiresAtMs) >= 0) {
+        pendingCloudWateringRequestId[0] = '\0';
+        emitDeviceUiAck(requestId, false, action, "cloud_decision_expired");
+        return;
+      }
+      if (duration != pendingCloudWateringDurationSeconds) {
+        emitDeviceUiAck(requestId, false, action, "cloud_duration_mismatch");
+        return;
+      }
+    }
     if (!deviceManualStartAllowed(duration, requestId)) return;
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
     valveRequiresHostHeartbeat = true;
     valveOpenedByLocalAuto = false;
+    valveCountsForFormalCooldown = true;
     setValveRelay(true);
     valveCloseAtMs = millis() + duration * 1000UL;
     lastHostHeartbeatMs = millis();
+    pendingCloudWateringRequestId[0] = '\0';
     emitDeviceUiAck(requestId, true, action, "started");
     emitDeviceIrrigationState(requestId);
     return;
@@ -1797,6 +2120,7 @@ void serviceDeviceRuntime() {
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
     valveRequiresHostHeartbeat = false;
     valveOpenedByLocalAuto = true;
+    valveCountsForFormalCooldown = true;
     setValveRelay(true);
     valveCloseAtMs = millis() + latestIrrigationEvaluation.durationSeconds * 1000UL;
     emitDeviceIrrigationState(requestId);
@@ -2651,7 +2975,8 @@ String wifiSetupPage(const String &notice = "") {
   page += cloudReady && cloud.apiKeyConfigured ? F("<small>当前状态：API Key 已配置。</small>")
                                                : F("<small>当前状态：未配置 API Key。</small>");
   page += F("<label>农田档案 JSON</label><textarea name='farmProfile' rows='5' style='width:100%;box-sizing:border-box'>");
-  page += cloudReady ? String(cloud.farmProfileJson) : "{\"status\":\"not_configured\"}";
+  page += cloudReady ? String(cloud.farmProfileJson)
+                     : "{\"status\":\"configured\",\"source\":\"demo_default\",\"crop\":\"番茄\",\"growthStage\":\"开花结果期\",\"soilType\":\"壤土\",\"irrigationMethod\":\"滴灌\"}";
   page += F("</textarea><button type='submit'>保存云端配置</button></form><form method='post' action='/cloud-clear-key'>"
             "<button type='submit' style='background:#6b746f'>清除云端 API Key</button></form>"
             "<p><small>云端不可用时，设备仍能离线采集、预测和执行本地安全策略。</small></p></main></html>");

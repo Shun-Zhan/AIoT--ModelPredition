@@ -69,6 +69,54 @@ def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> di
     }
 
 
+def demo_forecast_from_live_snapshot(snapshot: dict | None) -> dict | None:
+    """Build a clearly labelled, display-only preview while the device warms up.
+
+    The preview is derived from the current ESP32 telemetry and is returned only
+    by the dashboard polling endpoint.  It is never persisted and therefore
+    cannot become input to irrigation, cloud analysis, or device commands.
+    """
+    if not snapshot:
+        return None
+    soil = snapshot.get("soil") if isinstance(snapshot.get("soil"), dict) else {}
+    moisture = soil.get("moisturePercent")
+    et0_hourly = snapshot.get("et0MmPerHour")
+    if moisture is None or et0_hourly is None:
+        return None
+    try:
+        moisture = min(100.0, max(0.0, float(moisture)))
+        et0_hourly = max(0.0, float(et0_hourly))
+    except (TypeError, ValueError):
+        return None
+
+    generated_at = datetime.now(timezone.utc)
+    # A modest deterministic curve makes the live preview readable without
+    # pretending that a 24-hour model window already exists.
+    hourly_soil_drop = min(1.2, max(0.12, 0.18 + et0_hourly * 0.9))
+    points = []
+    for step in range(1, 13):
+        progress = step / 12
+        et0_step = et0_hourly / 12 * (0.92 + 0.16 * progress)
+        points.append({
+            "timestamp": (generated_at + timedelta(minutes=step * 5)).isoformat(),
+            "et0Mm": round(et0_step, 5),
+            "soilMoisturePercent": round(max(0.0, moisture - hourly_soil_drop * progress), 2),
+        })
+    return {
+        "schemaVersion": "2.0",
+        "generatedAt": generated_at.isoformat(),
+        "status": "demo_preview",
+        "availableSamples": 0,
+        "requiredSamples": 288,
+        "historySource": "live_demo_projection",
+        "displayOnly": True,
+        "safetyLocked": True,
+        "forecast": points,
+        "nextHourEt0Mm": round(sum(point["et0Mm"] for point in points), 5),
+        "soilMoistureInOneHour": points[-1]["soilMoisturePercent"],
+    }
+
+
 def qr_png(url: str, *, border: int = 2, pixel_size: int = 6) -> bytes:
     """Create a QR PNG without Pillow so a fresh install stays self-contained."""
     code = qrcode.QRCode(border=border)
@@ -130,6 +178,26 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             "message": "指令已进入 ESP32 队列，等待设备安全审核。",
             "safetyReasons": [],
         }
+
+    def active_device_cloud_decision(payload: dict | None) -> dict | None:
+        """Expire short-lived device LLM advice before it reaches the UI."""
+        if not payload:
+            return None
+        decision = dict(payload)
+        expires_at = decision.get("expiresAt")
+        if expires_at:
+            try:
+                expired = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")) <= datetime.now(timezone.utc)
+            except ValueError:
+                expired = True
+            if expired:
+                decision["status"] = "expired"
+                decision["finalAction"] = "NO_OP"
+                # Do not keep presenting an old rejection (for example a
+                # cooldown from the previous firmware boot) as the device's
+                # current safety state.
+                decision["safetyReasons"] = ["decision has expired"]
+        return decision
 
     def current_live_snapshot() -> dict | None:
         """Return only fresh ESP32 telemetry, never an old history row as live."""
@@ -590,13 +658,19 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         var forecastStatus = forecast.status || '--';
         if (forecastStatus === 'warming_up') forecastStatus = '连续完整数据积累中';
         else if (forecastStatus === 'ok') forecastStatus = '预测正常';
+        else if (forecastStatus === 'demo_preview') forecastStatus = '实时演示预览（非正式模型结果）';
         else if (forecastStatus === 'model_unavailable') forecastStatus = '模型未就绪';
         var modelText = '状态：' + forecastStatus + '\n连续完整样本：' + (forecast.availableSamples || 0) + '/' + (forecast.requiredSamples || '--');
         if (forecast.historySource === 'synthetic_test') {
           modelText += '\n测试历史：伪造数据，仅验证模型链路；水阀已锁定';
+        } else if (forecast.historySource === 'live_demo_projection') {
+          modelText += '\n展示说明：依据当前实时遥测生成趋势预览；不落库、不参与灌溉判断，正式预测到达后自动替换';
         }
+        var isDemoPreview = forecast.historySource === 'live_demo_projection';
+        el('et0ForecastLegend').textContent = isDemoPreview ? '演示趋势' : 'N-BEATS';
+        el('soilForecastLegend').textContent = isDemoPreview ? '演示趋势' : 'LSTM';
         el('model').textContent = modelText;
-        el('model').className = forecast.status === 'ok' ? 'model-status ok' : 'model-status warn';
+        el('model').className = (forecast.status === 'ok' || forecast.status === 'demo_preview') ? 'model-status ok' : 'model-status warn';
         renderForecastCharts(forecastPoints);
       } else {
         el('model').textContent = '状态：等待预测数据';
@@ -711,6 +785,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       gateway_error: '云端分析失败',
       suggested: '分析完成',
       awaiting_confirmation: '等待人工确认',
+      expired: '建议已过期',
       auto_held: '自动执行条件未满足',
       rejected: '本地安全审核未通过',
       rejected_on_confirmation: '确认时安全审核未通过',
@@ -722,7 +797,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     }[status] || '状态待确认';
   }
   function decisionStatusTone(status) {
-    if (status === 'rejected' || status === 'rejected_on_confirmation' || status === 'gateway_error') return 'bad';
+    if (status === 'rejected' || status === 'rejected_on_confirmation' || status === 'gateway_error' || status === 'expired') return 'bad';
     if (status === 'auto_held') return 'warn';
     if (status === 'awaiting_confirmation' || status === 'confirmed_waiting_device' || status === 'auto_confirmed_waiting_device') return 'warn';
     if (status === 'suggested' || status === 'executed' || status === 'completed') return 'ok';
@@ -756,6 +831,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       return '自动执行已暂停：' + translateSafetyReason(raw.substring(26));
     }
     var translations = [
+      ['action_not_allowed', '当前 ESP32 固件不支持人工调试开阀动作，请重新烧录本仓库最新固件'],
       ['prediction_invalid', 'ESP32 当前预测无效，尚未满足开阀条件'],
       ['clock_unset', '设备时间尚未校准，暂不能执行需要时间依据的灌溉'],
       ['warming_up', '设备完整历史数据尚未积累完成'],
@@ -819,6 +895,14 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   }
   function renderCloudResult(cloud) {
     var empty = el('cloudResultEmpty'), result = el('cloudResult');
+    // Device-side irrigation analysis now uses the original action-decision
+    // contract and is rendered by renderDecision below. Avoid showing the
+    // same result twice in the newer recommendation/limitations card.
+    if (cloud && (cloud.action || cloud.proposedAction || cloud.finalAction)) {
+      empty.hidden = true;
+      result.hidden = true;
+      return;
+    }
     if (!cloud) {
       empty.hidden = false;
       result.hidden = true;
@@ -862,21 +946,27 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     var finalAction = decision.finalAction || 'NO_OP';
     var invalidGovernance = isGovernanceOnlyDecision(decision);
     var blocked = finalAction === 'NO_OP' && proposed !== 'NO_OP';
-    var actionText = invalidGovernance
+    var actionText = decision.status === 'expired'
+      ? '历史建议已过期'
+      : invalidGovernance
       ? '结果无效'
       : (blocked ? actionLabel(proposed) + '（暂不可执行）' : actionLabel(proposed));
-    var actionTone = invalidGovernance || blocked || decision.status === 'rejected' || decision.status === 'rejected_on_confirmation'
+    var actionTone = decision.status === 'expired' || invalidGovernance || blocked || decision.status === 'rejected' || decision.status === 'rejected_on_confirmation'
       || decision.status === 'gateway_error' ? 'bad' : (proposed === 'START_WATERING' ? 'warn' : 'ok');
     el('decisionAction').textContent = actionText;
     el('decisionAction').className = 'decision-action ' + actionTone;
     el('decisionStatus').textContent = invalidGovernance ? '请重新分析' : decisionStatusLabel(decision.status);
     el('decisionStatus').className = 'decision-status ' + (invalidGovernance ? 'bad' : decisionStatusTone(decision.status));
-    if (invalidGovernance) {
+    if (decision.status === 'expired') {
+      el('decisionOutcome').textContent = '该结果只作历史记录，请点击“请求一次分析”获取当前结论。';
+    } else if (invalidGovernance) {
       el('decisionOutcome').textContent = '该历史结果混淆了灌溉建议与硬件执行权限，系统不会采用。';
     } else if (blocked) {
       el('decisionOutcome').textContent = '云端原建议：' + actionLabel(proposed) + '；本地最终动作：不执行灌溉';
     } else if (proposed !== finalAction) {
       el('decisionOutcome').textContent = '云端建议：' + actionLabel(proposed) + '；本地最终动作：' + actionLabel(finalAction);
+    } else if (decision.status === 'awaiting_confirmation' && finalAction === 'START_WATERING') {
+      el('decisionOutcome').textContent = '云端建议灌溉 ' + (decision.durationSeconds || '--') + ' 秒；本地安全审核已通过；水阀尚未开启';
     } else if (finalAction === 'NO_OP') {
       el('decisionOutcome').textContent = '本地审核结果：无需执行水阀动作';
     } else {
@@ -962,14 +1052,16 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       renderCloudResult(cloud);
       renderDecision(decision);
 
-      var awaiting = !!(decision && decision.status === 'awaiting_confirmation' && !automaticMode);
+      var expiresAtMs = decision && decision.expiresAt ? new Date(decision.expiresAt).getTime() : NaN;
+      var decisionExpired = isFinite(expiresAtMs) && expiresAtMs <= Date.now();
+      var awaiting = !!(decision && decision.status === 'awaiting_confirmation' && !decisionExpired && !automaticMode);
       el('cancel').hidden = !awaiting;
       el('decisionNextStep').hidden = !awaiting;
       confirm.setAttribute('data-id', decision ? decision.requestId : '');
       confirm.setAttribute('data-enabled', awaiting ? 'true' : 'false');
       confirm.setAttribute(
         'data-disabled-label',
-        automaticMode ? '全自动模式无需人工确认' : '暂无可执行灌溉建议'
+        decisionExpired ? '建议已过期，请重新分析' : (automaticMode ? '全自动模式无需人工确认' : '暂无可执行灌溉建议')
       );
       if (awaiting && longPressDecisionId && longPressDecisionId !== decision.requestId && !longPressStartedAt) {
         longPressTriggered = false;
@@ -977,10 +1069,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       }
       if (awaiting && !longPressStartedAt && !longPressTriggered) {
         resetConfirmButton();
-        setConfirmStatus('建议已通过本地安全审核，等待人工确认。', 'warn');
+        setConfirmStatus('云端建议灌溉 ' + decision.durationSeconds + ' 秒，本地审核已通过；水阀尚未开启，等待人工确认。', 'warn');
       } else if (!awaiting && !longPressStartedAt) {
         resetConfirmButton();
-        if (decision && decision.status === 'confirmed_waiting_device') {
+        if (decisionExpired || (decision && decision.status === 'expired')) {
+          setConfirmStatus('该建议已超过有效期，未执行水阀；请重新请求一次分析。', 'bad');
+        } else if (decision && decision.status === 'confirmed_waiting_device') {
           setConfirmStatus('确认已发送，正在等待 ESP32 执行回执；此时可以查看上方“水阀”状态。', 'warn');
         } else if (decision && decision.status === 'auto_confirmed_waiting_device') {
           setConfirmStatus('自动模式已通过本地安全审核并发送命令，正在等待 ESP32 执行回执。', 'warn');
@@ -1087,8 +1181,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     confirm.textContent = '正在发送开阀确认…';
     setConfirmStatus('长按确认成功，正在进行最后一次本地安全复核。', 'warn');
     request('POST', '/v1/decisions/' + encodeURIComponent(id) + '/confirm', {}, function (result) {
-      if (result.status === 'confirmed_waiting_device') {
-        setConfirmStatus('确认已发送，正在等待 ESP32 执行回执。', 'warn');
+      if (result.status === 'queued') {
+        setConfirmStatus('确认已发送，ESP32 将按本次建议时长执行并返回回执。', 'warn');
       } else {
         setConfirmStatus('本地安全复核未通过，未发送开阀命令。', 'bad');
       }
@@ -1132,8 +1226,14 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       } else if (result.status === 'sent') {
         setDebugStatus('指令已写入 ESP32 通信链路，正在等待下位机 ACK。', 'warn');
       } else if (result.status === 'acked') {
+        var gpioDetail = has(ack.relayGpio)
+          ? '；GPIO' + ack.relayGpio + ' 输出=' + (ack.relayOutputLevel || '未知')
+          : '';
         setDebugStatus(
-          '下位机已接受指令，实际阀门状态：' + (ack.actualState || '未知') + (ack.reason ? '；' + ack.reason : ''),
+          '下位机已接受指令，软件阀门状态：' + (ack.actualState || '未知')
+          + gpioDetail
+          + '；未安装物理反馈传感器，请以继电器 LED/触点或万用表为准'
+          + (ack.reason ? '；' + ack.reason : ''),
           'ok'
         );
         refreshCloud();
@@ -1646,14 +1746,14 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     <section class="card wide">
       <h2>未来 1 小时预测</h2>
       <div id="model" class="model-status">等待数据...</div>
-      <div id="forecastEmpty" class="forecast-empty">需要连续 288 个五分钟数据点，模型完成预热后显示预测曲线。</div>
+      <div id="forecastEmpty" class="forecast-empty">收到实时遥测后先显示演示趋势；积累连续 288 个五分钟数据点后自动切换为正式模型预测。</div>
       <div id="forecastCharts" class="forecast-charts" hidden>
         <div class="forecast-panel">
-          <div class="forecast-panel-title"><span>ET₀ 预测</span><span class="forecast-legend"><span class="forecast-dot"></span>N-BEATS</span></div>
+          <div class="forecast-panel-title"><span>ET₀ 预测</span><span class="forecast-legend"><span class="forecast-dot"></span><span id="et0ForecastLegend">N-BEATS</span></span></div>
           <svg id="et0ForecastChart" class="forecast-svg" viewBox="0 0 640 220" role="img" aria-label="未来一小时 ET₀ 预测曲线"></svg>
         </div>
         <div class="forecast-panel">
-          <div class="forecast-panel-title"><span>土壤湿度预测</span><span class="forecast-legend"><span class="forecast-dot soil"></span>LSTM</span></div>
+          <div class="forecast-panel-title"><span>土壤湿度预测</span><span class="forecast-legend"><span class="forecast-dot soil"></span><span id="soilForecastLegend">LSTM</span></span></div>
           <svg id="soilForecastChart" class="forecast-svg" viewBox="0 0 640 220" role="img" aria-label="未来一小时土壤湿度预测曲线"></svg>
         </div>
       </div>
@@ -1806,15 +1906,26 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         reference_response = state["last_response"] or store.latest_forecast()
         device_forecast = device_results["forecast"]
         device_irrigation_state = device_results["irrigationState"]
-        device_cloud_result = device_results["cloudResult"]
-        return {
-            "snapshot": current_live_snapshot() if device_authoritative else (
+        device_cloud_result = active_device_cloud_decision(device_results["cloudResult"])
+        live_snapshot = current_live_snapshot() if device_authoritative else (
                 current_live_snapshot() or store.latest_snapshot()
-            ),
+            )
+        selected_forecast = device_forecast or (
+            reference_response.model_dump(mode="json") if reference_response else None
+        )
+        if not selected_forecast or not selected_forecast.get("forecast"):
+            selected_forecast = demo_forecast_from_live_snapshot(live_snapshot) or selected_forecast
+        cloud_decision = device_cloud_result if device_cloud_result and (
+            device_cloud_result.get("action")
+            or device_cloud_result.get("proposedAction")
+            or device_cloud_result.get("finalAction")
+        ) else None
+        return {
+            "snapshot": live_snapshot,
             # Device results are authoritative for production display.  The
             # local forecast remains as a reference fallback for old devices.
-            "forecast": device_forecast or (reference_response.model_dump(mode="json") if reference_response else None),
-            "decision": device_irrigation_state or (
+            "forecast": selected_forecast,
+            "decision": cloud_decision or device_irrigation_state or (
                 store.latest_decision().model_dump(mode="json") if store.latest_decision() else None
             ),
             "cloud": device_cloud_result,
@@ -1893,7 +2004,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     @app.get("/v1/cloud/status")
     def cloud_status():
         if device_authoritative:
-            latest = store.latest_device_result("cloud_result")
+            latest = active_device_cloud_decision(store.latest_device_result("cloud_result"))
             return {
                 "enabled": latest is not None,
                 "configured": None,
@@ -1904,7 +2015,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                 "nextAutomaticAnalysisAt": None,
                 "autoIrrigation": {"enabled": None, "requiresForecastReady": True},
                 "latestCall": latest,
-                "decision": store.latest_device_result("irrigation_state"),
+                "decision": latest if latest and (
+                    latest.get("action") or latest.get("proposedAction") or latest.get("finalAction")
+                ) else store.latest_device_result("irrigation_state"),
                 "actuator": store.latest_device_result("irrigation_state"),
             }
         decision = store.latest_decision()
@@ -1995,7 +2108,21 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     @app.post("/v1/decisions/{request_id}/confirm")
     def confirm_decision(request_id: str):
         if device_authoritative:
-            return queue_device_command("CONFIRM_WATERING", sourceRequestId=request_id)
+            decision = active_device_cloud_decision(store.latest_device_result("cloud_result"))
+            if not decision or decision.get("requestId") != request_id:
+                raise HTTPException(status_code=404, detail="device cloud decision not found")
+            if decision.get("status") == "expired":
+                raise HTTPException(status_code=409, detail="decision has expired; request a new analysis")
+            if decision.get("status") != "awaiting_confirmation" or decision.get("finalAction") != "START_WATERING":
+                raise HTTPException(status_code=409, detail="decision is not executable")
+            duration = decision.get("durationSeconds")
+            if not isinstance(duration, int) or not 1 <= duration <= 60:
+                raise HTTPException(status_code=409, detail="decision watering duration is invalid")
+            return queue_device_command(
+                "CONFIRM_WATERING", sourceRequestId=request_id,
+                durationSeconds=duration, confidence=decision.get("confidence"),
+                cloudReasonCode=decision.get("reasonCode"),
+            )
         try:
             result = irrigation.confirm(request_id)
             store.mark_command_for_ui_transport(request_id)
@@ -2020,7 +2147,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     @app.post("/v1/actuator/debug/open")
     def debug_open_valve():
         if device_authoritative:
-            return queue_device_command("START_WATERING", durationSeconds=5)
+            return queue_device_command("DEBUG_VALVE_PULSE", durationSeconds=5)
         result = irrigation.queue_debug_actuation(
             IrrigationAction.START_WATERING,
             duration_seconds=5,

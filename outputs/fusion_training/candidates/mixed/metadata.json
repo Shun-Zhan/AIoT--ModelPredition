@@ -1,0 +1,55 @@
+{
+  "training_data_type": "balanced_proxy_observed_1to1",
+  "seed": 20260812,
+  "candidate_only": true,
+  "model_class": "SoilLSTM",
+  "architecture": {
+    "history_steps": 288,
+    "forecast_steps": 12,
+    "interval_minutes": 5,
+    "features": [
+      "soil_moisture_percent",
+      "soil_temp_c",
+      "air_temp_c",
+      "rh_percent",
+      "solar_wm2",
+      "wind_ms",
+      "pressure_kpa",
+      "hour_sin",
+      "hour_cos"
+    ],
+    "hidden_size": 64,
+    "layers": 2
+  },
+  "split": {
+    "validation_start": "2026-08-03T22:20:00",
+    "test_start": "2026-08-04T22:20:00",
+    "end": "2026-08-05T22:20:00"
+  },
+  "window_counts": {
+    "field_train": 957,
+    "field_validation": 277,
+    "field_test": 278,
+    "proxy_train": 6000,
+    "proxy_validation": 1200
+  },
+  "balanced_scaler_rows_per_source": 1256,
+  "training_event_fraction_target": 0.4,
+  "learning": {
+    "epochs_max": 35,
+    "early_stopping": true,
+    "base_learning_rate": 0.001,
+    "finetune_learning_rate": 0.0001
+  },
+  "label_types": {
+    "hongqiao": "water_balance_proxy",
+    "field": "uncalibrated_probe_raw_percentage"
+  },
+  "git": {
+    "commit": "ef79cf35120c53b61e46756e88eae5237bb1a6b9",
+    "status": "?? outputs/fusion_training/\n?? outputs/model_accuracy_report/\n?? scripts/analyze_field_accuracy.py\n?? scripts/extract_accuracy_sources.py\n?? scripts/train_fusion_candidates.py\n?? tests/test_fusion_training.py"
+  },
+  "generated_at": "2026-08-12T21:26:41.629712+09:00",
+  "production_artifacts_unchanged_by_design": true,
+  "deployment_status": "expert_material_candidate_only"
+}

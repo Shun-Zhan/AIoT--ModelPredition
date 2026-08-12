@@ -19,6 +19,10 @@ static const char *const CLOUD_GATEWAY_MODEL_KEY = "model";
 static const char *const CLOUD_GATEWAY_FARM_PROFILE_KEY = "farm_profile";
 static const char *const CLOUD_GATEWAY_DEFAULT_MODEL = "doubao-1.5-thinking-pro";
 static const char *const CLOUD_GATEWAY_DEFAULT_FARM_PROFILE =
+    "{\"status\":\"configured\",\"source\":\"demo_default\","
+    "\"crop\":\"番茄\",\"growthStage\":\"开花结果期\","
+    "\"soilType\":\"壤土\",\"irrigationMethod\":\"滴灌\"}";
+static const char *const CLOUD_GATEWAY_LEGACY_EMPTY_FARM_PROFILE =
     "{\"status\":\"not_configured\"}";
 
 // DigiCert Global Root G2 is the root used by the gateway's public TLS chain.
@@ -49,14 +53,23 @@ static const char CLOUD_GATEWAY_CA_CERT[] PROGMEM =
     "-----END CERTIFICATE-----\n";
 
 static const char *const CLOUD_GATEWAY_ANALYSIS_SYSTEM_PROMPT =
-    "你是农田云端分析模块。只能依据用户提供的JSON事实和农田档案给出建议。"
-    "缺失字段必须明确视为未知，不得编造天气、地理位置、作物或传感器数据。"
-    "只返回一个严格JSON对象，字段必须是schemaVersion、kind、recommendation、"
-    "riskLevel、confidence、reason、limitations。kind必须是analysis。"
-    "recommendation只能是建议文本，不是GPIO、继电器、阀门或任何硬件控制命令。";
+    "你是智能灌溉系统的云端分析模块。只能依据用户提供的JSON数据回答。"
+    "农田档案可用于解释建议，但缺失字段必须明确视为未知，不能补充常识猜测。"
+    "weather.status为not_configured时，不得声称知道天气、降雨、地理位置或天气预报。"
+    "灌溉动作只能返回一个严格JSON对象，字段必须是schemaVersion、requestId、action、"
+    "durationSeconds、reasonCode、reason、confidence、expiresAt；action只能为"
+    "START_WATERING、STOP_WATERING、NO_OP。不要使用Markdown代码围栏，不要添加额外字段。"
+    "只有constraints.edgeRisk.riskLevel为IRRIGATION_CANDIDATE时才可建议START_WATERING；"
+    "数据不完整、传感器异常或没有明确必要时必须返回NO_OP。"
+    "action表示基于环境数据给出的灌溉建议，不是直接控制硬件的命令。是否需要人工确认、"
+    "是否启用自动模式以及硬件控制权限，都不得影响action，也不得作为reasonCode或reason。"
+    "例如：环境与预测支持灌溉时，即使自动模式关闭，也应返回START_WATERING，之后由本地安全层决定是否下发。"
+    "NO_OP的原因必须是明确的环境、传感器、预测或灌溉必要性依据，不能是执行权限或确认流程。";
 static const char *const CLOUD_GATEWAY_QUESTION_SYSTEM_PROMPT =
     "你是农田问答模块。只能依据用户提供的JSON事实和农田档案回答。"
+    "农田档案source=demo_default时，直接采用该演示默认档案，不要要求用户补充作物或农田档案。"
     "缺失字段必须明确视为未知，不得编造天气、地理位置、作物或传感器数据。"
+    "不得仅凭太阳辐射为0、风速为0或单次读数推断夜间、无光照时段或天气状态。"
     "只返回一个严格JSON对象，字段必须是schemaVersion、kind、answer、evidence、"
     "limitations。kind必须是question。回答中的灌溉内容只能是参考建议，"
     "不得返回GPIO、继电器、阀门或任何硬件控制命令。";
@@ -69,6 +82,7 @@ CloudGateway CloudGatewayInstance;
 
 static void copyText(char *destination, size_t capacity, const char *source);
 static bool isJsonObject(const String &text);
+static bool shouldUseDefaultFarmProfile(const String &text);
 static bool hasOnlyFields(JsonObjectConst object,
                           const char *const *fields,
                           size_t fieldCount);
@@ -121,7 +135,7 @@ bool CloudGateway::loadStoredConfig() {
   if (_model.isEmpty()) {
     _model = CLOUD_GATEWAY_DEFAULT_MODEL;
   }
-  if (_farmProfileJson.isEmpty() || !isJsonObject(_farmProfileJson)) {
+  if (shouldUseDefaultFarmProfile(_farmProfileJson)) {
     _farmProfileJson = CLOUD_GATEWAY_DEFAULT_FARM_PROFILE;
   }
   return true;
@@ -146,7 +160,7 @@ bool CloudGateway::readPortalConfig(CloudGatewayPortalConfig &config) const {
                                  CLOUD_GATEWAY_DEFAULT_FARM_PROFILE).c_str());
   preferences.end();
 
-  if (!isJsonObject(String(config.farmProfileJson))) {
+  if (shouldUseDefaultFarmProfile(String(config.farmProfileJson))) {
     copyText(config.farmProfileJson, sizeof(config.farmProfileJson),
              CLOUD_GATEWAY_DEFAULT_FARM_PROFILE);
   }
@@ -371,21 +385,39 @@ bool CloudGateway::buildOpenAiRequest(String &payload) const {
                                    : CLOUD_GATEWAY_QUESTION_SYSTEM_PROMPT;
   JsonObject userMessage = messages.add<JsonObject>();
   userMessage["role"] = "user";
-  JsonDocument userContent;
-  userContent["schemaVersion"] = "1.0";
-  userContent["requestId"] = _pendingRequestId;
-  userContent["sensorContext"] = context.as<JsonObjectConst>();
-  userContent["farmProfile"] = farmProfile.as<JsonObjectConst>();
-  if (_pendingType == CLOUD_GATEWAY_QUESTION) {
-    userContent["question"] = _pendingQuestion;
+  context["requestId"] = _pendingRequestId;
+  context["generatedAtEpochUtc"] = static_cast<uint32_t>(time(nullptr));
+  context["constraints"]["farmProfile"] = farmProfile.as<JsonObjectConst>();
+  if (_pendingType == CLOUD_GATEWAY_ANALYSIS) {
+    const time_t expiryEpoch = time(nullptr) + 55;
+    struct tm expiryUtc = {};
+    gmtime_r(&expiryEpoch, &expiryUtc);
+    char expiryText[CLOUD_GATEWAY_EXPIRES_AT_CAPACITY] = {};
+    strftime(expiryText, sizeof(expiryText), "%Y-%m-%dT%H:%M:%SZ", &expiryUtc);
+    String contextJson;
+    serializeJson(context, contextJson);
+    userMessage["content"] = contextJson;
+    JsonObject contractMessage = messages.add<JsonObject>();
+    contractMessage["role"] = "user";
+    String contract = "输出合约（必须逐字遵守）：\n- requestId 必须是 ";
+    contract += _pendingRequestId;
+    contract += "\n- expiresAt 必须是 ";
+    contract += expiryText;
+    contract += "\n- action 为 NO_OP 或 STOP_WATERING 时，durationSeconds 必须是 JSON 的 null，绝不能是 0"
+                "\n- action 为 START_WATERING 时，durationSeconds 必须是 1 到 60 的整数"
+                "\n- confidence 必须是 0.0 到 1.0 之间的 JSON 数字，绝不能是 null"
+                "\n- reasonCode 只能包含大写字母、数字和下划线"
+                "\n- action 只表示是否建议灌溉；人工确认、自动模式和硬件控制权限不得作为 NO_OP 的理由"
+                "\n只输出一个 JSON 对象；不要解释，不要 Markdown。";
+    contractMessage["content"] = contract;
+  } else {
+    JsonDocument questionContent;
+    questionContent["question"] = _pendingQuestion;
+    questionContent["evidence"] = context.as<JsonObjectConst>();
+    String questionJson;
+    serializeJson(questionContent, questionJson);
+    userMessage["content"] = questionJson;
   }
-  // The Volcengine OpenAI-compatible endpoint expects messages[].content to
-  // be a string, matching its documented curl example. Keep the structured
-  // sensor context inside that JSON string instead of sending an object as
-  // the content value.
-  String userContentJson;
-  serializeJson(userContent, userContentJson);
-  userMessage["content"] = userContentJson;
 
   payload.clear();
   serializeJson(request, payload);
@@ -420,18 +452,29 @@ bool CloudGateway::parseOpenAiResponse(const String &body,
 
   if (result.type == CLOUD_GATEWAY_ANALYSIS) {
     static const char *const fields[] = {
-        "schemaVersion", "kind", "recommendation", "riskLevel",
-        "confidence", "reason", "limitations"};
+        "schemaVersion", "requestId", "action", "durationSeconds",
+        "reasonCode", "reason", "confidence", "expiresAt"};
     if (!hasOnlyFields(object, fields, sizeof(fields) / sizeof(fields[0])) ||
-        object["kind"] != "analysis" ||
-        !readJsonString(object, "recommendation", result.recommendation,
-                        sizeof(result.recommendation)) ||
-        !readJsonString(object, "riskLevel", result.riskLevel,
-                        sizeof(result.riskLevel)) ||
+        !readJsonString(object, "requestId", result.requestId,
+                        sizeof(result.requestId)) ||
+        strcmp(result.requestId, _pendingRequestId.c_str()) != 0 ||
+        !readJsonString(object, "action", result.action, sizeof(result.action)) ||
+        (strcmp(result.action, "START_WATERING") != 0 &&
+         strcmp(result.action, "STOP_WATERING") != 0 &&
+         strcmp(result.action, "NO_OP") != 0) ||
+        !readJsonString(object, "reasonCode", result.reasonCode,
+                        sizeof(result.reasonCode)) ||
         !readJsonString(object, "reason", result.reason, sizeof(result.reason)) ||
-        !readJsonString(object, "limitations", result.limitations,
-                        sizeof(result.limitations)) ||
+        !readJsonString(object, "expiresAt", result.expiresAt,
+                        sizeof(result.expiresAt)) ||
         !object["confidence"].is<float>()) {
+      return false;
+    }
+    if (strcmp(result.action, "START_WATERING") == 0) {
+      if (!object["durationSeconds"].is<int>()) return false;
+      result.durationSeconds = object["durationSeconds"].as<uint32_t>();
+      if (result.durationSeconds < 1 || result.durationSeconds > 60) return false;
+    } else if (!object["durationSeconds"].isNull()) {
       return false;
     }
     result.confidence = object["confidence"].as<float>();
@@ -477,11 +520,10 @@ void CloudGateway::makeOfflineResult(CloudGatewayResult &result,
   result.offlineFallback = true;
   setResultError(result, message);
   if (result.type == CLOUD_GATEWAY_ANALYSIS) {
-    copyText(result.recommendation, sizeof(result.recommendation),
-             "保持本地安全策略，不执行云端动作");
-    copyText(result.riskLevel, sizeof(result.riskLevel), "unknown");
+    copyText(result.action, sizeof(result.action), "NO_OP");
+    copyText(result.reasonCode, sizeof(result.reasonCode), "GATEWAY_ERROR");
     copyText(result.reason, sizeof(result.reason),
-             "云端不可用，当前结果不代表新的环境判断");
+             "云端调用失败，继续使用ESP32本地离线主干");
   } else {
     copyText(result.answer, sizeof(result.answer),
              "云端不可用，请依据本地传感器数据和人工安全规则判断");
@@ -510,6 +552,16 @@ static void copyText(char *destination, size_t capacity, const char *source) {
 static bool isJsonObject(const String &text) {
   JsonDocument document;
   return !deserializeJson(document, text) && document.is<JsonObject>();
+}
+
+static bool shouldUseDefaultFarmProfile(const String &text) {
+  if (text.isEmpty() || !isJsonObject(text)) {
+    return true;
+  }
+  // Upgrade the original placeholder transparently. This keeps an existing
+  // API key and other cloud settings intact while making demo devices useful
+  // immediately after installing newer firmware.
+  return text == CLOUD_GATEWAY_LEGACY_EMPTY_FARM_PROFILE;
 }
 
 static bool hasOnlyFields(JsonObjectConst object,

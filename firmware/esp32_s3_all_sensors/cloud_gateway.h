@@ -9,9 +9,12 @@
 static const size_t CLOUD_GATEWAY_MODEL_CAPACITY = 96;
 static const size_t CLOUD_GATEWAY_FARM_PROFILE_CAPACITY = 768;
 static const size_t CLOUD_GATEWAY_REQUEST_ID_CAPACITY = 65;
-static const size_t CLOUD_GATEWAY_SENSOR_CONTEXT_CAPACITY = 2048;
+static const size_t CLOUD_GATEWAY_SENSOR_CONTEXT_CAPACITY = 8192;
 static const size_t CLOUD_GATEWAY_QUESTION_CAPACITY = 512;
 static const size_t CLOUD_GATEWAY_RECOMMENDATION_CAPACITY = 256;
+static const size_t CLOUD_GATEWAY_ACTION_CAPACITY = 24;
+static const size_t CLOUD_GATEWAY_REASON_CODE_CAPACITY = 65;
+static const size_t CLOUD_GATEWAY_EXPIRES_AT_CAPACITY = 40;
 static const size_t CLOUD_GATEWAY_ANSWER_CAPACITY = 1024;
 static const size_t CLOUD_GATEWAY_REASON_CAPACITY = 512;
 static const size_t CLOUD_GATEWAY_EVIDENCE_CAPACITY = 768;
@@ -57,7 +60,11 @@ struct CloudGatewayResult {
   bool offlineFallback;
   bool hasConfidence;
   float confidence;
+  uint32_t durationSeconds;
   char requestId[CLOUD_GATEWAY_REQUEST_ID_CAPACITY];
+  char action[CLOUD_GATEWAY_ACTION_CAPACITY];
+  char reasonCode[CLOUD_GATEWAY_REASON_CODE_CAPACITY];
+  char expiresAt[CLOUD_GATEWAY_EXPIRES_AT_CAPACITY];
   char recommendation[CLOUD_GATEWAY_RECOMMENDATION_CAPACITY];
   char riskLevel[48];
   char answer[CLOUD_GATEWAY_ANSWER_CAPACITY];

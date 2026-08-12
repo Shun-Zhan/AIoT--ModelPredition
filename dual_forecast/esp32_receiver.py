@@ -178,6 +178,13 @@ def _handle_device_result_line(line: str, store: Store) -> bool:
         return True
     result_type, payload = parsed
     store.save_device_result(result_type, payload, datetime.now(timezone.utc))
+    # V2 UI acknowledgements supersede the legacy @ACK packet.  Keep the
+    # command queue in sync as well as the latest-only display cache so the
+    # browser can report the device's real accept/reject reason immediately.
+    if result_type == "ui_ack":
+        ack = payload.model_dump(mode="json", exclude_none=True)
+        store.record_ack(ack)
+        store.update_decision_ack(ack)
     print(f"ESP32 {result_type} updated (schemaVersion={payload.schemaVersion}).")
     return True
 
@@ -374,13 +381,25 @@ def _send_pending_commands(connection: Any, store: Store) -> None:
                 "requestId": command["requestId"],
                 "action": command["action"],
             }
-            if command["action"] == "START_WATERING":
+            if command["action"] in {"START_WATERING", "CONFIRM_WATERING", "DEBUG_VALVE_PULSE"}:
                 compact["durationSeconds"] = command["durationSeconds"]
-            compact.update({
-                "reasonCode": "X",
-                "expiresAt": "x",
-                "ttlSeconds": command["ttlSeconds"],
-            })
+            if command["action"] == "CONFIRM_WATERING":
+                compact["sourceRequestId"] = command["sourceRequestId"]
+                # UI commands are parsed by handleDeviceUiCommand(), which only
+                # requires these four fields. Keeping the envelope this small
+                # preserves cloud-decision binding on older 191-byte transports.
+                compact = {
+                    "requestId": command["requestId"],
+                    "action": command["action"],
+                    "durationSeconds": command["durationSeconds"],
+                    "sourceRequestId": command["sourceRequestId"],
+                }
+            else:
+                compact.update({
+                    "reasonCode": "X",
+                    "expiresAt": "x",
+                    "ttlSeconds": command["ttlSeconds"],
+                })
             line = prefix + json.dumps(compact, separators=(",", ":")) + "\n"
         if max_bytes is not None and len(line.rstrip("\n").encode("utf-8")) > max_bytes:
             raise OSError("ESP32 TCP command exceeds the deployed firmware control-line limit")
