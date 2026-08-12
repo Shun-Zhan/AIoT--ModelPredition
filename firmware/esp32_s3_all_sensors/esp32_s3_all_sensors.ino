@@ -47,6 +47,12 @@
 #define AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE 0
 #endif
 
+// Test builds can select either the production worker task or a direct call
+// from loop(). Field builds always leave both test switches disabled.
+#ifndef AIOT_TEST_RUN_INFERENCE_INLINE
+#define AIOT_TEST_RUN_INFERENCE_INLINE 0
+#endif
+
 #if AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE && \
     __has_include("generated/synthetic_history_fixture.h")
 #include "generated/synthetic_history_fixture.h"
@@ -419,6 +425,11 @@ static const uint32_t DEVICE_NTP_INITIAL_RETRY_INTERVAL_MS = 5000;
 static const uint32_t DEVICE_NTP_RETRY_INTERVAL_MS = 60000;
 static const uint32_t DEVICE_STATUS_INTERVAL_MS = 5000;
 static const int32_t DEVICE_LOCAL_UTC_OFFSET_SECONDS = 8 * 60 * 60;
+#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+// Deterministic bench-test time. This is compiled only with the explicit
+// synthetic-fixture flag, and that same fixture permanently locks the relay.
+static const uint32_t DEVICE_SYNTHETIC_TEST_EPOCH_UTC = 1767225600UL;
+#endif
 // The model kernels use less than 4 KB of call stack. Keep the worker stack
 // in internal SRAM: a large ordinary allocation can be routed to PSRAM, while
 // FreeRTOS stack diagnostics and cache-disabled paths must not touch PSRAM.
@@ -1252,7 +1263,7 @@ static void deviceInferenceTask(void *) {
 }
 
 static bool deviceRunModelInference(edge_model::ModelOutput &result) {
-#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+#if AIOT_TEST_HISTORY_FIXTURE_ENABLED && AIOT_TEST_RUN_INFERENCE_INLINE
   return edge_model::predictEt0(deviceModelInput.et0, &result.et0Mm) &&
          edge_model::predictSoil(deviceModelInput.soil,
                                   result.soilMoisturePercent);
@@ -1590,6 +1601,13 @@ void initDeviceRuntime() {
   deviceClockValid = false;
   deviceNtpClockValid = false;
   deviceClockSource = DEVICE_CLOCK_UNSET;
+#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+  deviceSetSystemClock(DEVICE_SYNTHETIC_TEST_EPOCH_UTC);
+  deviceClockValid = true;
+  deviceNtpClockValid = true;
+  deviceClockSource = DEVICE_CLOCK_NTP;
+  latestDeviceSample.epochUtc = DEVICE_SYNTHETIC_TEST_EPOCH_UTC;
+#endif
   deviceSetForecastStatus("clock_unset");
   deviceRestoreHistory();
   if (deviceClockValid) deviceSetForecastStatus("warming_up");
@@ -1622,8 +1640,10 @@ static bool deviceSyntheticHistoryBlocksValve() {
 
 static void deviceTryInjectSyntheticHistory() {
 #if AIOT_TEST_HISTORY_FIXTURE_ENABLED
-  if (deviceSyntheticHistoryInjected || !deviceClockValid ||
-      deviceInferenceTaskHandle == nullptr) {
+  // The bench path runs the model inline so it can diagnose the kernel even
+  // when the background worker cannot be allocated. Production inference
+  // continues to require its dedicated task below.
+  if (deviceSyntheticHistoryInjected || !deviceClockValid) {
     return;
   }
   if (AIOT_TEST_HISTORY_FIXTURE_COUNT != DEVICE_RUNTIME_RING_CAPACITY) {
@@ -1677,17 +1697,40 @@ static void deviceTryInjectSyntheticHistory() {
     return;
   }
   deviceBuildModelInput();
-#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+#if AIOT_TEST_HISTORY_FIXTURE_ENABLED && AIOT_TEST_RUN_INFERENCE_INLINE
   // Test the same generated weights and input on Arduino's loop task. This
   // isolates model/data correctness from cross-task Flash-cache scheduling.
   deviceInferenceBusy = true;
   const bool inlineInferenceOk = deviceRunModelInference(deviceModelOutput);
   deviceInferenceBusy = false;
+  if (inlineInferenceOk) {
+    deviceForecast.valid = true;
+    deviceForecast.generatedEpochUtc = latestDeviceSample.epochUtc;
+    deviceForecast.availableSamples = DEVICE_RUNTIME_RING_CAPACITY;
+    deviceForecast.nextHourEt0Mm = deviceModelOutput.et0Mm;
+    const uint32_t base = latestDeviceSample.epochUtc;
+    for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
+      const uint32_t timestamp = base + (index + 1) * DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+      deviceForecast.timestampsUtc[index] = timestamp;
+      deviceForecast.soilMoisturePercent[index] =
+          deviceModelOutput.soilMoisturePercent[index];
+      deviceForecast.et0Mm[index] = deviceModelOutput.et0Mm /
+                                    DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
+    }
+    strlcpy(deviceForecast.status, "ok", sizeof(deviceForecast.status));
+  } else {
+    deviceForecast.valid = false;
+    strlcpy(deviceForecast.status, "model_error", sizeof(deviceForecast.status));
+  }
+  deviceForecastPendingEmit = true;
   Serial.printf("[SYNTHETIC TEST] Inline model=%s ET0=%.4f soil_60m=%.2f%%.\n",
                 inlineInferenceOk ? "ok" : "failed", deviceModelOutput.et0Mm,
                 deviceModelOutput.soilMoisturePercent[
                     DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1]);
   return;
+#endif
+#if !(AIOT_TEST_HISTORY_FIXTURE_ENABLED && AIOT_TEST_RUN_INFERENCE_INLINE)
+  if (deviceInferenceTaskHandle == nullptr) return;
 #endif
   Serial.println("[SYNTHETIC TEST] Model input built; scheduling inference.");
   deviceInferenceRequested = true;
