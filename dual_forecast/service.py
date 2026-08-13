@@ -199,6 +199,76 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                 decision["safetyReasons"] = ["decision has expired"]
         return decision
 
+    def device_session_started_at() -> datetime | None:
+        """Infer the current ESP32 boot boundary from its latest telemetry."""
+        live = current_live_snapshot()
+        if not live:
+            return None
+        received_at = live.get("receivedAt")
+        uptime_ms = live.get("uptimeMs")
+        try:
+            received = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
+            if received.tzinfo is None:
+                received = received.replace(tzinfo=timezone.utc)
+            return received - timedelta(milliseconds=max(0, int(uptime_ms)))
+        except (TypeError, ValueError):
+            return None
+
+    def device_cloud_display_state() -> tuple[dict | None, dict | None]:
+        """Return request-correlated cloud/decision state for the UI.
+
+        An ESP32 UI ACK for CLOUD_ANALYZE means only that the worker accepted
+        the job.  Until a CLOUD_RESULT carrying the same requestId arrives, an
+        older cached result must never be presented as the new analysis.
+        """
+        session_started_at = device_session_started_at()
+        latest = active_device_cloud_decision(
+            store.latest_device_result("cloud_result", not_before=session_started_at)
+        )
+        analyze = store.latest_command("CLOUD_ANALYZE")
+        if analyze:
+            queued_at = datetime.fromisoformat(analyze["queuedAt"].replace("Z", "+00:00"))
+            if session_started_at and queued_at < session_started_at:
+                analyze = None
+        if analyze:
+            queued_at = datetime.fromisoformat(analyze["queuedAt"].replace("Z", "+00:00"))
+            result_missing = latest is None or latest.get("requestId") != analyze["requestId"]
+            request_age = (datetime.now(timezone.utc) - queued_at).total_seconds()
+            if result_missing and request_age <= 120:
+                pending = {
+                    "schemaVersion": "2.0", "status": "pending",
+                    "requestId": analyze["requestId"], "action": None,
+                    "proposedAction": None, "finalAction": None,
+                    "reason": "ESP32 已接收请求，正在等待本次 LLM 分析返回。",
+                    "safetyReasons": [],
+                }
+                return pending, pending
+            if result_missing:
+                timeout = {
+                    "schemaVersion": "2.0", "status": "gateway_error",
+                    "requestId": analyze["requestId"], "action": None,
+                    "proposedAction": None, "finalAction": "NO_OP",
+                    "reason": "本次请求在 2 分钟内没有收到 LLM 结果，请检查 ESP32 网络后重试。",
+                    "safetyReasons": ["cloud analysis timed out"],
+                }
+                return timeout, timeout
+
+        decision = dict(latest) if latest else None
+        confirm = store.latest_command("CONFIRM_WATERING")
+        if decision and confirm and confirm["command"].get("sourceRequestId") == decision.get("requestId"):
+            ack = confirm.get("ack") or {}
+            if confirm["status"] in {"pending", "sent"}:
+                decision["status"] = "confirmed_waiting_device"
+            elif confirm["status"] == "rejected":
+                decision["status"] = "rejected_on_confirmation"
+                decision["finalAction"] = "NO_OP"
+                decision["safetyReasons"] = [ack.get("reason") or "device rejected confirmation"]
+            elif confirm["status"] == "acked" and ack.get("actualState") == "OPEN":
+                decision["status"] = "executed"
+            elif confirm["status"] == "acked" and ack.get("actualState") == "CLOSED":
+                decision["status"] = "completed"
+        return latest, decision
+
     def current_live_snapshot() -> dict | None:
         """Return only fresh ESP32 telemetry, never an old history row as live."""
         live = state["last_live_snapshot"]
@@ -833,6 +903,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     var translations = [
       ['action_not_allowed', '当前 ESP32 固件不支持人工调试开阀动作，请重新烧录本仓库最新固件'],
       ['prediction_invalid', 'ESP32 当前预测无效，尚未满足开阀条件'],
+      ['irrigation_candidate_invalid', '确认时土壤状态已不再满足灌溉候选条件'],
+      ['cloud analysis timed out', '本次 LLM 分析等待超时，请检查 ESP32 网络后重新分析'],
       ['clock_unset', '设备时间尚未校准，暂不能执行需要时间依据的灌溉'],
       ['warming_up', '设备完整历史数据尚未积累完成'],
       ['model_error', 'ESP32 推理模型异常'],
@@ -898,7 +970,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     // Device-side irrigation analysis now uses the original action-decision
     // contract and is rendered by renderDecision below. Avoid showing the
     // same result twice in the newer recommendation/limitations card.
-    if (cloud && (cloud.action || cloud.proposedAction || cloud.finalAction)) {
+    if (cloud && (cloud.status === 'pending' || cloud.action || cloud.proposedAction || cloud.finalAction)) {
       empty.hidden = true;
       result.hidden = true;
       return;
@@ -942,6 +1014,17 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     }
     empty.hidden = true;
     result.hidden = false;
+    if (decision.status === 'pending') {
+      el('decisionAction').textContent = '正在分析…';
+      el('decisionAction').className = 'decision-action warn';
+      el('decisionStatus').textContent = '等待 LLM 返回';
+      el('decisionStatus').className = 'decision-status warn';
+      el('decisionOutcome').textContent = '本次请求已到达 ESP32，旧分析结果已隐藏。';
+      el('decisionReason').textContent = decision.reason || '正在等待云端模型生成结论。';
+      el('decisionSafetyBox').hidden = true;
+      el('decisionTechnical').textContent = decision.requestId ? ('请求 ID：' + decision.requestId) : '';
+      return;
+    }
     var proposed = decision.proposedAction || decision.finalAction || 'NO_OP';
     var finalAction = decision.finalAction || 'NO_OP';
     var invalidGovernance = isGovernanceOnlyDecision(decision);
@@ -1010,7 +1093,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         pendingCloudRequestId = '';
         pendingCloudStartedAt = 0;
         finishAnalyze(completedStatus, completedText);
-      } else if (pendingCloudRequestId && pendingCloudStartedAt && (Date.now() - pendingCloudStartedAt) > 35000) {
+      } else if (pendingCloudRequestId && pendingCloudStartedAt && (Date.now() - pendingCloudStartedAt) > 120000) {
         pendingCloudRequestId = '';
         pendingCloudStartedAt = 0;
         finishAnalyze('error', '等待 ESP32 云端回执超时；请查看设备网络和串口/TCP 接收器日志。');
@@ -1816,7 +1899,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
           <div id="decisionTechnical" class="decision-technical"></div>
         </details>
       </div>
-      <div id="decisionNextStep" class="decision-next-step" hidden>该建议已通过当前安全审核。如需执行，请持续按住确认按钮 1.5 秒；下发前系统还会再次检查传感器、湿度、冷却时间和每日限额。</div>
+      <div id="decisionNextStep" class="decision-next-step" hidden>该建议已通过当前安全审核。如需执行，请持续按住确认按钮 1.5 秒；下发前系统还会再次检查传感器、湿度和本次上电会话内的冷却状态。</div>
       <div class="decision-actions">
         <button id="analyze" class="action-button" type="button" aria-busy="false">请求一次分析</button>
         <button id="confirm" class="hold formal-confirm" type="button" data-enabled="false" disabled>暂无可执行灌溉建议</button>
@@ -1826,7 +1909,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div id="confirmStatus" class="meta" aria-live="polite"></div>
       <div class="actuator-debug">
         <div class="decision-section-title">水阀调试（本地安全模式）</div>
-        <div class="meta">调试开阀固定 5 秒，不受正式灌溉的 15 分钟冷却限制；仍需通过传感器有效性、预测候选、水阀状态和灌溉限额检查。关阀指令可随时下发。</div>
+        <div class="meta">调试开阀固定 5 秒，不受正式灌溉的 15 分钟会话冷却限制；仍需通过传感器有效性、预测候选和水阀状态检查。关阀指令可随时下发。</div>
         <div class="decision-actions">
           <button id="debugOpenValve" class="hold debug-hold" type="button">长按 1.5 秒调试开阀 5 秒</button>
           <button id="debugCloseValve" class="secondary" type="button">调试关阀</button>
@@ -1902,11 +1985,13 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
 
     @app.get("/v1/dashboard/latest")
     def dashboard_latest():
-        device_results = store.latest_device_results()
+        device_results = store.latest_device_results(
+            display_session_started_at=device_session_started_at()
+        )
         reference_response = state["last_response"] or store.latest_forecast()
         device_forecast = device_results["forecast"]
         device_irrigation_state = device_results["irrigationState"]
-        device_cloud_result = active_device_cloud_decision(device_results["cloudResult"])
+        device_cloud_result, cloud_decision_state = device_cloud_display_state()
         live_snapshot = current_live_snapshot() if device_authoritative else (
                 current_live_snapshot() or store.latest_snapshot()
             )
@@ -1915,10 +2000,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         )
         if not selected_forecast or not selected_forecast.get("forecast"):
             selected_forecast = demo_forecast_from_live_snapshot(live_snapshot) or selected_forecast
-        cloud_decision = device_cloud_result if device_cloud_result and (
-            device_cloud_result.get("action")
-            or device_cloud_result.get("proposedAction")
-            or device_cloud_result.get("finalAction")
+        cloud_decision = cloud_decision_state if cloud_decision_state and (
+            cloud_decision_state.get("status") == "pending"
+            or cloud_decision_state.get("action")
+            or cloud_decision_state.get("proposedAction")
+            or cloud_decision_state.get("finalAction")
         ) else None
         return {
             "snapshot": live_snapshot,
@@ -2004,7 +2090,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     @app.get("/v1/cloud/status")
     def cloud_status():
         if device_authoritative:
-            latest = active_device_cloud_decision(store.latest_device_result("cloud_result"))
+            latest, decision = device_cloud_display_state()
             return {
                 "enabled": latest is not None,
                 "configured": None,
@@ -2015,8 +2101,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                 "nextAutomaticAnalysisAt": None,
                 "autoIrrigation": {"enabled": None, "requiresForecastReady": True},
                 "latestCall": latest,
-                "decision": latest if latest and (
-                    latest.get("action") or latest.get("proposedAction") or latest.get("finalAction")
+                "decision": decision if decision and (
+                    decision.get("status") == "pending" or decision.get("action")
+                    or decision.get("proposedAction") or decision.get("finalAction")
                 ) else store.latest_device_result("irrigation_state"),
                 "actuator": store.latest_device_result("irrigation_state"),
             }
@@ -2108,7 +2195,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     @app.post("/v1/decisions/{request_id}/confirm")
     def confirm_decision(request_id: str):
         if device_authoritative:
-            decision = active_device_cloud_decision(store.latest_device_result("cloud_result"))
+            decision = active_device_cloud_decision(
+                store.latest_device_result(
+                    "cloud_result", not_before=device_session_started_at()
+                )
+            )
             if not decision or decision.get("requestId") != request_id:
                 raise HTTPException(status_code=404, detail="device cloud decision not found")
             if decision.get("status") == "expired":

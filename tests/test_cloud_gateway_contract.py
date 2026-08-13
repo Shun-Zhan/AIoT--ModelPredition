@@ -18,10 +18,10 @@ def test_cloud_gateway_files_are_the_only_contract_targets():
 
 def test_arduino_esp32_transport_is_pinned_to_secure_gateway():
     header, source = read_sources()
-    assert '#include <NetworkClientSecure.h>' in source
-    assert '#include <HTTPClient.h>' in source
+    assert '#include <esp_http_client.h>' in source
     assert 'CLOUD_GATEWAY_BASE_URL =\n    "https://ai-gateway.vei.volces.com/v1/chat/completions"' in source
-    assert 'secureClient.setCACert(CLOUD_GATEWAY_CA_CERT);' in source
+    assert 'config.cert_pem = CLOUD_GATEWAY_CA_CERT;' in source
+    assert 'config.timeout_ms = static_cast<int>(_timeoutMs);' in source
     assert 'setInsecure' not in source
     assert 'WiFiClientSecure' not in source
     assert "CLOUD_GATEWAY_PREFERENCES_NAMESPACE = \"vei_cloud\"" in source
@@ -72,8 +72,10 @@ def test_worker_api_does_not_force_network_work_into_loop():
     assert "bool CloudGateway::runWorkerOnce()" in source
     assert "WiFi.status() != WL_CONNECTED" in source
     assert "offlineFallback" in header + source
-    assert "CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS = 30000" in header
-    assert "explicit CloudGateway(uint16_t timeoutMs = CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS)" in header
+    assert "CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS = 120000UL" in header
+    assert "explicit CloudGateway(uint32_t timeoutMs = CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS)" in header
+    assert "CloudGateway::CloudGateway(uint32_t timeoutMs)" in source
+    assert "time(nullptr) + 180" in source
 
 
 def test_portal_cloud_save_returns_small_closed_response_without_network_call():

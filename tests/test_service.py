@@ -111,6 +111,67 @@ def test_device_command_response_has_user_visible_feedback(tmp_path, monkeypatch
     assert body["safetyReasons"] == []
 
 
+def test_device_analysis_hides_cached_result_until_matching_llm_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
+    )
+    store = Store(settings.database_path)
+    store.save_device_cloud_result(DeviceCloudResult(
+        schemaVersion="2.0", status="awaiting_confirmation", requestId="old-result",
+        action="START_WATERING", proposedAction="START_WATERING",
+        finalAction="START_WATERING", durationSeconds=16, reason="old result",
+        expiresAt=datetime.now(timezone.utc) + timedelta(minutes=2),
+    ))
+    client = TestClient(create_app(settings))
+
+    queued = client.post("/v1/cloud/analyze").json()
+    status = client.get("/v1/cloud/status").json()
+
+    assert queued["status"] == "queued"
+    assert status["latestCall"]["status"] == "pending"
+    assert status["latestCall"]["requestId"] == queued["requestId"]
+    assert status["decision"]["status"] == "pending"
+    assert status["decision"]["requestId"] != "old-result"
+
+    app_js = client.get("/v1/dashboard/app.js").text
+    assert "> 120000" in app_js
+    assert "45 秒内没有收到" not in app_js
+
+
+def test_device_confirmation_ack_is_reflected_in_decision_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
+    )
+    store = Store(settings.database_path)
+    source_id = "cloud-result-current"
+    store.save_device_cloud_result(DeviceCloudResult(
+        schemaVersion="2.0", status="awaiting_confirmation", requestId=source_id,
+        action="START_WATERING", proposedAction="START_WATERING",
+        finalAction="START_WATERING", durationSeconds=16, reason="soil dry",
+        expiresAt=datetime.now(timezone.utc) + timedelta(minutes=2),
+    ))
+    command = {
+        "schemaVersion": "2.0", "requestId": "confirm-current",
+        "action": "CONFIRM_WATERING", "sourceRequestId": source_id,
+        "durationSeconds": 16, "reasonCode": "UI",
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "ttlSeconds": 30, "transport": "UI_COMMAND",
+    }
+    assert store.enqueue_command(command)
+    store.record_ack({
+        "requestId": "confirm-current", "accepted": False,
+        "action": "CONFIRM_WATERING", "reason": "cooldown", "actualState": "CLOSED",
+    })
+
+    decision = TestClient(create_app(settings)).get("/v1/cloud/status").json()["decision"]
+
+    assert decision["status"] == "rejected_on_confirmation"
+    assert decision["finalAction"] == "NO_OP"
+    assert decision["safetyReasons"] == ["cooldown"]
+
+
 def test_duplicate_is_reported(tmp_path):
     settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
     client = TestClient(create_app(settings))
@@ -226,6 +287,35 @@ def test_device_dashboard_marks_old_rejection_as_expired_not_current_safety(tmp_
     assert body["decision"]["status"] == "expired"
     assert body["decision"]["safetyReasons"] == ["decision has expired"]
     assert body["decision"]["finalAction"] == "NO_OP"
+
+
+def test_device_reboot_hides_cloud_rejection_from_previous_boot(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
+    )
+    store = Store(settings.database_path)
+    previous_boot_result_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    store.save_device_cloud_result(DeviceCloudResult(
+        schemaVersion="2.0", status="rejected", requestId="previous-boot",
+        action="START_WATERING", proposedAction="START_WATERING", finalAction="NO_OP",
+        durationSeconds=60, reason="soil is dry",
+        expiresAt=(datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+        safetyReasons=["watering cooldown is active"],
+    ), previous_boot_result_at)
+    live = payload()
+    live["uptimeMs"] = 5_000
+    live["receivedAt"] = datetime.now(timezone.utc).isoformat()
+
+    client = TestClient(create_app(settings))
+    assert client.post("/v1/telemetry/live", json=live).status_code == 200
+    latest = client.get("/v1/dashboard/latest").json()
+    status = client.get("/v1/cloud/status").json()
+
+    assert latest["cloud"] is None
+    assert latest["deviceCloudResult"] is None
+    assert status["latestCall"] is None
+    assert status["decision"] is None
 
 
 def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):

@@ -20,7 +20,9 @@ static const size_t CLOUD_GATEWAY_REASON_CAPACITY = 512;
 static const size_t CLOUD_GATEWAY_EVIDENCE_CAPACITY = 768;
 static const size_t CLOUD_GATEWAY_LIMITATIONS_CAPACITY = 512;
 static const size_t CLOUD_GATEWAY_ERROR_CAPACITY = 160;
-static const uint16_t CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS = 30000;
+// Thinking models can legitimately take longer than a minute. Keep this as a
+// 32-bit duration: 120000 cannot be represented by uint16_t.
+static const uint32_t CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS = 120000UL;
 
 // -------------------- Intermediate variables calculated by private functions --------------------
 
@@ -80,7 +82,7 @@ class CloudGateway {
 public:
   // The object owns only configuration and request buffers. It does not
   // create a background task, so the caller controls task priority and stack.
-  explicit CloudGateway(uint16_t timeoutMs = CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS);
+  explicit CloudGateway(uint32_t timeoutMs = CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS);
 
   bool begin();
 
@@ -120,7 +122,7 @@ private:
   bool _requestPending;
   bool _resultReady;
   CloudGatewayRequestType _pendingType;
-  uint16_t _timeoutMs;
+  uint32_t _timeoutMs;
   String _apiKey;
   String _model;
   String _farmProfileJson;

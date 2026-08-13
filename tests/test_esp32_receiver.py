@@ -442,6 +442,29 @@ def test_failed_serial_write_keeps_command_pending(tmp_path):
     assert store.pending_commands()[0]["requestId"] == "request-retry"
 
 
+def test_confirm_watering_open_ack_records_actuator_event(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    store = Store(tmp_path / "commands.sqlite")
+    command = {
+        "schemaVersion": "2.0", "requestId": "confirm-event",
+        "action": "CONFIRM_WATERING", "sourceRequestId": "cloud-event",
+        "durationSeconds": 16, "reasonCode": "UI",
+        "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "ttlSeconds": 30, "transport": "UI_COMMAND",
+    }
+    assert store.enqueue_command(command)
+
+    store.record_ack({
+        "requestId": "confirm-event", "accepted": True,
+        "action": "CONFIRM_WATERING", "actualState": "OPEN", "reason": "started",
+    })
+
+    summary = store.actuator_summary(datetime.now(timezone.utc) - timedelta(minutes=1))
+    assert summary["wateringCount"] == 1
+    assert summary["wateringSeconds"] == 16
+
+
 def test_config_protocol_remains_separate_from_valve_commands(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     config = store.enqueue_sampling_config("NIGHT_ECO", 600000)

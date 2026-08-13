@@ -3,10 +3,9 @@
 #include "cloud_gateway.h"
 
 #include <ArduinoJson.h>
-#include <HTTPClient.h>
-#include <NetworkClientSecure.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_http_client.h>
 
 // -------------------- Private define --------------------
 
@@ -91,10 +90,11 @@ static bool readJsonString(JsonObjectConst object,
                            char *destination,
                            size_t capacity);
 static void setResultError(CloudGatewayResult &result, const char *message);
+static esp_err_t collectHttpResponse(esp_http_client_event_t *event);
 
 // -------------------- Private user code --------------------
 
-CloudGateway::CloudGateway(uint16_t timeoutMs)
+CloudGateway::CloudGateway(uint32_t timeoutMs)
     : _initialized(false),
       _requestPending(false),
       _resultReady(false),
@@ -312,28 +312,36 @@ bool CloudGateway::executeRequest(CloudGatewayResult &result) {
     return false;
   }
 
-  NetworkClientSecure secureClient;
-  secureClient.setCACert(CLOUD_GATEWAY_CA_CERT);
-  HTTPClient http;
-  http.setConnectTimeout(_timeoutMs);
-  http.setTimeout(_timeoutMs);
-  if (!http.begin(secureClient, String(CLOUD_GATEWAY_BASE_URL))) {
+  String responseBody;
+  esp_http_client_config_t config = {};
+  config.url = CLOUD_GATEWAY_BASE_URL;
+  config.cert_pem = CLOUD_GATEWAY_CA_CERT;
+  config.timeout_ms = static_cast<int>(_timeoutMs);
+  config.method = HTTP_METHOD_POST;
+  config.event_handler = collectHttpResponse;
+  config.user_data = &responseBody;
+  esp_http_client_handle_t http = esp_http_client_init(&config);
+  if (http == nullptr) {
     makeOfflineResult(result, CLOUD_GATEWAY_OFFLINE, "HTTPS client initialization failed");
     return false;
   }
-  http.addHeader("Content-Type", "application/json");
+  esp_http_client_set_header(http, "Content-Type", "application/json");
   String authorization = String("Bearer ") + _apiKey;
-  http.addHeader("Authorization", authorization);
-  const int responseCode = http.POST(payload);
+  esp_http_client_set_header(http, "Authorization", authorization.c_str());
+  esp_http_client_set_post_field(http, payload.c_str(), payload.length());
+  const esp_err_t requestStatus = esp_http_client_perform(http);
+  const int responseCode = requestStatus == ESP_OK
+                               ? esp_http_client_get_status_code(http)
+                               : 0;
   result.httpStatus = responseCode > 0 ? static_cast<uint16_t>(responseCode) : 0;
-  if (responseCode <= 0) {
-    http.end();
-    makeOfflineResult(result, CLOUD_GATEWAY_OFFLINE, "HTTPS request failed");
+  if (requestStatus != ESP_OK) {
+    String requestError = String("HTTPS request failed: ") +
+                          esp_err_to_name(requestStatus);
+    esp_http_client_cleanup(http);
+    makeOfflineResult(result, CLOUD_GATEWAY_OFFLINE, requestError.c_str());
     return false;
   }
-
-  const String responseBody = http.getString();
-  http.end();
+  esp_http_client_cleanup(http);
   if (responseCode < 200 || responseCode >= 300) {
     String gatewayError = "gateway returned HTTP " + String(responseCode);
     JsonDocument errorDocument;
@@ -389,7 +397,9 @@ bool CloudGateway::buildOpenAiRequest(String &payload) const {
   context["generatedAtEpochUtc"] = static_cast<uint32_t>(time(nullptr));
   context["constraints"]["farmProfile"] = farmProfile.as<JsonObjectConst>();
   if (_pendingType == CLOUD_GATEWAY_ANALYSIS) {
-    const time_t expiryEpoch = time(nullptr) + 55;
+    // The expiry is embedded before the potentially two-minute HTTPS call.
+    // Leave another minute for the operator to review and confirm the result.
+    const time_t expiryEpoch = time(nullptr) + 180;
     struct tm expiryUtc = {};
     gmtime_r(&expiryEpoch, &expiryUtc);
     char expiryText[CLOUD_GATEWAY_EXPIRES_AT_CAPACITY] = {};
@@ -598,4 +608,15 @@ static bool readJsonString(JsonObjectConst object,
 
 static void setResultError(CloudGatewayResult &result, const char *message) {
   copyText(result.error, sizeof(result.error), message);
+}
+
+static esp_err_t collectHttpResponse(esp_http_client_event_t *event) {
+  if (event == nullptr || event->event_id != HTTP_EVENT_ON_DATA ||
+      event->user_data == nullptr || event->data == nullptr ||
+      event->data_len <= 0) {
+    return ESP_OK;
+  }
+  String *response = static_cast<String *>(event->user_data);
+  response->concat(static_cast<const char *>(event->data), event->data_len);
+  return ESP_OK;
 }

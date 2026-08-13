@@ -77,7 +77,6 @@ def test_local_irrigation_contract_has_thresholds_and_all_safety_gates():
         "75.0f",
         "DEVICE_RUNTIME_SINGLE_WATERING_SECONDS = 60",
         "DEVICE_RUNTIME_COOLDOWN_SECONDS = 15UL * 60UL",
-        "DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS = 600",
     ):
         assert text in header
     for field in (
@@ -135,13 +134,75 @@ def test_manual_debug_valve_pulse_is_explicit_fixed_and_does_not_weaken_formal_g
     assert "duration != 5UL" in debug_block
     assert "deviceSyntheticHistoryBlocksValve" in debug_block
     assert "valve_already_open" in debug_block
-    assert "DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS" in debug_block
+    assert "DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS" not in debug_block
+    assert '"daily_limit"' not in debug_block
     assert '"debug_started_5s"' in debug_block
     assert "valveCountsForFormalCooldown = false" in debug_block
     assert "deviceManualStartAllowed" not in debug_block
     formal_block = firmware[formal_start:]
     assert "deviceManualStartAllowed" in formal_block
     assert "valveCountsForFormalCooldown = true" in formal_block
+
+
+def test_daily_total_is_session_only_and_never_blocks_valve_commands():
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+    _, runtime = read_runtime_files()
+
+    assert 'putUInt("daily_sec"' not in firmware
+    assert 'getUInt("daily_sec"' not in firmware
+    assert 'constraints["maxSingleWateringSeconds"]' in firmware
+    assert 'constraints["wateringLast7Days"]' not in firmware
+    assert "DEVICE_IRRIGATION_DAILY_LIMIT" not in runtime
+
+
+def test_first_cloud_request_waits_for_complete_sensor_sample():
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+
+    assert "static bool deviceCloudInputReady()" in firmware
+    assert "pendingCloudAnalysisRequestId" in firmware
+    assert '"queued_waiting_for_sensors"' in firmware
+    sample_start = firmware.index("void processDeviceRuntimeSample(", 1000)
+    sample_start = firmware.index("void processDeviceRuntimeSample(", sample_start + 1)
+    sample_end = firmware.index("void initDeviceRuntime", sample_start)
+    sample_block = firmware[sample_start:sample_end]
+    assert sample_block.index("latestDeviceSample = sample") < sample_block.index(
+        "deviceSubmitPendingCloudWhenReady()"
+    )
+
+    cycle_start = firmware.index("  latestSensorSnapshotValid =\n")
+    cycle_end = firmware.index("const bool completeForOfflineLog", cycle_start)
+    cycle_block = firmware[cycle_start:cycle_end]
+    runtime_update = cycle_block.index("processDeviceRuntimeSample(snapshot)")
+    assert runtime_update < cycle_block.index("serviceUsbControl()")
+    assert runtime_update < cycle_block.index("sendTelemetry(snapshot, edgePrediction)")
+    assert cycle_block.count("processDeviceRuntimeSample(snapshot)") == 1
+
+
+def test_cloud_confirmation_reuses_cloud_candidate_gates_without_prediction_only_rejection():
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+    gate_start = firmware.index("static bool deviceConfirmedCloudStartAllowed(", 1000)
+    gate_start = firmware.index("static bool deviceConfirmedCloudStartAllowed(", gate_start + 1)
+    gate_end = firmware.index("void handleDeviceUiCommand", gate_start)
+    gate = firmware[gate_start:gate_end]
+
+    assert "deviceCloudIrrigationCandidate()" in gate
+    assert "sensorsValid" in gate
+    assert "dailyLimitSafe" not in gate
+    assert '"daily_limit"' not in gate
+    assert "cooldownSafe" in gate
+    assert "deviceForecast.valid" not in gate
+    assert "prediction_invalid" not in gate
+
+    confirm_start = firmware.index('strcmp(action, "START_WATERING")', gate_end)
+    confirm_end = firmware.index('strcmp(action, "CLOUD_ANALYZE")', confirm_start)
+    confirm = firmware[confirm_start:confirm_end]
+    assert "deviceConfirmedCloudStartAllowed(duration, requestId)" in confirm
 
 
 def test_only_formal_watering_updates_cooldown_timestamp():
@@ -154,11 +215,13 @@ def test_only_formal_watering_updates_cooldown_timestamp():
 
     assert "if (valveCountsForFormalCooldown && nowEpochUtc != 0)" in relay_block
     assert "deviceLastWateringEpochUtc = nowEpochUtc" in relay_block
-    assert 'putBool("formal_v2", true)' in relay_block
+    assert "Preferences" not in relay_block
+    assert '"aiot_irrig"' not in relay_block
+    assert '"last_epoch"' not in relay_block
     assert "valveCountsForFormalCooldown = false" in relay_block
 
 
-def test_legacy_debug_cooldown_state_is_migrated_without_erasing_daily_total():
+def test_watering_cooldown_is_session_only_and_never_restored_from_nvs():
     firmware = (
         ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
     ).read_text(encoding="utf-8")
@@ -166,11 +229,12 @@ def test_legacy_debug_cooldown_state_is_migrated_without_erasing_daily_total():
     load_end = firmware.index("static void deviceRestoreHistory", load_start)
     load_block = firmware[load_start:load_end]
 
-    assert 'getBool("formal_v2", false)' in load_block
-    assert "!formalCooldownTagged && deviceLastWateringEpochUtc != 0" in load_block
-    assert 'putUInt("last_epoch", 0)' in load_block
-    assert 'putBool("formal_v2", true)' in load_block
-    assert 'putUInt("daily_sec", 0)' not in load_block
+    assert "deviceLastWateringEpochUtc = 0" in load_block
+    assert "Preferences" not in load_block
+    assert '"aiot_irrig"' not in firmware
+    assert '"last_epoch"' not in firmware
+    assert '"formal_v2"' not in firmware
+    assert '"daily_sec"' not in firmware
 
 
 def test_ui_ack_reports_gpio_level_without_claiming_physical_feedback():

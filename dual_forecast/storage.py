@@ -112,6 +112,16 @@ class Store:
                 conn.execute(
                     "ALTER TABLE snapshots ADD COLUMN solar_semantics TEXT NOT NULL DEFAULT 'legacy_mean'"
                 )
+            # origin/main introduced an actuator mode column while this branch
+            # can also open databases created before that migration. Normalize
+            # both layouts so recording an ACK never crashes the receiver.
+            actuator_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(actuator_events)")
+            }
+            if "mode" not in actuator_columns:
+                conn.execute(
+                    "ALTER TABLE actuator_events ADD COLUMN mode TEXT NOT NULL DEFAULT 'serial'"
+                )
 
     def get_runtime_setting(self, key: str) -> str | None:
         with self.connection() as conn:
@@ -295,20 +305,33 @@ class Store:
                 (result_type, received_at.isoformat(), payload_json),
             )
 
-    def latest_device_result(self, result_type: str) -> dict | None:
+    def latest_device_result(
+        self, result_type: str, *, not_before: datetime | None = None
+    ) -> dict | None:
         with self.connection() as conn:
             row = conn.execute(
-                "SELECT payload_json FROM device_display_cache WHERE result_type=?",
-                (result_type,),
+                """SELECT payload_json FROM device_display_cache
+                   WHERE result_type=? AND (? IS NULL OR received_at>=?)""",
+                (
+                    result_type,
+                    not_before.isoformat() if not_before else None,
+                    not_before.isoformat() if not_before else None,
+                ),
             ).fetchone()
         return json.loads(row["payload_json"]) if row else None
 
-    def latest_device_results(self) -> dict[str, dict | None]:
+    def latest_device_results(
+        self, *, display_session_started_at: datetime | None = None
+    ) -> dict[str, dict | None]:
         return {
             "forecast": self.latest_device_result("forecast"),
             "irrigationState": self.latest_device_result("irrigation_state"),
-            "cloudResult": self.latest_device_result("cloud_result"),
-            "uiAck": self.latest_device_result("ui_ack"),
+            "cloudResult": self.latest_device_result(
+                "cloud_result", not_before=display_session_started_at
+            ),
+            "uiAck": self.latest_device_result(
+                "ui_ack", not_before=display_session_started_at
+            ),
         }
 
     def save_device_forecast(self, forecast: DeviceForecast, received_at: datetime | None = None) -> None:
@@ -457,6 +480,27 @@ class Store:
             "ack": json.loads(row["ack_json"]) if row["ack_json"] else None,
         }
 
+    def latest_command(self, action: str | None = None) -> dict | None:
+        """Return the newest queued device command, including its ACK state."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT request_id,command_json,status,queued_at,sent_at,ack_json "
+                "FROM command_queue ORDER BY queued_at DESC"
+            ).fetchall()
+        for row in rows:
+            command = json.loads(row["command_json"])
+            if action is not None and command.get("action") != action:
+                continue
+            return {
+                "requestId": row["request_id"],
+                "command": command,
+                "status": row["status"],
+                "queuedAt": row["queued_at"],
+                "sentAt": row["sent_at"],
+                "ack": json.loads(row["ack_json"]) if row["ack_json"] else None,
+            }
+        return None
+
     def claim_pending_commands(self, limit: int = 1) -> list[dict]:
         """Compatibility helper used by tests and non-I/O queue consumers."""
         commands = self.pending_commands(limit)
@@ -483,10 +527,15 @@ class Store:
         # A later safety-timeout CLOSED ACK for the same request must not add a
         # second watering event or inflate daily-use limits.
         if (ack.get("accepted") and command
-                and command.get("action") == IrrigationAction.START_WATERING.value
+                and command.get("action") in {
+                    IrrigationAction.START_WATERING.value, "CONFIRM_WATERING"
+                }
                 and ack.get("actualState") == "OPEN"
                 and previous_ack is None):
-            self.record_actuator_event(request_id, command["action"], command.get("durationSeconds"), ack)
+            self.record_actuator_event(
+                request_id, IrrigationAction.START_WATERING,
+                command.get("durationSeconds"), ack,
+            )
         if not ack.get("accepted"):
             self.record_anomaly("VALVE_EXECUTION_FAILED", "high", "ESP32 拒绝执行水阀指令", ack)
 
@@ -515,12 +564,16 @@ class Store:
             conn.execute("UPDATE decisions SET result_json=? WHERE request_id=?", (updated.model_dump_json(), request_id))
 
     def record_actuator_event(self, request_id: str, action: IrrigationAction | str,
-                              duration_seconds: int | None, details: dict) -> None:
+                              duration_seconds: int | None, details: dict,
+                              mode: str = "serial") -> None:
         action_value = action.value if isinstance(action, IrrigationAction) else str(action)
         with self.connection() as conn:
-            conn.execute("INSERT INTO actuator_events(occurred_at,request_id,action,duration_seconds,details_json) VALUES(?,?,?,?,?)",
-                         (datetime.now(timezone.utc).isoformat(), request_id, action_value, duration_seconds,
-                          json.dumps(details, ensure_ascii=False)))
+            conn.execute(
+                "INSERT INTO actuator_events(occurred_at,request_id,action,duration_seconds,mode,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (datetime.now(timezone.utc).isoformat(), request_id, action_value,
+                 duration_seconds, mode, json.dumps(details, ensure_ascii=False)),
+            )
 
     def actuator_summary(self, since: datetime) -> dict:
         with self.connection() as conn:

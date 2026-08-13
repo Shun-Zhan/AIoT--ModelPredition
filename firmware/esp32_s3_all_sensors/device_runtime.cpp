@@ -250,8 +250,6 @@ DeviceRuntimeConfig deviceRuntimeDefaultConfig() {
   config.et0TriggerMm = DEVICE_RUNTIME_ET0_TRIGGER_MM;
   config.singleWateringSeconds = DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
   config.cooldownSeconds = DEVICE_RUNTIME_COOLDOWN_SECONDS;
-  config.dailyWateringLimitSeconds =
-      DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS;
   return config;
 }
 
@@ -344,13 +342,6 @@ DeviceIrrigationEvaluation evaluateLocalIrrigation(
     evaluation.reason = DEVICE_IRRIGATION_COOLDOWN;
     return evaluation;
   }
-  if (input.dailyWateredSeconds >= config.dailyWateringLimitSeconds ||
-      config.singleWateringSeconds >
-          config.dailyWateringLimitSeconds - input.dailyWateredSeconds) {
-    evaluation.reason = DEVICE_IRRIGATION_DAILY_LIMIT;
-    return evaluation;
-  }
-
   evaluation.shouldOpenValve = true;
   evaluation.reason = DEVICE_IRRIGATION_ALLOWED;
   return evaluation;

@@ -473,14 +473,15 @@ bool deviceSyntheticHistoryInjected = false;
 uint32_t deviceLastNtpAttemptMs = 0;
 uint32_t deviceLastStatusEmitMs = 0;
 uint32_t deviceLastSavedSlot = UINT32_MAX;
-uint32_t deviceDailyWateredSeconds = 0;
-uint32_t deviceWateringDayUtc = 0;
 uint32_t deviceLastWateringEpochUtc = 0;
 uint32_t deviceValveOpenEpochUtc = 0;
 bool valveCountsForFormalCooldown = false;
 char pendingCloudWateringRequestId[CLOUD_GATEWAY_REQUEST_ID_CAPACITY] = {};
 uint32_t pendingCloudWateringDurationSeconds = 0;
 uint32_t pendingCloudWateringExpiresAtMs = 0;
+char pendingCloudAnalysisRequestId[CLOUD_GATEWAY_REQUEST_ID_CAPACITY] = {};
+char pendingCloudAnalysisQuestion[CLOUD_GATEWAY_QUESTION_CAPACITY] = {};
+CloudGatewayRequestType pendingCloudAnalysisType = CLOUD_GATEWAY_ANALYSIS;
 DeviceIrrigationEvaluation latestIrrigationEvaluation = {
     false, false, false, false, false, false, 0, 0.0f,
     DEVICE_IRRIGATION_AUTO_DISABLED};
@@ -492,6 +493,8 @@ void serviceDeviceRuntime();
 void processDeviceRuntimeSample(const SensorSnapshot &snapshot);
 void handleDeviceUiCommand(const char *json);
 static bool deviceManualStartAllowed(uint32_t durationSeconds, const char *requestId);
+static bool deviceConfirmedCloudStartAllowed(uint32_t durationSeconds,
+                                             const char *requestId);
 void emitDeviceForecast();
 void emitDeviceIrrigationState(const char *requestId = nullptr);
 void emitDeviceCloudResult(const CloudGatewayResult &result);
@@ -504,6 +507,8 @@ static void deviceTryInjectSyntheticHistory();
 static bool deviceSyntheticHistoryBlocksValve();
 static bool deviceRunModelInference(edge_model::ModelOutput &result);
 static bool deviceCloudIrrigationCandidate(const char **rule = nullptr);
+static bool deviceCloudInputReady();
+static void deviceSubmitPendingCloudWhenReady();
 static String deviceIsoUtc(uint32_t epochUtc);
 
 uint32_t offlineLogChecksum(const uint8_t *data, size_t length) {
@@ -768,30 +773,9 @@ void setValveRelay(bool open) {
     valveOpenedAtMs = millis();
     deviceValveOpenEpochUtc = latestDeviceSample.epochUtc;
   } else if (!open && wasOpen) {
-    const uint32_t elapsedSeconds =
-        min<uint32_t>((millis() - valveOpenedAtMs + 999) / 1000,
-                      DEVICE_RUNTIME_SINGLE_WATERING_SECONDS);
     const uint32_t nowEpochUtc = latestDeviceSample.epochUtc;
-    const uint32_t dayUtc = nowEpochUtc / 86400UL;
-    if (dayUtc != 0 && dayUtc != deviceWateringDayUtc) {
-      deviceWateringDayUtc = dayUtc;
-      deviceDailyWateredSeconds = 0;
-    }
-    deviceDailyWateredSeconds = min<uint32_t>(
-        DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS,
-        deviceDailyWateredSeconds + elapsedSeconds);
     if (valveCountsForFormalCooldown && nowEpochUtc != 0) {
       deviceLastWateringEpochUtc = nowEpochUtc;
-    }
-    Preferences irrigationPreferences;
-    if (irrigationPreferences.begin("aiot_irrig", false)) {
-      irrigationPreferences.putUInt("day_utc", deviceWateringDayUtc);
-      irrigationPreferences.putUInt("daily_sec", deviceDailyWateredSeconds);
-      irrigationPreferences.putUInt("last_epoch", deviceLastWateringEpochUtc);
-      if (valveCountsForFormalCooldown) {
-        irrigationPreferences.putBool("formal_v2", true);
-      }
-      irrigationPreferences.end();
     }
   }
   valveOpen = open;
@@ -1138,24 +1122,9 @@ bool appendDeviceV2Record(const DeviceRuntimeRecordV2 &record) {
 }
 
 static void deviceLoadIrrigationCounters() {
-  Preferences preferences;
-  if (!preferences.begin("aiot_irrig", true)) return;
-  deviceWateringDayUtc = preferences.getUInt("day_utc", 0);
-  deviceDailyWateredSeconds = preferences.getUInt("daily_sec", 0);
-  deviceLastWateringEpochUtc = preferences.getUInt("last_epoch", 0);
-  const bool formalCooldownTagged = preferences.getBool("formal_v2", false);
-  preferences.end();
-  // Firmware before the formal_v2 marker updated last_epoch for every relay
-  // diagnostic pulse. That timestamp cannot prove a real irrigation cycle,
-  // so migrate it to no cooldown while retaining the daily water total.
-  if (!formalCooldownTagged && deviceLastWateringEpochUtc != 0) {
-    deviceLastWateringEpochUtc = 0;
-    if (preferences.begin("aiot_irrig", false)) {
-      preferences.putUInt("last_epoch", 0);
-      preferences.putBool("formal_v2", true);
-      preferences.end();
-    }
-  }
+  // Irrigation cooldown is deliberately session-only for the demonstration.
+  // Never restore it from NVS: a reboot/power cycle always starts at zero.
+  deviceLastWateringEpochUtc = 0;
 }
 
 static void deviceRestoreHistory() {
@@ -1350,7 +1319,6 @@ static const char *deviceIrrigationReasonText(DeviceIrrigationReason reason) {
     case DEVICE_IRRIGATION_PREDICTION_INVALID: return "prediction_invalid";
     case DEVICE_IRRIGATION_SOIL_NOT_DRY: return "soil_not_dry";
     case DEVICE_IRRIGATION_COOLDOWN: return "cooldown";
-    case DEVICE_IRRIGATION_DAILY_LIMIT: return "daily_limit";
     default: return "auto_disabled";
   }
 }
@@ -1368,7 +1336,6 @@ void emitDeviceIrrigationState(const char *requestId) {
   document["shouldOpen"] = latestIrrigationEvaluation.shouldOpenValve;
   document["reasonCode"] = deviceIrrigationReasonText(latestIrrigationEvaluation.reason);
   document["reason"] = deviceIrrigationReasonText(latestIrrigationEvaluation.reason);
-  document["dailyWateredSeconds"] = deviceDailyWateredSeconds;
   document["remainingSeconds"] = valveOpen && valveCloseAtMs > millis()
                                       ? (valveCloseAtMs - millis() + 999) / 1000
                                       : 0;
@@ -1420,16 +1387,13 @@ void emitDeviceCloudResult(const CloudGatewayResult &result) {
   const bool confidenceValid = !startSuggested ||
                                (result.hasConfidence && result.confidence >= 0.5f);
   const bool valveSafe = !startSuggested || !valveOpen;
-  const bool dailyLimitSafe = !startSuggested ||
-                              deviceDailyWateredSeconds + result.durationSeconds <=
-                                  DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS;
   const bool cooldownSafe = !startSuggested || deviceLastWateringEpochUtc == 0 ||
                             (latestDeviceSample.epochUtc >= deviceLastWateringEpochUtc &&
                              latestDeviceSample.epochUtc - deviceLastWateringEpochUtc >=
                                  DEVICE_RUNTIME_COOLDOWN_SECONDS);
   const bool localAccepted = !startSuggested ||
                              (cloudCandidate && sensorsValid && durationValid &&
-                              confidenceValid && valveSafe && dailyLimitSafe && cooldownSafe);
+                              confidenceValid && valveSafe && cooldownSafe);
   pendingCloudWateringRequestId[0] = '\0';
   pendingCloudWateringDurationSeconds = 0;
   pendingCloudWateringExpiresAtMs = 0;
@@ -1478,7 +1442,6 @@ void emitDeviceCloudResult(const CloudGatewayResult &result) {
   if (!confidenceValid) safetyReasons.add("model confidence is below local threshold");
   if (!valveSafe) safetyReasons.add("valve is already open");
   if (!cooldownSafe) safetyReasons.add("watering cooldown is active");
-  if (!dailyLimitSafe) safetyReasons.add("daily watering limit would be exceeded");
   document["error"] = result.error;
   sendDeviceProtocol(USB_CLOUD_RESULT_PREFIX, document);
 }
@@ -1596,10 +1559,9 @@ static void deviceBuildCloudContext(String &context) {
 
   JsonObject actuator = document["actuator"].to<JsonObject>();
   actuator["state"] = valveOpen ? "OPEN" : "CLOSED";
-  actuator["dailyWateredSeconds"] = deviceDailyWateredSeconds;
 
   JsonObject constraints = document["constraints"].to<JsonObject>();
-  constraints["maxWateringSeconds"] = DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
+  constraints["maxSingleWateringSeconds"] = DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
   constraints["severeDryPercent"] = DEVICE_RUNTIME_SOIL_SEVERE_DRY_PERCENT;
   constraints["triggerPercent"] = DEVICE_RUNTIME_SOIL_TRIGGER_PERCENT;
   constraints["predictiveMaxPercent"] = DEVICE_RUNTIME_SOIL_PREDICTIVE_MAX_PERCENT;
@@ -1608,9 +1570,6 @@ static void deviceBuildCloudContext(String &context) {
   constraints["cloudNeverDirectlyControlsGPIO"] = true;
   constraints["activeAnomalies"].to<JsonArray>();
   constraints["recentAnomalies"].to<JsonArray>();
-  JsonObject watering = constraints["wateringLast7Days"].to<JsonObject>();
-  watering["wateringCount"] = 0;
-  watering["wateringSeconds"] = deviceDailyWateredSeconds;
   constraints["recentReviewedDecisions"].to<JsonArray>();
   JsonObject weather = constraints["weather"].to<JsonObject>();
   weather["status"] = "not_configured";
@@ -1664,6 +1623,12 @@ static bool deviceCloudIrrigationCandidate(const char **rule) {
   return false;
 }
 
+static bool deviceCloudInputReady() {
+  return latestDeviceSample.validityMask == DEVICE_SENSOR_ALL_REQUIRED_VALID &&
+         latestDeviceSample.soilMoisturePercent > 0.0f &&
+         latestDeviceSample.soilMoisturePercent <= 100.0f;
+}
+
 static String deviceIsoUtc(uint32_t epochUtc) {
   if (!deviceRuntimeIsValidUtcEpoch(epochUtc)) return "";
   const time_t value = static_cast<time_t>(epochUtc);
@@ -1685,6 +1650,18 @@ static void deviceSubmitCloud(CloudGatewayRequestType type, const char *requestI
   request.question = question;
   if (!CloudGatewayInstance.submit(request)) return;
   if (cloudWorkerTaskHandle != nullptr) xTaskNotifyGive(cloudWorkerTaskHandle);
+}
+
+static void deviceSubmitPendingCloudWhenReady() {
+  if (pendingCloudAnalysisRequestId[0] == '\0' || !deviceCloudInputReady()) return;
+  char requestId[CLOUD_GATEWAY_REQUEST_ID_CAPACITY] = {};
+  char question[CLOUD_GATEWAY_QUESTION_CAPACITY] = {};
+  strlcpy(requestId, pendingCloudAnalysisRequestId, sizeof(requestId));
+  strlcpy(question, pendingCloudAnalysisQuestion, sizeof(question));
+  const CloudGatewayRequestType type = pendingCloudAnalysisType;
+  pendingCloudAnalysisRequestId[0] = '\0';
+  pendingCloudAnalysisQuestion[0] = '\0';
+  deviceSubmitCloud(type, requestId, question);
 }
 
 static bool deviceManualStartAllowed(uint32_t durationSeconds,
@@ -1715,7 +1692,6 @@ static bool deviceManualStartAllowed(uint32_t durationSeconds,
   input.prediction.nextHourEt0Mm = deviceForecast.nextHourEt0Mm;
   input.valveState = valveOpen ? DEVICE_VALVE_OPEN : DEVICE_VALVE_CLOSED;
   input.valveDriverHealthy = true;
-  input.dailyWateredSeconds = deviceDailyWateredSeconds;
   input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
   const DeviceIrrigationEvaluation evaluation =
       evaluateLocalIrrigation(input, config);
@@ -1725,6 +1701,37 @@ static bool deviceManualStartAllowed(uint32_t durationSeconds,
       durationSeconds == 0 || durationSeconds > evaluation.durationSeconds) {
     emitDeviceUiAck(requestId, false, "START_WATERING",
                     deviceIrrigationReasonText(evaluation.reason));
+    emitDeviceIrrigationState(requestId);
+    return false;
+  }
+  return true;
+}
+
+static bool deviceConfirmedCloudStartAllowed(uint32_t durationSeconds,
+                                             const char *requestId) {
+  // Re-run the same physical/local gates used when the LLM result was first
+  // accepted. Severe dry soil is a valid candidate without a warmed-up model;
+  // confirmation must not introduce a contradictory prediction-only gate.
+  const bool candidate = deviceCloudIrrigationCandidate();
+  const bool sensorsValid = latestDeviceSample.validityMask ==
+                                DEVICE_SENSOR_ALL_REQUIRED_VALID &&
+                            latestDeviceSample.soilMoisturePercent > 0.0f &&
+                            latestDeviceSample.soilMoisturePercent <= 100.0f;
+  const bool durationValid = durationSeconds >= 1 &&
+                             durationSeconds <= DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
+  const bool valveSafe = !valveOpen;
+  const bool cooldownSafe = deviceLastWateringEpochUtc == 0 ||
+                            (latestDeviceSample.epochUtc >= deviceLastWateringEpochUtc &&
+                             latestDeviceSample.epochUtc - deviceLastWateringEpochUtc >=
+                                 DEVICE_RUNTIME_COOLDOWN_SECONDS);
+  const char *reason = !sensorsValid ? "sensor_invalid"
+                       : !candidate ? "irrigation_candidate_invalid"
+                       : !durationValid ? "invalid_duration"
+                       : !valveSafe ? "valve_already_open"
+                       : !cooldownSafe ? "cooldown"
+                       : nullptr;
+  if (reason != nullptr) {
+    emitDeviceUiAck(requestId, false, "CONFIRM_WATERING", reason);
     emitDeviceIrrigationState(requestId);
     return false;
   }
@@ -1794,11 +1801,6 @@ void handleDeviceUiCommand(const char *json) {
       emitDeviceUiAck(requestId, true, action, "duplicate_idempotent");
       return;
     }
-    if (deviceDailyWateredSeconds >
-        DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS - duration) {
-      emitDeviceUiAck(requestId, false, action, "daily_limit");
-      return;
-    }
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
     valveRequiresHostHeartbeat = true;
@@ -1830,7 +1832,10 @@ void handleDeviceUiCommand(const char *json) {
         return;
       }
     }
-    if (!deviceManualStartAllowed(duration, requestId)) return;
+    const bool allowed = strcmp(action, "CONFIRM_WATERING") == 0
+                             ? deviceConfirmedCloudStartAllowed(duration, requestId)
+                             : deviceManualStartAllowed(duration, requestId);
+    if (!allowed) return;
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
     valveRequiresHostHeartbeat = true;
@@ -1849,6 +1854,15 @@ void handleDeviceUiCommand(const char *json) {
                                              ? CLOUD_GATEWAY_QUESTION
                                              : CLOUD_GATEWAY_ANALYSIS;
     const char *question = document["question"] | "";
+    if (!deviceCloudInputReady()) {
+      strlcpy(pendingCloudAnalysisRequestId, requestId,
+              sizeof(pendingCloudAnalysisRequestId));
+      strlcpy(pendingCloudAnalysisQuestion, question,
+              sizeof(pendingCloudAnalysisQuestion));
+      pendingCloudAnalysisType = type;
+      emitDeviceUiAck(requestId, true, action, "queued_waiting_for_sensors");
+      return;
+    }
     deviceSubmitCloud(type, requestId, question);
     emitDeviceUiAck(requestId, true, action, "queued");
     return;
@@ -1883,6 +1897,7 @@ void processDeviceRuntimeSample(const SensorSnapshot &snapshot) {
   sample.solarReflectedWm2 = snapshot.solarRadiation1Wm2;
   sample.windSpeedMs = snapshot.wind2Ok ? snapshot.wind2SpeedMs : snapshot.wind1SpeedMs;
   latestDeviceSample = sample;
+  deviceSubmitPendingCloudWhenReady();
   if (deviceSyntheticHistoryActive) return;
   if (!trustedClock) {
     deviceSetForecastStatus("clock_unset");
@@ -2112,7 +2127,6 @@ void serviceDeviceRuntime() {
   input.prediction.nextHourEt0Mm = deviceForecast.nextHourEt0Mm;
   input.valveState = DEVICE_VALVE_CLOSED;
   input.valveDriverHealthy = true;
-  input.dailyWateredSeconds = deviceDailyWateredSeconds;
   input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
   latestIrrigationEvaluation = DeviceRuntimeInstance.evaluateLocalIrrigation(input);
   if (latestIrrigationEvaluation.shouldOpenValve) {
@@ -3788,6 +3802,10 @@ void loop() {
   } else {
     Serial.println("ESP32 edge prediction: unavailable (sensor_invalid).");
   }
+  // Publish the completed sensor cycle to the device runtime before servicing
+  // any incoming UI command.  Telemetry and cloud analysis must describe the
+  // same snapshot, especially for the first request after boot.
+  processDeviceRuntimeSample(snapshot);
   serviceUsbControl();
   updateDisplay(snapshot);
   lastTelemetrySnapshot = snapshot;
@@ -3796,7 +3814,6 @@ void loop() {
   sendTelemetry(snapshot, edgePrediction);
   lastTcpTelemetryEmitMs = millis();
   tcpClientJustConnected = false;
-  processDeviceRuntimeSample(snapshot);
 
   // A failed sample is still reported to USB/Wi-Fi for diagnosis, but never
   // enters offline history.  Retry after 15 seconds and keep retrying until a

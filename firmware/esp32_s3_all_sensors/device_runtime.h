@@ -20,7 +20,6 @@ static constexpr float DEVICE_RUNTIME_SOIL_PREDICTIVE_MAX_PERCENT = 45.0f;
 static constexpr float DEVICE_RUNTIME_TARGET_SOIL_PERCENT = 75.0f;
 static constexpr uint32_t DEVICE_RUNTIME_SINGLE_WATERING_SECONDS = 60;
 static constexpr uint32_t DEVICE_RUNTIME_COOLDOWN_SECONDS = 15UL * 60UL;
-static constexpr uint32_t DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS = 600;
 static constexpr uint8_t DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR = 12;
 
 // -------------------- Sensor and system-clock contracts --------------------
@@ -146,7 +145,6 @@ struct DeviceRuntimeConfig {
   float et0TriggerMm;
   uint32_t singleWateringSeconds;
   uint32_t cooldownSeconds;
-  uint32_t dailyWateringLimitSeconds;
 };
 
 struct DeviceIrrigationInput {
@@ -156,7 +154,6 @@ struct DeviceIrrigationInput {
   DevicePredictionResult prediction;
   DeviceValveState valveState;
   bool valveDriverHealthy;
-  uint32_t dailyWateredSeconds;
   uint32_t lastWateringEpochUtc;
 };
 
@@ -169,7 +166,6 @@ enum DeviceIrrigationReason : uint8_t {
   DEVICE_IRRIGATION_PREDICTION_INVALID,
   DEVICE_IRRIGATION_SOIL_NOT_DRY,
   DEVICE_IRRIGATION_COOLDOWN,
-  DEVICE_IRRIGATION_DAILY_LIMIT,
 };
 
 struct DeviceIrrigationEvaluation {
