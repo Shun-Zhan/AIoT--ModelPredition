@@ -270,9 +270,13 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "/v1/actuator/debug/open" in app_js.text
     assert "/v1/actuator/debug/close" in app_js.text
     assert "beginDebugHold" in app_js.text
+    assert "未安装物理反馈传感器" not in app_js.text
+    assert "debug_started_5s" not in app_js.text
     assert "/v1/operation-mode" in app_js.text
     assert "每 60 秒调用一次 AI 决策" in app_js.text
     assert "全自动模式无需人工确认" in app_js.text
+    assert "function cloudAnalysisSucceeded(status)" in app_js.text
+    assert "本次云端分析已完成，建议灌溉；当前等待人工确认。" in app_js.text
     assert "analyzeStatus" in html
     assert "et0ForecastChart" in html
     assert "soilForecastChart" in html
@@ -285,21 +289,25 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "风险等级 " not in app_js.text
     assert "传感器异常：" in app_js.text
     assert "土壤温湿度传感器" in app_js.text
-    assert "ESP32 未来 30 分钟土壤趋势" in html
-    assert "edgeTrendChart" in app_js.text
+    assert 'id="edgePrediction"' in html
+    assert "ESP32 边缘趋势" in html
+    assert "ESP32 未来 30 分钟土壤趋势" not in html
+    assert "edgeTrendPanel" not in html
+    assert "edgeTrendChart" not in app_js.text
     assert "当前土壤湿度：" in app_js.text
     assert "预计变化：" in app_js.text
-    assert "ESP32 线性趋势估计" in html
-    assert "ESP32未来30分钟土壤湿度趋势曲线" in html
-    assert "不代表新增的中间模型预测点" in html
+    assert "ESP32 线性趋势估计" not in html
+    assert "ESP32未来30分钟土壤湿度趋势曲线" not in html
+    assert "不代表新增的中间模型预测点" not in html
     assert "#E0E5EC" in html
     assert "--shadow-extruded" in html
     assert "prefers-reduced-motion" in html
     assert "api.qrserver.com" not in app_js.text
-    assert "SpeechRecognition" in app_js.text
-    assert "停止录音" in app_js.text
-    assert "8 秒未检测到语音，已自动停止" in app_js.text
-    assert "voiceRecognition.stop()" in app_js.text
+    assert "自然语言问答（可选语音）" not in html
+    assert 'id="question"' not in html
+    assert "SpeechRecognition" not in app_js.text
+    assert "voiceRecognition" not in app_js.text
+    assert "speechSynthesis" not in app_js.text
     qr = client.get("/v1/dashboard/qr", params={"url": "http://192.168.1.20:8000/dashboard"})
     assert qr.status_code == 200
     assert qr.headers["content-type"].startswith("image/png")

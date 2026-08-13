@@ -438,7 +438,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     dashboard_script = r"""(function () {
   'use strict';
   var lastSnapshotAt = null;
-  var latestAnswer = '';
   var longPressTimer = null;
   var longPressProgressTimer = null;
   var longPressStartedAt = 0;
@@ -450,10 +449,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   var debugHoldStartedAt = 0;
   var debugHoldTriggered = false;
   var debugStatusTimer = null;
-  var voiceRecognition = null;
-  var voiceStopTimer = null;
-  var voiceBusy = false;
-  var voiceGotResult = false;
   var analyzeBusy = false;
   var analyzeStatusTimer = null;
   var pendingCloudRequestId = '';
@@ -517,43 +512,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       svg.push('<text x="' + tickX.toFixed(1) + '" y="' + (height - 12) + '" text-anchor="middle" class="chart-axis">+' + ((tick + 1) * 5) + ' 分钟</text>');
     }
     svg.push('<text x="15" y="' + (top + plotHeight / 2) + '" text-anchor="middle" transform="rotate(-90 15 ' + (top + plotHeight / 2) + ')" class="chart-unit">' + label + '（' + unit + '）</text>');
-    return svg.join('');
-  }
-  function edgeTrendChart(currentMoisture, predictedMoisture) {
-    var current = Number(currentMoisture), predicted = Number(predictedMoisture);
-    if (!isFinite(current) || !isFinite(predicted)) {
-      return '<text x="320" y="100" text-anchor="middle" class="chart-empty">暂无趋势数据</text>';
-    }
-    var values = [], minutes = [0, 10, 20, 30], i;
-    for (i = 0; i < minutes.length; i++) {
-      values.push(current + (predicted - current) * minutes[i] / 30);
-    }
-    var width = 640, height = 200;
-    var left = 58, right = 18, top = 18, bottom = 38;
-    var plotWidth = width - left - right, plotHeight = height - top - bottom;
-    var minimum = Math.min.apply(Math, values), maximum = Math.max.apply(Math, values);
-    var padding = Math.max((maximum - minimum) * 0.2, 0.4);
-    var yMin = Math.max(0, minimum - padding), yMax = Math.min(100, maximum + padding);
-    if (yMax === yMin) yMax = Math.min(100, yMin + 1);
-    var svg = [], coords = [];
-    for (i = 0; i < 4; i++) {
-      var gridY = top + plotHeight * i / 3;
-      var tickValue = yMax - (yMax - yMin) * i / 3;
-      svg.push('<line x1="' + left + '" y1="' + gridY.toFixed(1) + '" x2="' + (width - right) + '" y2="' + gridY.toFixed(1) + '" class="chart-grid"/>');
-      svg.push('<text x="' + (left - 9) + '" y="' + (gridY + 4).toFixed(1) + '" text-anchor="end" class="chart-axis">' + tickValue.toFixed(1) + '</text>');
-    }
-    for (i = 0; i < values.length; i++) {
-      var x = left + plotWidth * i / (values.length - 1);
-      var y = top + (yMax - values[i]) / (yMax - yMin) * plotHeight;
-      coords.push(x.toFixed(1) + ',' + y.toFixed(1));
-    }
-    svg.push('<polyline points="' + coords.join(' ') + '" fill="none" stroke="#167B72" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>');
-    for (i = 0; i < values.length; i++) {
-      var parts = coords[i].split(',');
-      svg.push('<circle cx="' + parts[0] + '" cy="' + parts[1] + '" r="5" fill="#167B72" class="chart-point"><title>' + (minutes[i] ? '+' + minutes[i] + ' 分钟' : '当前') + '：' + values[i].toFixed(1) + ' %</title></circle>');
-      svg.push('<text x="' + parts[0] + '" y="' + (height - 12) + '" text-anchor="middle" class="chart-axis">' + (minutes[i] ? '+' + minutes[i] + ' 分钟' : '当前') + '</text>');
-    }
-    svg.push('<text x="15" y="' + (top + plotHeight / 2) + '" text-anchor="middle" transform="rotate(-90 15 ' + (top + plotHeight / 2) + ')" class="chart-unit">土壤湿度（%）</text>');
     return svg.join('');
   }
   function renderForecastCharts(points) {
@@ -752,15 +710,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         el('edgePrediction').textContent = '传感器异常：' + sensorIssues.join('、') + '。请检查接线或探头状态，ESP32 趋势估计暂不作为判断依据。';
         el('edgePrediction').className = 'value bad';
         el('edgePrediction').style.fontSize = '17px';
-        el('edgeTrendPanel').hidden = true;
       } else if (!edgePrediction) {
         el('edgePrediction').textContent = '等待 ESP32 边缘预测数据...';
         el('edgePrediction').className = 'meta';
-        el('edgeTrendPanel').hidden = true;
       } else if (!edgePrediction.valid) {
         el('edgePrediction').textContent = 'ESP32 暂时无法生成土壤趋势，请检查传感器数据。';
         el('edgePrediction').className = 'meta warn';
-        el('edgeTrendPanel').hidden = true;
       } else {
         var edgeRiskLabels = {
           NORMAL: '正常',
@@ -788,8 +743,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         el('edgePrediction').textContent = edgeText;
         el('edgePrediction').className = 'value ' + (edgePrediction.riskLevel === 'NORMAL' ? 'ok' : (edgePrediction.riskLevel === 'ATTENTION' ? 'warn' : 'bad'));
         el('edgePrediction').style.fontSize = '17px';
-        el('edgeTrendChart').innerHTML = edgeTrendChart(currentMoisture, predictedMoisture);
-        el('edgeTrendPanel').hidden = false;
       }
       var edge = data.edge || {}, risk = edge.riskLevel || '--';
       var riskLabels = {
@@ -954,6 +907,14 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       unknown: '等待云端结果'
     }[status] || '云端状态：' + (status || '未知');
   }
+  function cloudAnalysisSucceeded(status) {
+    return [
+      'ok', 'suggested', 'awaiting_confirmation', 'auto_held',
+      'confirmed_waiting_device', 'auto_confirmed_waiting_device',
+      'executed', 'completed', 'cancelled_by_user', 'rejected',
+      'rejected_on_confirmation', 'expired'
+    ].indexOf(String(status || '')) !== -1;
+  }
   function cloudRiskLabel(risk) {
     return {
       low: '低风险',
@@ -1086,9 +1047,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     request('GET', '/v1/cloud/status', null, function (data) {
       var decision = data.decision, actuator = data.actuator || {}, cloud = data.latestCall || data.cloud || null;
       if (pendingCloudRequestId && cloud && cloud.requestId === pendingCloudRequestId && cloud.status !== 'pending') {
-        var completedStatus = cloud.status === 'ok' ? 'success' : 'error';
-        var completedText = cloud.status === 'ok'
-          ? '本次云端分析已返回，下面显示的是最新 AI 内容。'
+        var analysisSucceeded = cloudAnalysisSucceeded(cloud.status);
+        var completedStatus = analysisSucceeded ? 'success' : 'error';
+        var completedText = analysisSucceeded
+          ? (cloud.status === 'awaiting_confirmation'
+            ? '本次云端分析已完成，建议灌溉；当前等待人工确认。'
+            : '本次云端分析已返回，下面显示的是最新 AI 内容。')
           : '本次云端分析返回：' + cloudStatusLabel(cloud.status) + '。';
         pendingCloudRequestId = '';
         pendingCloudStartedAt = 0;
@@ -1314,9 +1278,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
           : '';
         setDebugStatus(
           '下位机已接受指令，软件阀门状态：' + (ack.actualState || '未知')
-          + gpioDetail
-          + '；未安装物理反馈传感器，请以继电器 LED/触点或万用表为准'
-          + (ack.reason ? '；' + ack.reason : ''),
+          + gpioDetail,
           'ok'
         );
         refreshCloud();
@@ -1486,79 +1448,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       setDebugStatus('调试关阀请求失败：' + message, 'bad');
     });
   };
-  el('ask').onclick = function () {
-    var question = el('question').value.replace(/^\s+|\s+$/g, '');
-    if (!question) return;
-    request('POST', '/v1/cloud/chat', {question: question}, function (data) {
-      latestAnswer = data.answer || '';
-      var range = data.dataRange || {};
-      el('answer').textContent = latestAnswer + '\n数据范围：' + (range.start || '--') + ' 至 ' + (range.end || '--') + '\n依据：' + (data.evidence || []).join('；');
-    }, function () { el('answer').textContent = '问答服务暂不可用。'; });
-  };
-  function resetVoiceButton() {
-    voiceBusy = false;
-    voiceRecognition = null;
-    if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
-    el('voice').textContent = '开始说话';
-  }
-  function stopVoice(status) {
-    if (status) el('voiceStatus').textContent = status;
-    if (!voiceBusy || !voiceRecognition) { resetVoiceButton(); return; }
-    if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
-    try { voiceRecognition.stop(); }
-    catch (error) { resetVoiceButton(); }
-  }
-  el('voiceStatus').textContent = '点击“开始说话”后说一句完整问题；可再次点击停止，8 秒无语音会自动停止。';
-  el('voice').onclick = function () {
-    var Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!Recognition) { el('voiceStatus').textContent = '当前浏览器不支持语音输入，请使用文字提问。'; return; }
-    if (voiceBusy) { stopVoice('已停止语音输入。'); return; }
-    voiceBusy = true;
-    voiceGotResult = false;
-    voiceRecognition = new Recognition();
-    voiceRecognition.lang = 'zh-CN';
-    voiceRecognition.continuous = false;
-    voiceRecognition.interimResults = false;
-    voiceRecognition.maxAlternatives = 1;
-    voiceRecognition.onstart = function () {
-      el('voice').textContent = '停止录音';
-      el('voiceStatus').textContent = '正在聆听…请说一句完整问题；再次点击“停止录音”可立即关闭麦克风。';
-      voiceStopTimer = setTimeout(function () { stopVoice('8 秒未检测到语音，已自动停止。'); }, 8000);
-    };
-    voiceRecognition.onresult = function (event) {
-      var transcript = event.results[0][0].transcript;
-      voiceGotResult = true;
-      if (voiceStopTimer) { clearTimeout(voiceStopTimer); voiceStopTimer = null; }
-      el('question').value = transcript;
-      el('voiceStatus').textContent = '已识别：“' + transcript + '”，正在提交问题。';
-      el('ask').click();
-      stopVoice();
-    };
-    voiceRecognition.onerror = function (event) {
-      if (event.error === 'aborted') return;
-      var messages = {
-        'not-allowed': '麦克风权限被拒绝，请在浏览器网站设置中允许麦克风。',
-        'no-speech': '没有识别到语音，已停止。',
-        'audio-capture': '未找到可用麦克风，请检查系统输入设备。',
-        'network': '浏览器语音识别服务连接失败，请改用文字提问。'
-      };
-      el('voiceStatus').textContent = messages[event.error] || ('语音输入失败：' + event.error);
-    };
-    voiceRecognition.onend = function () {
-      var hadResult = voiceGotResult;
-      resetVoiceButton();
-      if (!hadResult && el('voiceStatus').textContent.indexOf('正在聆听') === 0) {
-        el('voiceStatus').textContent = '语音输入已结束。';
-      }
-    };
-    try { voiceRecognition.start(); }
-    catch (error) { resetVoiceButton(); el('voiceStatus').textContent = '无法启动语音输入，请稍后重试。'; }
-  };
-  el('speak').onclick = function () {
-    if (!('speechSynthesis' in window)) { el('voiceStatus').textContent = '当前浏览器不支持朗读。'; return; }
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(new SpeechSynthesisUtterance(latestAnswer || el('answer').textContent));
-  };
   refresh(); refreshCloud();
   window.setInterval(refresh, 2000);
   window.setInterval(refreshCloud, 5000);
@@ -1660,8 +1549,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .forecast-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
     .forecast-dot.soil { background: var(--success); }
     .forecast-svg { display: block; width: 100%; height: auto; min-height: 190px; overflow: visible; }
-    .edge-trend-panel { margin-top: 16px; }
-    .edge-trend-svg { min-height: 170px; }
     .chart-grid { stroke: rgba(107, 114, 128, .22); stroke-width: 1; stroke-dasharray: 4 5; }
     .chart-axis, .chart-unit, .chart-empty { fill: var(--muted); font-size: 11px; font-family: inherit; }
     .chart-unit { font-size: 10px; font-weight: 650; }
@@ -1825,7 +1712,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card sensor-card sensor-sun"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">☀️</span><div class="label">入射短波（Solar 2）</div></div><div id="solarIncoming" class="value">-- <span class="unit">W/m²</span></div></div>
       <div class="card sensor-card sensor-reflect"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">↗️</span><div class="label">反射短波（Solar 1）</div></div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
-    <section class="card wide mobile-full"><h2>设备状态</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div></section>
+    <section class="card wide mobile-full"><h2>设备状态</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div><div class="label" style="margin-top:14px">ESP32 边缘趋势</div><div id="edgePrediction" class="meta">等待 ESP32 趋势数据...</div></section>
     <section class="card wide">
       <h2>未来 1 小时预测</h2>
       <div id="model" class="model-status">等待数据...</div>
@@ -1841,15 +1728,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         </div>
       </div>
       <div id="forecastSummary" class="forecast-summary" hidden></div>
-    </section>
-    <section class="card wide">
-      <h2>ESP32 未来 30 分钟土壤趋势</h2>
-      <div id="edgePrediction" class="meta">等待 ESP32 趋势数据...</div>
-      <div id="edgeTrendPanel" class="forecast-panel edge-trend-panel" hidden>
-        <div class="forecast-panel-title"><span>土壤湿度趋势</span><span class="forecast-legend"><span class="forecast-dot soil"></span>ESP32 线性趋势估计</span></div>
-        <svg id="edgeTrendChart" class="forecast-svg edge-trend-svg" viewBox="0 0 640 200" role="img" aria-label="ESP32未来30分钟土壤湿度趋势曲线"></svg>
-        <div class="meta">曲线由当前实测值与 30 分钟预测值线性连接，用于展示变化方向，不代表新增的中间模型预测点。</div>
-      </div>
     </section>
     <section class="card wide">
       <h2>云端分析决策</h2>
@@ -1917,7 +1795,6 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         <div id="debugValveStatus" class="meta" aria-live="polite"></div>
       </div>
     </section>
-    <section class="card wide"><h2>自然语言问答（可选语音）</h2><div class="row"><input id="question" placeholder="例如：今天需要调整灌溉计划吗？"><button id="ask">提问</button><button id="voice" class="secondary">开始说话</button><button id="speak" class="secondary">朗读回答</button></div><div id="voiceStatus" class="meta"></div><div id="answer" class="muted" style="margin-top:12px;white-space:pre-line"></div></section>
     <section class="card wide tcp-card" aria-labelledby="tcpStreamTitle">
       <div class="tcp-heading">
         <div>
