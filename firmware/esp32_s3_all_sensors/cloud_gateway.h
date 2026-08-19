@@ -101,6 +101,11 @@ public:
   bool pollResult(CloudGatewayResult &result);
   bool busy() const;
   bool hasResult() const;
+  // Runtime state is deliberately limited to non-secret booleans for
+  // telemetry/UI feedback. The API key is never returned or logged.
+  bool initialized() const;
+  bool enabled() const;
+  bool apiKeyConfigured() const;
   void cancelPending();
 
 private:
@@ -119,6 +124,7 @@ private:
   void resetResult(CloudGatewayResult &result) const;
 
   bool _initialized;
+  bool _enabled;
   bool _requestPending;
   bool _resultReady;
   CloudGatewayRequestType _pendingType;

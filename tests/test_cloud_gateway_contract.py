@@ -138,7 +138,7 @@ def test_device_cloud_context_keeps_original_decision_context_shape_and_separate
         encoding="utf-8"
     )
     builder = sketch[sketch.index("static void deviceBuildCloudContext(String &context)"):
-                     sketch.index("static void deviceSubmitCloud")]
+                     sketch.index("static bool deviceSubmitCloud")]
     for key in ('"current"', '"trends"', '"windows"', '"last1Hour"',
                 '"last24Hours"', '"last7Days"', '"forecast"', '"actuator"',
                 '"constraints"', '"edgeRisk"', '"farmProfile"', '"weather"'):

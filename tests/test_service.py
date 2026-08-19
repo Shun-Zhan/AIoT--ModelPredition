@@ -135,8 +135,32 @@ def test_device_analysis_hides_cached_result_until_matching_llm_result(tmp_path,
     assert status["decision"]["requestId"] != "old-result"
 
     app_js = client.get("/v1/dashboard/app.js").text
-    assert "> 120000" in app_js
+    assert "> 150000" in app_js
     assert "45 秒内没有收到" not in app_js
+
+
+def test_device_cloud_status_uses_telemetry_runtime_not_previous_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
+    )
+    live = payload()
+    live["receivedAt"] = datetime.now(timezone.utc).isoformat()
+    live["cloudRuntime"] = {
+        "initialized": True,
+        "enabled": True,
+        "apiKeyConfigured": True,
+        "requestPending": True,
+    }
+    client = TestClient(create_app(settings))
+
+    assert client.post("/v1/telemetry/live", json=live).status_code == 200
+    status = client.get("/v1/cloud/status").json()
+
+    assert status["enabled"] is True
+    assert status["configured"] is True
+    assert status["cloudRuntime"]["requestPending"] is True
+    assert status["latestCall"] is None
 
 
 def test_device_confirmation_ack_is_reflected_in_decision_state(tmp_path, monkeypatch):

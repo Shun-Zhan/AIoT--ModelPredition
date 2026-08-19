@@ -96,6 +96,7 @@ static esp_err_t collectHttpResponse(esp_http_client_event_t *event);
 
 CloudGateway::CloudGateway(uint32_t timeoutMs)
     : _initialized(false),
+      _enabled(false),
       _requestPending(false),
       _resultReady(false),
       _pendingType(CLOUD_GATEWAY_ANALYSIS),
@@ -126,6 +127,7 @@ bool CloudGateway::loadStoredConfig() {
   }
 
   _apiKey = preferences.getString(CLOUD_GATEWAY_API_KEY_KEY, "");
+  _enabled = preferences.getBool(CLOUD_GATEWAY_ENABLED_KEY, false);
   _model = preferences.getString(CLOUD_GATEWAY_MODEL_KEY,
                                  CLOUD_GATEWAY_DEFAULT_MODEL);
   _farmProfileJson = preferences.getString(CLOUD_GATEWAY_FARM_PROFILE_KEY,
@@ -182,6 +184,7 @@ bool CloudGateway::savePortalConfig(const CloudGatewayPortalConfig &config,
   }
   _model = config.model;
   _farmProfileJson = config.farmProfileJson;
+  _enabled = config.enabled;
   if (clearApiKey) {
     _apiKey = "";
   } else if (apiKey != nullptr && apiKey[0] != '\0') {
@@ -225,6 +228,18 @@ bool CloudGateway::clearApiKey() {
     _apiKey = "";
   }
   return removed;
+}
+
+bool CloudGateway::initialized() const {
+  return _initialized;
+}
+
+bool CloudGateway::enabled() const {
+  return _initialized && _enabled && !_apiKey.isEmpty() && !_model.isEmpty();
+}
+
+bool CloudGateway::apiKeyConfigured() const {
+  return !_apiKey.isEmpty();
 }
 
 bool CloudGateway::submit(const CloudGatewayRequest &request) {
@@ -289,13 +304,7 @@ bool CloudGateway::runWorkerOnce() {
 }
 
 bool CloudGateway::executeRequest(CloudGatewayResult &result) {
-  Preferences preferences;
-  bool enabled = false;
-  if (preferences.begin(CLOUD_GATEWAY_PREFERENCES_NAMESPACE, true)) {
-    enabled = preferences.getBool(CLOUD_GATEWAY_ENABLED_KEY, false);
-    preferences.end();
-  }
-  if (!enabled || _apiKey.isEmpty() || _model.isEmpty()) {
+  if (!enabled()) {
     makeOfflineResult(result, CLOUD_GATEWAY_DISABLED,
                       "cloud gateway disabled or not configured");
     return false;

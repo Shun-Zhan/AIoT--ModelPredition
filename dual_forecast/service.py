@@ -23,6 +23,9 @@ from .storage import Store
 
 AUTO_ANALYSIS_INTERVAL_SECONDS = 60
 LIVE_TELEMETRY_MAX_AGE_SECONDS = 10 * 60
+# The ESP32 HTTPS client times out at 120 seconds. Keep the UI/backend timeout
+# slightly longer so the device can publish the final offline/error result.
+DEVICE_CLOUD_RESULT_GRACE_SECONDS = 150
 
 
 def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> dict:
@@ -49,6 +52,12 @@ def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> di
             "humidityPercent": snapshot.air.humidityPercent,
         },
         "airPressureHpa": snapshot.airPressureHpa,
+        "performance": (
+            snapshot.performance.model_dump() if snapshot.performance is not None else None
+        ),
+        "cloudRuntime": (
+            snapshot.cloudRuntime.model_dump() if snapshot.cloudRuntime is not None else None
+        ),
         "soilOk": snapshot.soilOk,
         "soil": {
             "temperatureC": snapshot.soil.temperatureC,
@@ -234,7 +243,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             queued_at = datetime.fromisoformat(analyze["queuedAt"].replace("Z", "+00:00"))
             result_missing = latest is None or latest.get("requestId") != analyze["requestId"]
             request_age = (datetime.now(timezone.utc) - queued_at).total_seconds()
-            if result_missing and request_age <= 120:
+            if result_missing and request_age <= DEVICE_CLOUD_RESULT_GRACE_SECONDS:
                 pending = {
                     "schemaVersion": "2.0", "status": "pending",
                     "requestId": analyze["requestId"], "action": None,
@@ -248,7 +257,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                     "schemaVersion": "2.0", "status": "gateway_error",
                     "requestId": analyze["requestId"], "action": None,
                     "proposedAction": None, "finalAction": "NO_OP",
-                    "reason": "本次请求在 2 分钟内没有收到 LLM 结果，请检查 ESP32 网络后重试。",
+                    "reason": "本次请求在 150 秒内没有收到 LLM 结果，请检查 ESP32 网络后重试。",
                     "safetyReasons": ["cloud analysis timed out"],
                 }
                 return timeout, timeout
@@ -565,6 +574,25 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   function streamValue(label, value, unit) {
     return label + '=' + (has(value) ? value : '--') + (unit || '');
   }
+  function formatBytes(value) {
+    if (!has(value) || !isFinite(Number(value))) return '--';
+    var bytes = Number(value);
+    if (bytes < 1024) return Math.round(bytes) + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  }
+  function renderPerformance(performance) {
+    var p = performance || {};
+    el('deviceChipTemp').textContent = number(p.chipTemperatureC, 1) + ' °C';
+    el('deviceHeap').textContent = formatBytes(p.heapFreeBytes) + ' / ' + formatBytes(p.heapSizeBytes);
+    el('deviceHeapUsed').textContent = number(p.heapUsedPercent, 1) + '%';
+    el('deviceHeapMin').textContent = formatBytes(p.heapMinFreeBytes);
+    el('deviceCpu').textContent = has(p.cpuFreqMHz) ? p.cpuFreqMHz + ' MHz' : '--';
+    el('deviceFlash').textContent = formatBytes(p.sketchSizeBytes) + ' / ' + formatBytes(p.flashSizeBytes);
+    el('deviceWifi').textContent = p.wifiConnected === true
+      ? number(p.wifiRssiDbm, 0) + ' dBm · ' + (p.wifiIp || '--')
+      : (p.wifiConnected === false ? '未连接' : '--');
+  }
   function renderTcpStream(snapshot) {
     if (!snapshot) {
       el('tcpStatus').textContent = '等待数据';
@@ -648,6 +676,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       lastSnapshotAt = new Date(s.receivedAt);
       renderFreshness();
       renderTcpStream(s);
+      renderPerformance(s.performance);
       var air = s.air || {}, soil = s.soil || {};
       var allSensorNames = [
         '空气温湿度传感器', '大气压力传感器', '风速传感器',
@@ -1033,6 +1062,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     var technical = [];
     if (has(decision.confidence)) technical.push('置信度：' + Math.round(Number(decision.confidence) * 100) + '%');
     if (decision.reasonCode) technical.push('原因代码：' + decision.reasonCode);
+    if (decision.error) technical.push('设备错误：' + decision.error);
     if (decision.durationSeconds) technical.push('建议时长：' + decision.durationSeconds + ' 秒');
     if (decision.requestId) technical.push('请求 ID：' + decision.requestId);
     if (decision.evaluatedAt) technical.push('分析时间：' + formatDecisionTime(decision.evaluatedAt));
@@ -1046,6 +1076,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   function refreshCloud() {
     request('GET', '/v1/cloud/status', null, function (data) {
       var decision = data.decision, actuator = data.actuator || {}, cloud = data.latestCall || data.cloud || null;
+      var deviceRequestPending = !!(data.cloudRuntime && data.cloudRuntime.requestPending);
+      var analysisPending = !!pendingCloudRequestId || deviceRequestPending || (cloud && cloud.status === 'pending');
       if (pendingCloudRequestId && cloud && cloud.requestId === pendingCloudRequestId && cloud.status !== 'pending') {
         var analysisSucceeded = cloudAnalysisSucceeded(cloud.status);
         var completedStatus = analysisSucceeded ? 'success' : 'error';
@@ -1057,7 +1089,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         pendingCloudRequestId = '';
         pendingCloudStartedAt = 0;
         finishAnalyze(completedStatus, completedText);
-      } else if (pendingCloudRequestId && pendingCloudStartedAt && (Date.now() - pendingCloudStartedAt) > 120000) {
+      } else if (pendingCloudRequestId && pendingCloudStartedAt && (Date.now() - pendingCloudStartedAt) > 150000) {
         pendingCloudRequestId = '';
         pendingCloudStartedAt = 0;
         finishAnalyze('error', '等待 ESP32 云端回执超时；请查看设备网络和串口/TCP 接收器日志。');
@@ -1083,7 +1115,13 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             + (data.lastAutomaticAnalysisAt ? '　·　上次：' + formatDecisionTime(data.lastAutomaticAnalysisAt) : ''))
           : '等待云端分析功能启用。')
         : '自动分析与自动执行当前未启用。';
-      setStatusBadge('cloudConnectionBadge', data.enabled ? '云端：已连接' : '云端：未启用', data.enabled ? 'ok' : 'bad');
+      var cloudBadgeText = analysisPending
+        ? '云端：分析中'
+        : (data.enabled === true
+          ? '云端：已启用'
+          : (data.enabled === false ? '云端：未启用' : '云端：等待 ESP32 状态'));
+      var cloudBadgeTone = analysisPending ? 'warn' : (data.enabled === true ? 'ok' : (data.enabled === false ? 'bad' : ''));
+      setStatusBadge('cloudConnectionBadge', cloudBadgeText, cloudBadgeTone);
       setStatusBadge('cloudValveBadge', actuator.state === 'OPEN' ? '水阀：已开启' : '水阀：已关闭', actuator.state === 'OPEN' ? 'warn' : 'ok');
       setStatusBadge(
         'cloudAutoBadge',
@@ -1092,10 +1130,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
           : '自动灌溉：需人工确认',
         automatic.enabled ? 'warn' : ''
       );
-      el('cloudAvailability').hidden = !!data.enabled;
-      el('cloudAvailability').textContent = data.enabled
-        ? ''
-        : '云端分析当前未启用；本地传感器监测、预测和水阀安全保护仍正常运行。';
+      el('cloudAvailability').hidden = analysisPending || data.enabled !== false;
+      el('cloudAvailability').textContent = data.enabled === false
+        ? '云端分析当前未启用；本地传感器监测、预测和水阀安全保护仍正常运行。'
+        : '';
       renderCloudResult(cloud);
       renderDecision(decision);
 
@@ -1614,6 +1652,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .row button { margin-right: 0; }
     .tcp-card { overflow: hidden; }
+    .performance-card { margin-top: 20px; }
+    .performance-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .performance-metric { min-width: 0; padding: 12px 13px; border-radius: 16px; box-shadow: var(--shadow-inset); }
+    .performance-label { color: var(--muted); font-size: 11px; font-weight: 650; }
+    .performance-value { margin-top: 5px; color: var(--text); font-size: 16px; font-weight: 780; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .tcp-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 16px; }
     .tcp-heading h2 { margin-bottom: 3px; }
     .tcp-status { position: relative; flex: 0 0 auto; padding: 7px 12px 7px 27px; border-radius: 999px; box-shadow: var(--shadow-inset); font-size: 12px; font-weight: 750; }
@@ -1679,6 +1722,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       .tcp-heading { align-items: flex-start; }
       .tcp-route { flex-wrap: wrap; }
       .tcp-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .performance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .tcp-feed { height: 248px; }
       .tcp-packet { grid-template-columns: 1fr; gap: 2px; }
       .tcp-packet-payload { padding-left: 10px; }
@@ -1713,6 +1757,19 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card sensor-card sensor-reflect"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">↗️</span><div class="label">反射短波（Solar 1）</div></div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
     </section>
     <section class="card wide mobile-full"><h2>设备状态</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div><div class="label" style="margin-top:14px">ESP32 边缘趋势</div><div id="edgePrediction" class="meta">等待 ESP32 趋势数据...</div></section>
+    <section class="card wide performance-card" aria-labelledby="performanceTitle">
+      <h2 id="performanceTitle">ESP32 设备性能</h2>
+      <div class="meta">来自最新遥测包；仅用于运行状态监控，不参与预测和灌溉决策。</div>
+      <div class="performance-grid">
+        <div class="performance-metric"><div class="performance-label">芯片温度</div><div id="deviceChipTemp" class="performance-value">--</div></div>
+        <div class="performance-metric"><div class="performance-label">堆内存 空闲 / 总量</div><div id="deviceHeap" class="performance-value">--</div></div>
+        <div class="performance-metric"><div class="performance-label">堆内存占用</div><div id="deviceHeapUsed" class="performance-value">--</div></div>
+        <div class="performance-metric"><div class="performance-label">启动以来最低空闲堆</div><div id="deviceHeapMin" class="performance-value">--</div></div>
+        <div class="performance-metric"><div class="performance-label">CPU 频率</div><div id="deviceCpu" class="performance-value">--</div></div>
+        <div class="performance-metric"><div class="performance-label">固件大小 / Flash</div><div id="deviceFlash" class="performance-value">--</div></div>
+        <div class="performance-metric"><div class="performance-label">Wi-Fi 信号 / IP</div><div id="deviceWifi" class="performance-value">--</div></div>
+      </div>
+    </section>
     <section class="card wide">
       <h2>未来 1 小时预测</h2>
       <div id="model" class="model-status">等待数据...</div>
@@ -1968,9 +2025,24 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     def cloud_status():
         if device_authoritative:
             latest, decision = device_cloud_display_state()
+            live = current_live_snapshot()
+            cloud_runtime = live.get("cloudRuntime") if live else None
+            runtime_enabled = (
+                cloud_runtime.get("enabled")
+                if isinstance(cloud_runtime, dict)
+                else None
+            )
             return {
-                "enabled": latest is not None,
-                "configured": None,
+                # A result is an event, not a configuration flag. The ESP32
+                # exposes its non-secret gateway state in telemetry so a
+                # pending request cannot make the UI briefly claim disabled.
+                "enabled": runtime_enabled,
+                "configured": (
+                    cloud_runtime.get("apiKeyConfigured")
+                    if isinstance(cloud_runtime, dict)
+                    else None
+                ),
+                "cloudRuntime": cloud_runtime,
                 "provider": "esp32-volcengine-gateway",
                 "operationMode": "device_authoritative",
                 "automaticIntervalSeconds": None,

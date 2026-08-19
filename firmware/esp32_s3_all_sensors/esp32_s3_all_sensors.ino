@@ -1268,7 +1268,9 @@ static bool deviceRunModelInference(edge_model::ModelOutput &result) {
 static void deviceCloudWorkerTask(void *) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    CloudGatewayInstance.runWorkerOnce();
+    Serial.println("[CLOUD] worker started.");
+    const bool ran = CloudGatewayInstance.runWorkerOnce();
+    Serial.printf("[CLOUD] worker finished ran=%s.\n", ran ? "true" : "false");
   }
 }
 
@@ -1639,8 +1641,38 @@ static String deviceIsoUtc(uint32_t epochUtc) {
   return String(text);
 }
 
-static void deviceSubmitCloud(CloudGatewayRequestType type, const char *requestId,
+static bool deviceSubmitCloud(CloudGatewayRequestType type, const char *requestId,
+                              const char *question);
+
+static void emitDeviceCloudSubmissionFailure(CloudGatewayRequestType type,
+                                              const char *requestId,
+                                              const char *message) {
+  CloudGatewayResult result = {};
+  result.status = CLOUD_GATEWAY_OFFLINE;
+  result.type = type;
+  strlcpy(result.requestId, requestId == nullptr ? "" : requestId,
+          sizeof(result.requestId));
+  strlcpy(result.action, "NO_OP", sizeof(result.action));
+  strlcpy(result.reasonCode, "GATEWAY_ERROR", sizeof(result.reasonCode));
+  strlcpy(result.reason, "ESP32 云端任务未能启动，继续使用本地离线主干",
+          sizeof(result.reason));
+  strlcpy(result.error, message == nullptr ? "cloud submit failed" : message,
+          sizeof(result.error));
+  strlcpy(result.answer, "云端任务未能启动，请检查 ESP32 云端任务和网络状态。",
+          sizeof(result.answer));
+  strlcpy(result.evidence, "设备未成功进入 HTTPS 请求阶段。",
+          sizeof(result.evidence));
+  strlcpy(result.limitations, "本地离线主干仍有效，结果不控制 GPIO。",
+          sizeof(result.limitations));
+  emitDeviceCloudResult(result);
+}
+
+static bool deviceSubmitCloud(CloudGatewayRequestType type, const char *requestId,
                               const char *question) {
+  if (cloudWorkerTaskHandle == nullptr) {
+    emitDeviceCloudSubmissionFailure(type, requestId, "cloud worker task unavailable");
+    return false;
+  }
   String context;
   deviceBuildCloudContext(context);
   CloudGatewayRequest request = {};
@@ -1648,8 +1680,18 @@ static void deviceSubmitCloud(CloudGatewayRequestType type, const char *requestI
   request.requestId = requestId;
   request.sensorContextJson = context.c_str();
   request.question = question;
-  if (!CloudGatewayInstance.submit(request)) return;
-  if (cloudWorkerTaskHandle != nullptr) xTaskNotifyGive(cloudWorkerTaskHandle);
+  if (!CloudGatewayInstance.submit(request)) {
+    CloudGatewayResult result = {};
+    if (CloudGatewayInstance.pollResult(result)) {
+      emitDeviceCloudResult(result);
+    } else {
+      emitDeviceCloudSubmissionFailure(type, requestId,
+                                       "cloud request is busy or has an unread result");
+    }
+    return false;
+  }
+  xTaskNotifyGive(cloudWorkerTaskHandle);
+  return true;
 }
 
 static void deviceSubmitPendingCloudWhenReady() {
@@ -1863,8 +1905,11 @@ void handleDeviceUiCommand(const char *json) {
       emitDeviceUiAck(requestId, true, action, "queued_waiting_for_sensors");
       return;
     }
-    deviceSubmitCloud(type, requestId, question);
-    emitDeviceUiAck(requestId, true, action, "queued");
+    if (deviceSubmitCloud(type, requestId, question)) {
+      emitDeviceUiAck(requestId, true, action, "queued");
+    } else {
+      emitDeviceUiAck(requestId, false, action, "cloud_submit_failed");
+    }
     return;
   }
   if (strcmp(action, "REQUEST_STATE") == 0) {
@@ -2103,7 +2148,14 @@ void serviceDeviceRuntime() {
   deviceServiceNtp();
   deviceTryInjectSyntheticHistory();
   CloudGatewayResult cloudResult = {};
-  if (CloudGatewayInstance.pollResult(cloudResult)) emitDeviceCloudResult(cloudResult);
+  if (CloudGatewayInstance.pollResult(cloudResult)) {
+    Serial.printf("[CLOUD] result request=%s status=%u http=%u error=%s\n",
+                  cloudResult.requestId,
+                  static_cast<unsigned>(cloudResult.status),
+                  static_cast<unsigned>(cloudResult.httpStatus),
+                  cloudResult.error[0] == '\0' ? "none" : cloudResult.error);
+    emitDeviceCloudResult(cloudResult);
+  }
   if (deviceForecastPendingEmit) {
     deviceForecastPendingEmit = false;
     emitDeviceForecast();
@@ -3523,7 +3575,28 @@ void sendTelemetry(const SensorSnapshot &snapshot,
     averageWindSpeedMs /= validWindCount;
   }
 
-  char packet[1280];
+  const uint32_t heapSizeBytes = ESP.getHeapSize();
+  const uint32_t heapFreeBytes = ESP.getFreeHeap();
+  const float heapUsedPercent = heapSizeBytes > 0
+                                    ? 100.0f * static_cast<float>(heapSizeBytes - heapFreeBytes) /
+                                          static_cast<float>(heapSizeBytes)
+                                    : 0.0f;
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  const int wifiRssiDbm = wifiConnected ? WiFi.RSSI() : 0;
+  const String wifiIp = wifiConnected ? WiFi.localIP().toString() : String("");
+  const bool cloudInitialized = CloudGatewayInstance.initialized();
+  const bool cloudEnabled = CloudGatewayInstance.enabled();
+  const bool cloudKeyConfigured = CloudGatewayInstance.apiKeyConfigured();
+  const bool cloudRequestPending = CloudGatewayInstance.busy();
+  const float chipTemperatureC = temperatureRead();
+  char chipTemperatureJson[16];
+  if (isfinite(chipTemperatureC)) {
+    snprintf(chipTemperatureJson, sizeof(chipTemperatureJson), "%.1f", chipTemperatureC);
+  } else {
+    strlcpy(chipTemperatureJson, "null", sizeof(chipTemperatureJson));
+  }
+
+  char packet[1800];
   const int written = snprintf(
       packet,
       sizeof(packet),
@@ -3534,6 +3607,8 @@ void sendTelemetry(const SensorSnapshot &snapshot,
       "\"air\":{\"ok\":%s,\"temperature_c\":%.2f,\"humidity_pct\":%.2f},"
       "\"soil\":{\"ok\":%s,\"temperature_c\":%.1f,\"moisture_pct\":%.1f},"
       "\"solar\":{\"sensor_1_role\":\"reflected_shortwave\",\"sensor_1\":{\"ok\":%s,\"radiation_w_m2\":%u},\"sensor_2_role\":\"incoming_shortwave\",\"sensor_2\":{\"ok\":%s,\"radiation_w_m2\":%u}},"
+      "\"performance\":{\"chip_temperature_c\":%s,\"heap_free_bytes\":%lu,\"heap_min_free_bytes\":%lu,\"heap_size_bytes\":%lu,\"heap_used_percent\":%.1f,\"cpu_freq_mhz\":%lu,\"flash_size_bytes\":%lu,\"sketch_size_bytes\":%lu,\"free_sketch_bytes\":%lu,\"wifi\":{\"connected\":%s,\"rssi_dbm\":%d,\"ip\":\"%s\"}},"
+      "\"cloud\":{\"initialized\":%s,\"enabled\":%s,\"api_key_configured\":%s,\"request_pending\":%s},"
       "\"edge_prediction\":{\"valid\":%s,\"mode\":\"edge_fallback\",\"predicted_soil_moisture_30m_pct\":%.1f,"
       "\"drying_rate_pct_per_h\":%.3f,\"risk_level\":\"%s\",\"reason\":\"%s\",\"updated_uptime_ms\":%lu},"
       "\"display\":{\"enabled\":%s,\"rx_bytes\":%lu,\"handshake_ok\":%s}}\n",
@@ -3558,6 +3633,22 @@ void sendTelemetry(const SensorSnapshot &snapshot,
       snapshot.solarRadiation1Wm2,
       snapshot.solar2Ok ? "true" : "false",
       snapshot.solarRadiation2Wm2,
+      chipTemperatureJson,
+      static_cast<unsigned long>(heapFreeBytes),
+      static_cast<unsigned long>(ESP.getMinFreeHeap()),
+      static_cast<unsigned long>(heapSizeBytes),
+      heapUsedPercent,
+      static_cast<unsigned long>(ESP.getCpuFreqMHz()),
+      static_cast<unsigned long>(ESP.getFlashChipSize()),
+      static_cast<unsigned long>(ESP.getSketchSize()),
+      static_cast<unsigned long>(ESP.getFreeSketchSpace()),
+      wifiConnected ? "true" : "false",
+      wifiRssiDbm,
+      wifiIp.c_str(),
+      cloudInitialized ? "true" : "false",
+      cloudEnabled ? "true" : "false",
+      cloudKeyConfigured ? "true" : "false",
+      cloudRequestPending ? "true" : "false",
       edgePrediction.valid ? "true" : "false",
       edgePrediction.predictedSoilMoisture30mPercent,
       edgePrediction.dryingRatePercentPerHour,

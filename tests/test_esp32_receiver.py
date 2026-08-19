@@ -127,6 +127,68 @@ def test_esp32_edge_prediction_is_forwarded_to_live_dashboard():
     }
 
 
+def test_esp32_cloud_runtime_state_is_forwarded_without_credentials():
+    message = {
+        "uptime_ms": 300000,
+        "wind": {"ok": True, "voltage_v": 1.2, "speed_m_s": 2.3},
+        "air_pressure_hpa": 1013,
+        "air": {"ok": True, "temperature_c": 25.1, "humidity_pct": 63.2},
+        "soil": {"ok": True, "temperature_c": 22.4, "moisture_pct": 36.7},
+        "solar": {
+            "sensor_1": {"ok": True, "radiation_w_m2": 410},
+            "sensor_2": {"ok": True, "radiation_w_m2": 430},
+        },
+        "cloud": {
+            "initialized": True,
+            "enabled": True,
+            "api_key_configured": True,
+            "request_pending": True,
+        },
+    }
+
+    snapshot = esp32_message_to_snapshot(message)
+
+    assert snapshot["cloudRuntime"] == {
+        "initialized": True,
+        "enabled": True,
+        "apiKeyConfigured": True,
+        "requestPending": True,
+    }
+    assert "apiKey" not in snapshot["cloudRuntime"]
+
+
+def test_esp32_performance_diagnostics_are_forwarded():
+    message = {
+        "uptime_ms": 300000,
+        "wind": {"ok": True, "voltage_v": 0.0, "speed_m_s": 0.0},
+        "air_pressure_hpa": 1013,
+        "air": {"ok": True, "temperature_c": 20.0, "humidity_pct": 50.0},
+        "soil": {"ok": True, "temperature_c": 20.0, "moisture_pct": 50.0},
+        "solar": {
+            "sensor_1": {"ok": True, "radiation_w_m2": 0},
+            "sensor_2": {"ok": True, "radiation_w_m2": 0},
+        },
+        "performance": {
+            "chip_temperature_c": 48.5,
+            "heap_free_bytes": 220000,
+            "heap_min_free_bytes": 180000,
+            "heap_size_bytes": 320000,
+            "heap_used_percent": 31.25,
+            "cpu_freq_mhz": 240,
+            "flash_size_bytes": 8388608,
+            "sketch_size_bytes": 1000000,
+            "free_sketch_bytes": 2000000,
+            "wifi": {"connected": True, "rssi_dbm": -55, "ip": "192.168.1.20"},
+        },
+    }
+
+    snapshot = esp32_message_to_snapshot(message)
+
+    assert snapshot["performance"]["chipTemperatureC"] == 48.5
+    assert snapshot["performance"]["heapUsedPercent"] == 31.25
+    assert snapshot["performance"]["wifiIp"] == "192.168.1.20"
+
+
 def test_incomplete_packet_is_not_used_for_prediction():
     snapshot = {
         "windOk": True,

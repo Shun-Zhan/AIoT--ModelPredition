@@ -215,6 +215,10 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "<h2>设备状态</h2>" in html
     assert "Wi-Fi TCP 实时数据流" in html
     assert "Wi-Fi · TCP 3333" in html
+    assert "ESP32 设备性能" in html
+    assert "deviceChipTemp" in app_js.text
+    assert "deviceHeapUsed" in app_js.text
+    assert "renderPerformance" in app_js.text
     assert 'id="tcpFeed"' in html
     assert "<h2>手机入口</h2>" not in html
     assert "<h2>节水与运行报告</h2>" not in html

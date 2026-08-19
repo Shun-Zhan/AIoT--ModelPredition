@@ -77,6 +77,33 @@ def esp32_message_to_snapshot(
         "solarRadiation2Wm2": int(solar_2["radiation_w_m2"]),
         "AirPressure": air_pressure_hpa,
     }
+    raw_performance = message.get("performance")
+    if isinstance(raw_performance, dict):
+        raw_wifi = raw_performance.get("wifi")
+        if not isinstance(raw_wifi, dict):
+            raw_wifi = {}
+        snapshot["performance"] = {
+            "chipTemperatureC": raw_performance.get("chip_temperature_c"),
+            "heapFreeBytes": raw_performance.get("heap_free_bytes"),
+            "heapMinFreeBytes": raw_performance.get("heap_min_free_bytes"),
+            "heapSizeBytes": raw_performance.get("heap_size_bytes"),
+            "heapUsedPercent": raw_performance.get("heap_used_percent"),
+            "cpuFreqMHz": raw_performance.get("cpu_freq_mhz"),
+            "flashSizeBytes": raw_performance.get("flash_size_bytes"),
+            "sketchSizeBytes": raw_performance.get("sketch_size_bytes"),
+            "freeSketchBytes": raw_performance.get("free_sketch_bytes"),
+            "wifiConnected": raw_wifi.get("connected"),
+            "wifiRssiDbm": raw_wifi.get("rssi_dbm"),
+            "wifiIp": raw_wifi.get("ip"),
+        }
+    raw_cloud = message.get("cloud")
+    if isinstance(raw_cloud, dict):
+        snapshot["cloudRuntime"] = {
+            "initialized": raw_cloud.get("initialized"),
+            "enabled": raw_cloud.get("enabled"),
+            "apiKeyConfigured": raw_cloud.get("api_key_configured"),
+            "requestPending": raw_cloud.get("request_pending"),
+        }
     raw_edge = message.get("edge_prediction")
     if isinstance(raw_edge, dict):
         valid = bool(raw_edge.get("valid", False))

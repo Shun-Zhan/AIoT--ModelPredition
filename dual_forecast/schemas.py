@@ -32,6 +32,34 @@ class EdgePrediction(BaseModel):
     updatedUptimeMs: int = Field(ge=0, le=0xFFFFFFFF)
 
 
+class DevicePerformance(BaseModel):
+    """Optional runtime diagnostics emitted by the ESP32 telemetry packet."""
+
+    model_config = ConfigDict(extra="forbid")
+    chipTemperatureC: float | None = None
+    heapFreeBytes: int | None = Field(default=None, ge=0)
+    heapMinFreeBytes: int | None = Field(default=None, ge=0)
+    heapSizeBytes: int | None = Field(default=None, ge=0)
+    heapUsedPercent: float | None = Field(default=None, ge=0, le=100)
+    cpuFreqMHz: int | None = Field(default=None, ge=0)
+    flashSizeBytes: int | None = Field(default=None, ge=0)
+    sketchSizeBytes: int | None = Field(default=None, ge=0)
+    freeSketchBytes: int | None = Field(default=None, ge=0)
+    wifiConnected: bool | None = None
+    wifiRssiDbm: int | None = None
+    wifiIp: str | None = None
+
+
+class DeviceCloudRuntime(BaseModel):
+    """Non-secret cloud gateway state emitted with ESP32 telemetry."""
+
+    model_config = ConfigDict(extra="forbid")
+    initialized: bool | None = None
+    enabled: bool | None = None
+    apiKeyConfigured: bool | None = None
+    requestPending: bool | None = None
+
+
 class SensorSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     uptimeMs: int = Field(ge=0, le=0xFFFFFFFF)
@@ -47,6 +75,8 @@ class SensorSnapshot(BaseModel):
     solar2Ok: bool
     solarRadiation2Wm2: int = Field(ge=0, le=65535)
     airPressureHpa: int = Field(ge=0, le=65535)
+    performance: DevicePerformance | None = None
+    cloudRuntime: DeviceCloudRuntime | None = None
     edgePrediction: EdgePrediction | None = None
     receivedAt: datetime | None = None
 
@@ -194,6 +224,7 @@ class DeviceCloudResult(_DeviceProtocolModel):
     provider: str | None = None
     modelVersion: str | None = None
     expiresAt: datetime | None = None
+    error: str | None = None
     safetyReasons: list[str] = Field(default_factory=list)
 
 
