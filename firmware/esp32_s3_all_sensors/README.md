@@ -6,7 +6,7 @@
 
 使用 Arduino IDE 打开 `esp32_s3_all_sensors.ino`。板型选择 **Adafruit Feather ESP32-S3 No PSRAM**，Tools → Partition Scheme 选择 **Default (3MB APP/1.5MB SPIFFS)**。不要选 TinyUF2 FATFS 分区，否则 LittleFS 无法挂载。
 
-通过 CH340 `/dev/cu.wchusbserial*` 或 Windows `COM*` 烧录时，设置 USB CDC On Boot → Disabled、Upload Mode → UART0 / Hardware CDC。
+语音模块占用 UART0 的 GPIO13/14，因此必须设置 USB CDC On Boot → Enabled；这样 `Serial` 日志和遥测走原生 USB CDC，UART0 才能专门连接语音模块。Upload Mode 可保持 UART0 / Hardware CDC，或按开发板实际 USB 方式选择。
 
 除 ESP32 Arduino Core 外，还需安装 **ArduinoJson 7.4.2**。模型权重由仓库根目录的 `scripts/export_esp32_models.py` 生成 `generated/model_data.h`，更新模型后必须重新烧录；不要手动修改生成文件。
 
@@ -29,6 +29,7 @@ arduino-cli compile \
 | ZH-SOIL7 土壤 | GPIO18 / GPIO17 | TX / RX | TTL UART，4800 8N1，Modbus-RTU 地址 0x03 |
 | SN-300AL 太阳辐射 | GPIO16 / GPIO15 | RS485 转换器 RO / DI | 4800 8N1，地址 0x01/0x02 |
 | 水阀继电器 | GPIO11 | IN | 3.3 V、高电平有效；上电先置 LOW |
+| 语音模块 UART | GPIO13 / GPIO14 | ESP32 RX / TX | 115200 8N1；GPIO14→模块 RX，GPIO13←模块 TX；信号必须为 ESP32 安全的 3.3 V 电平 |
 | Feather I²C 电源控制 | GPIO7 | 不外接 | 固件自动拉高，禁止复用 |
 
 所有模块必须共地。本方案没有硬件 RTC：设备每次启动后先连接有互联网的 Wi-Fi，通过 NTP 校准 ESP32 系统时钟；Wi-Fi 连通后约 5 秒开始校时重试。校时成功前预测状态为 `clock_unset`，自动灌溉不会开启。校时成功后，在本次运行周期内即使暂时断网，设备仍可继续采集、预测和自动灌溉；断网重启则需再次 NTP 校时。
@@ -38,6 +39,14 @@ arduino-cli compile \
 太阳辐射才需要 RS485 转换器：两个太阳探头 A 对 A、B 对 B 并联在独立太阳总线上，转换器 RO→GPIO16，DI→GPIO15。地址 0x01 是反射短波，0x02 是入射短波；净短波为 `max(入射 - 反射, 0)`。
 
 继电器控制侧：DC+/VCC→模块要求的 3.3 V，DC-/GND→ESP32 GND，IN→GPIO11。24 V 常闭水阀的触点侧：24 V 正极→COM，NO→水阀正极，水阀负极→24 V 负极。24 V 不得接入 GPIO 或 IN；触点额定直流电压/电流应高于水阀负载。
+
+语音模块串口接线：ESP32 GPIO14（TX）→语音模块 RX，ESP32 GPIO13（RX）←语音模块 TX，语音模块 GND→ESP32 GND，语音模块按规格供 5 V。若模块 TX 上拉到 5 V，不能直接接 GPIO13，必须使用 5 V→3.3 V 电平转换或确认模块输出为 3.3 V/开漏并采用 3.3 V 上拉。
+
+语音协议帧为 `AA 55 功能ID 词条ID FB`。当前农业词条使用命令 ID `0x60`～`0x65`：`0x60`“打开水阀”转为网页同款 `DEBUG_VALVE_PULSE`，固定开阀 5 秒，用于继电器/水路调试；`0x62`“开始灌溉”才转为正式 `START_WATERING`，经过时间、传感器、预测、冷却和时长安全审核；其余命令分别对应关阀、停止、自动模式和状态查询。语音调试开阀不依赖电脑心跳，但仍受设备自身最长开阀计时保护。
+
+烧录后打开 USB 串口监视器，波特率选 `115200`。上电应看到 `Voice UART: RX=GPIO13 TX=GPIO14 baud=115200`。说出已配置的唤醒词和命令词后，串口应出现 `[VOICE] command id=0x..`；如果没有这行，先检查模块 TX/RX 是否交叉、GND 是否共地、模块是否真的输出 `115200 8N1`，以及 GPIO13 是否经过 5 V→3.3 V 电平转换。
+
+语音命令只会产生协议请求，水阀动作仍由 ESP32 本地安全层决定。展示模式只播报成功结果：开阀成功为 `AA 55 FF 70 FB`，关闭为 `AA 55 FF 71 FB`，灌溉完成为 `AA 55 FF 72 FB`，自动灌溉开启为 `AA 55 FF 75 FB`。因时钟、传感器、预测、冷却或其他安全门失败时不播报，具体原因仍保留在网页和 USB 串口日志中。上电后自动灌溉仍默认为关闭。
 
 ## 离线记录、预测与安全
 
@@ -73,9 +82,9 @@ arduino-cli compile \
 电脑/网页下行：
 
 ```text
-@UI_COMMAND { "action":"SET_AUTO_MODE" | "CONFIRM_WATERING" | "CANCEL" | "STOP_WATERING" | "CLOUD_ANALYZE" | "CLOUD_CHAT", ... }
+@UI_COMMAND { "action":"DEBUG_VALVE_PULSE" | "SET_AUTO_MODE" | "CONFIRM_WATERING" | "CANCEL" | "STOP_WATERING" | "CLOUD_ANALYZE" | "CLOUD_CHAT", ... }
 ```
 
-设备对所有开阀请求重新执行完整安全审核。Dashboard 的按钮表示“已请求”，不是“已执行”；以 `@UI_ACK` 和 `@IRRIGATION_STATE` 中的设备状态为准。
+正式灌溉开阀请求由设备重新执行完整安全审核；调试开阀固定 5 秒且不参与正式灌溉统计。Dashboard 的按钮表示“已请求”，不是“已执行”；以 `@UI_ACK` 和 `@IRRIGATION_STATE` 中的设备状态为准。
 
 Wi-Fi 模式下设备以 UDP 3334 广播、TCP 3333 提供遥测端点；电脑可自动发现。USB 波特率为 115200，Arduino 串口监视器不能与电脑接收器同时占用该端口。

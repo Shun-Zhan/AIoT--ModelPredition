@@ -260,6 +260,28 @@ def test_v2_device_result_prefixes_are_parsed_and_cached(tmp_path):
     assert cached["uiAck"]["accepted"] is True
 
 
+def test_v2_irrigation_state_replaces_open_with_automatic_closed_state(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+
+    assert _handle_device_result_line(
+        '@IRRIGATION_STATE {"schemaVersion":"2.0","requestId":"voice-1",'
+        '"state":"OPEN","valveState":"OPEN","action":"NO_OP",'
+        '"remainingSeconds":5}',
+        store,
+    )
+    assert _handle_device_result_line(
+        '@IRRIGATION_STATE {"schemaVersion":"2.0","requestId":"voice-1",'
+        '"state":"CLOSED","valveState":"CLOSED","action":"NO_OP",'
+        '"remainingSeconds":0}',
+        store,
+    )
+
+    state = store.latest_device_results()["irrigationState"]
+    assert state["state"] == "CLOSED"
+    assert state["valveState"] == "CLOSED"
+    assert state["remainingSeconds"] == 0
+
+
 def test_v2_ui_ack_updates_the_matching_command_queue(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     store.enqueue_command({

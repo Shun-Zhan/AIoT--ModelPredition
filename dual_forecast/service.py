@@ -1488,7 +1488,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   };
   refresh(); refreshCloud();
   window.setInterval(refresh, 2000);
-  window.setInterval(refreshCloud, 5000);
+  // The cloud card also carries the ESP32-owned valve badge. Keep it aligned
+  // with the main telemetry refresh after a voice or browser command.
+  window.setInterval(refreshCloud, 2000);
   window.setInterval(renderFreshness, 1000);
 }());"""
 
@@ -1844,7 +1846,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div id="confirmStatus" class="meta" aria-live="polite"></div>
       <div class="actuator-debug">
         <div class="decision-section-title">水阀调试（本地安全模式）</div>
-        <div class="meta">调试开阀固定 5 秒，不受正式灌溉的 15 分钟会话冷却限制；仍需通过传感器有效性、预测候选和水阀状态检查。关阀指令可随时下发。</div>
+        <div class="meta">调试开阀固定 5 秒，不参与正式灌溉预测、15 分钟冷却和累计统计；仍保留水阀状态、重复请求和设备测试锁保护。关阀指令可随时下发。</div>
         <div class="decision-actions">
           <button id="debugOpenValve" class="hold debug-hold" type="button">长按 1.5 秒调试开阀 5 秒</button>
           <button id="debugCloseValve" class="secondary" type="button">调试关阀</button>

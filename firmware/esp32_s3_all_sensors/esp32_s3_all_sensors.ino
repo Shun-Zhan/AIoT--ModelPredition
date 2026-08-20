@@ -175,6 +175,38 @@ static const uint8_t DISPLAY_UART_TX_PIN = 13;
 static const uint32_t DISPLAY_BAUD = 19200;
 static const uint32_t DISPLAY_HANDSHAKE_INTERVAL_MS = 3000;
 
+// -------------------- Voice interaction UART --------------------
+
+// GPIO14 is ESP32 TX -> voice module RX and GPIO13 is ESP32 RX <- voice
+// module TX. UART0 is safe here only when USB CDC On Boot is enabled, because
+// Serial then remains on the native USB CDC interface.
+static const bool VOICE_UART_ENABLED = true;
+static const uint8_t VOICE_UART_RX_PIN = 13;
+static const uint8_t VOICE_UART_TX_PIN = 14;
+static const uint32_t VOICE_UART_BAUD = 115200;
+static const uint8_t VOICE_FRAME_HEAD_0 = 0xAA;
+static const uint8_t VOICE_FRAME_HEAD_1 = 0x55;
+static const uint8_t VOICE_FRAME_TAIL = 0xFB;
+static const uint8_t VOICE_FUNCTION_COMMAND = 0x00;
+static const uint8_t VOICE_FUNCTION_SPEECH = 0xFF;
+static const uint8_t VOICE_CMD_OPEN_VALVE = 0x60;
+static const uint8_t VOICE_CMD_CLOSE_VALVE = 0x61;
+static const uint8_t VOICE_CMD_START_IRRIGATION = 0x62;
+static const uint8_t VOICE_CMD_STOP_IRRIGATION = 0x63;
+static const uint8_t VOICE_CMD_ENABLE_AUTO = 0x64;
+static const uint8_t VOICE_CMD_QUERY_STATE = 0x65;
+static const uint8_t VOICE_SPEECH_VALVE_OPEN = 0x70;
+static const uint8_t VOICE_SPEECH_VALVE_CLOSED = 0x71;
+static const uint8_t VOICE_SPEECH_IRRIGATION_DONE = 0x72;
+static const uint8_t VOICE_SPEECH_AUTO_ENABLED = 0x75;
+
+#if VOICE_UART_ENABLED && !ARDUINO_USB_CDC_ON_BOOT
+#error "Voice UART uses UART0 on GPIO13/14; enable USB CDC On Boot for Serial logs."
+#endif
+
+static_assert(!(VOICE_UART_ENABLED && DISPLAY_ENABLED),
+              "Voice UART and the M-series display both use UART0; enable only one.");
+
 // -------------------- Analog wind speed --------------------
 
 // GPIO6 is the only wind sensor enabled in the current hardware build.
@@ -264,9 +296,9 @@ static const uint32_t MODBUS_GAP_MS = 300;
 
 HardwareSerial SoilSerial(1);
 HardwareSerial SolarSerial(2);
+HardwareSerial VoiceSerial(0);
 // UART0 is used for the optional M-series screen. Keep the USB serial monitor
-// on native USB CDC when DISPLAY_ENABLED is true; a USB-to-UART monitor on
-// UART0 will otherwise lose application logs and share bytes with the screen.
+// on native USB CDC because the voice module uses UART0 on GPIO13/14.
 HardwareSerial DisplaySerial(0);
 TwoWire AhtWire(1);
 WiFiServer TcpServer(TCP_PORT);
@@ -497,10 +529,15 @@ static bool deviceConfirmedCloudStartAllowed(uint32_t durationSeconds,
                                              const char *requestId);
 void emitDeviceForecast();
 void emitDeviceIrrigationState(const char *requestId = nullptr);
+static void emitDeviceUiAck(const char *requestId, bool accepted,
+                            const char *action, const char *reason);
 void emitDeviceCloudResult(const CloudGatewayResult &result);
 bool appendDeviceV2Record(const DeviceRuntimeRecordV2 &record);
 void closeValveForSafety(const char *reason);
 void setValveRelay(bool open);
+static void serviceVoiceUart();
+static void voiceSpeak(uint8_t speechId);
+static void handleVoiceCommand(uint8_t commandId);
 static bool deviceReadTrustedEpoch(uint32_t &epochUtc);
 static const char *deviceClockSourceText();
 static void deviceTryInjectSyntheticHistory();
@@ -789,6 +826,118 @@ void setValveRelay(bool open) {
   }
 }
 
+static void voiceSpeak(uint8_t speechId) {
+  if (!VOICE_UART_ENABLED) return;
+  const uint8_t frame[] = {
+      VOICE_FRAME_HEAD_0, VOICE_FRAME_HEAD_1, VOICE_FUNCTION_SPEECH,
+      speechId, VOICE_FRAME_TAIL};
+  VoiceSerial.write(frame, sizeof(frame));
+  VoiceSerial.flush();
+}
+
+static void handleVoiceCommand(uint8_t commandId) {
+  char requestId[48] = {};
+  char commandJson[192] = {};
+  snprintf(requestId, sizeof(requestId), "voice-%lu-%u",
+           static_cast<unsigned long>(millis()), commandId);
+
+  switch (commandId) {
+    case VOICE_CMD_OPEN_VALVE:
+      snprintf(commandJson, sizeof(commandJson),
+               "{\"requestId\":\"%s\",\"action\":\"DEBUG_VALVE_PULSE\","
+               "\"durationSeconds\":5,\"source\":\"voice\"}", requestId);
+      {
+        const bool wasOpen = valveOpen;
+        handleDeviceUiCommand(commandJson);
+        // Voice valve testing shares the dashboard's five-second diagnostic
+        // path and speaks only after the relay actually transitions.
+        if (!wasOpen && valveOpen) voiceSpeak(VOICE_SPEECH_VALVE_OPEN);
+      }
+      return;
+
+    case VOICE_CMD_START_IRRIGATION:
+      snprintf(commandJson, sizeof(commandJson),
+               "{\"requestId\":\"%s\",\"action\":\"START_WATERING\","
+               "\"durationSeconds\":%lu,\"source\":\"voice\"}",
+               requestId,
+               static_cast<unsigned long>(DEVICE_RUNTIME_SINGLE_WATERING_SECONDS));
+      {
+        const bool wasOpen = valveOpen;
+        handleDeviceUiCommand(commandJson);
+        // Safety rejections remain visible in the dashboard/USB logs; the
+        // demo voice channel speaks only after a real valve transition.
+        if (!wasOpen && valveOpen) voiceSpeak(VOICE_SPEECH_VALVE_OPEN);
+      }
+      return;
+
+    case VOICE_CMD_CLOSE_VALVE:
+    case VOICE_CMD_STOP_IRRIGATION:
+      snprintf(commandJson, sizeof(commandJson),
+               "{\"requestId\":\"%s\",\"action\":\"STOP_WATERING\","
+               "\"source\":\"voice\"}", requestId);
+      handleDeviceUiCommand(commandJson);
+      voiceSpeak(VOICE_SPEECH_VALVE_CLOSED);
+      return;
+
+    case VOICE_CMD_ENABLE_AUTO:
+      snprintf(commandJson, sizeof(commandJson),
+               "{\"requestId\":\"%s\",\"action\":\"SET_AUTO_MODE\","
+               "\"enabled\":true,\"source\":\"voice\"}", requestId);
+      handleDeviceUiCommand(commandJson);
+      if (DeviceRuntimeInstance.automaticModeEnabled()) {
+        voiceSpeak(VOICE_SPEECH_AUTO_ENABLED);
+      }
+      return;
+
+    case VOICE_CMD_QUERY_STATE:
+      snprintf(commandJson, sizeof(commandJson),
+               "{\"requestId\":\"%s\",\"action\":\"REQUEST_STATE\","
+               "\"source\":\"voice\"}", requestId);
+      handleDeviceUiCommand(commandJson);
+      voiceSpeak(valveOpen ? VOICE_SPEECH_VALVE_OPEN
+                           : VOICE_SPEECH_VALVE_CLOSED);
+      return;
+
+    default:
+      return;
+  }
+}
+
+static void serviceVoiceUart() {
+  if (!VOICE_UART_ENABLED) return;
+
+  static uint8_t frame[5] = {};
+  static size_t frameLength = 0;
+  while (VoiceSerial.available()) {
+    const int value = VoiceSerial.read();
+    if (value < 0) break;
+    const uint8_t byte = static_cast<uint8_t>(value);
+
+    if (frameLength == 0) {
+      if (byte == VOICE_FRAME_HEAD_0) frame[frameLength++] = byte;
+      continue;
+    }
+    if (frameLength == 1) {
+      if (byte == VOICE_FRAME_HEAD_1) {
+        frame[frameLength++] = byte;
+      } else {
+        frameLength = byte == VOICE_FRAME_HEAD_0 ? 1 : 0;
+        if (frameLength == 1) frame[0] = byte;
+      }
+      continue;
+    }
+
+    frame[frameLength++] = byte;
+    if (frameLength < sizeof(frame)) continue;
+
+    if (frame[4] == VOICE_FRAME_TAIL && frame[2] == VOICE_FUNCTION_COMMAND) {
+      Serial.printf("[VOICE] command id=0x%02X\n", frame[3]);
+      handleVoiceCommand(frame[3]);
+    }
+    frameLength = 0;
+  }
+}
+
 bool jsonStringValue(const char *json, const char *key, char *output,
                      size_t outputSize) {
   char marker[72];
@@ -894,7 +1043,11 @@ void closeValveForSafety(const char *reason) {
   char requestId[sizeof(activeRequestId)];
   strlcpy(requestId, activeRequestId, sizeof(requestId));
   setValveRelay(false);
+  // Keep legacy controllers working, then publish the v2 state immediately so
+  // the dashboard reflects both voice- and web-initiated automatic closure.
   sendValveAck(requestId, true, reason);
+  emitDeviceUiAck(requestId, true, "STOP_WATERING", reason);
+  emitDeviceIrrigationState(requestId);
   activeRequestId[0] = '\0';
 }
 
@@ -1788,6 +1941,7 @@ void handleDeviceUiCommand(const char *json) {
   }
   const char *requestId = document["requestId"] | "unknown";
   const char *action = document["action"] | document["command"] | "";
+  const bool voiceSource = strcmp(document["source"] | "", "voice") == 0;
   if (strcmp(action, "SET_AUTO_MODE") == 0) {
     const bool enabled = document["enabled"] | false;
     if (enabled && deviceSyntheticHistoryBlocksValve()) {
@@ -1845,7 +1999,9 @@ void handleDeviceUiCommand(const char *json) {
     }
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
-    valveRequiresHostHeartbeat = true;
+    // Dashboard debug commands still require the PC heartbeat. A voice debug
+    // command is a local device action and must finish without a computer.
+    valveRequiresHostHeartbeat = !voiceSource;
     valveOpenedByLocalAuto = false;
     valveCountsForFormalCooldown = false;
     setValveRelay(true);
@@ -1880,7 +2036,9 @@ void handleDeviceUiCommand(const char *json) {
     if (!allowed) return;
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
-    valveRequiresHostHeartbeat = true;
+    // Voice commands are handled locally, so they must not depend on a PC
+    // heartbeat. USB/TCP commands retain the existing heartbeat protection.
+    valveRequiresHostHeartbeat = !voiceSource;
     valveOpenedByLocalAuto = false;
     valveCountsForFormalCooldown = true;
     setValveRelay(true);
@@ -3704,6 +3862,13 @@ void setup() {
 
   SoilSerial.begin(SOIL_BAUD, SERIAL_8N1, SOIL_UART_RX_PIN, SOIL_UART_TX_PIN);
   SolarSerial.begin(SOLAR_BAUD, SERIAL_8N1, SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN);
+  if (VOICE_UART_ENABLED) {
+    VoiceSerial.begin(VOICE_UART_BAUD, SERIAL_8N1,
+                     VOICE_UART_RX_PIN, VOICE_UART_TX_PIN);
+    Serial.printf("Voice UART: RX=GPIO%d TX=GPIO%d baud=%lu\n",
+                  VOICE_UART_RX_PIN, VOICE_UART_TX_PIN,
+                  static_cast<unsigned long>(VOICE_UART_BAUD));
+  }
   if (DISPLAY_ENABLED) {
     DisplaySerial.begin(DISPLAY_BAUD, SERIAL_8N1, DISPLAY_UART_RX_PIN, DISPLAY_UART_TX_PIN);
     Serial.printf("M-series display: UART RX=GPIO%d TX=GPIO%d baud=%lu\n",
@@ -3774,6 +3939,7 @@ void setup() {
 }
 
 void loop() {
+  serviceVoiceUart();
   serviceUsbControl();
   serviceWifi();
   serviceWifiProvisioning();

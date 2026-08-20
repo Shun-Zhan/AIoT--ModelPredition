@@ -196,6 +196,7 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "请持续按住：" in app_js.text
     assert "confirmStatus" in app_js.text
     assert "正在分析…" in app_js.text
+    assert "window.setInterval(refreshCloud, 2000)" in app_js.text
     assert "setAnalyzeState" in app_js.text
     assert "/cancel" in app_js.text
     assert "pointerdown" in app_js.text

@@ -144,6 +144,33 @@ def test_manual_debug_valve_pulse_is_explicit_fixed_and_does_not_weaken_formal_g
     assert "valveCountsForFormalCooldown = true" in formal_block
 
 
+def test_voice_open_valve_uses_debug_path_but_voice_start_uses_formal_path():
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+    voice_start = firmware.index("static void handleVoiceCommand")
+    voice_end = firmware.index("static void serviceVoiceUart", voice_start)
+    voice_block = firmware[voice_start:voice_end]
+
+    open_start = voice_block.index("case VOICE_CMD_OPEN_VALVE")
+    formal_start = voice_block.index("case VOICE_CMD_START_IRRIGATION")
+    close_start = voice_block.index("case VOICE_CMD_CLOSE_VALVE")
+    open_block = voice_block[open_start:formal_start]
+    formal_block = voice_block[formal_start:close_start]
+
+    assert '"action\\":\\"DEBUG_VALVE_PULSE' in open_block
+    assert '"durationSeconds\\":5' in open_block
+    assert '"action\\":\\"START_WATERING' in formal_block
+    assert "DEVICE_RUNTIME_SINGLE_WATERING_SECONDS" in formal_block
+
+    debug_start = firmware.index('strcmp(action, "DEBUG_VALVE_PULSE")')
+    formal_handler_start = firmware.index(
+        'strcmp(action, "START_WATERING")', debug_start
+    )
+    debug_handler = firmware[debug_start:formal_handler_start]
+    assert "valveRequiresHostHeartbeat = !voiceSource" in debug_handler
+
+
 def test_daily_total_is_session_only_and_never_blocks_valve_commands():
     firmware = (
         ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
@@ -241,12 +268,26 @@ def test_ui_ack_reports_gpio_level_without_claiming_physical_feedback():
     firmware = (
         ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
     ).read_text(encoding="utf-8")
-    ack_start = firmware.index("static void emitDeviceUiAck")
+    ack_start = firmware.rindex("static void emitDeviceUiAck")
     ack_end = firmware.index("void emitDeviceCloudResult", ack_start)
     ack = firmware[ack_start:ack_end]
     assert 'document["relayGpio"] = VALVE_RELAY_PIN' in ack
     assert "digitalRead(VALVE_RELAY_PIN)" in ack
     assert 'document["physicalFeedbackAvailable"] = false' in ack
+
+
+def test_safety_close_publishes_v2_closed_state_for_dashboard_sync():
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+    close_start = firmware.index("void closeValveForSafety(")
+    close_end = firmware.index("void handleValveCommand", close_start)
+    close = firmware[close_start:close_end]
+
+    assert "setValveRelay(false)" in close
+    assert "sendValveAck(requestId, true, reason)" in close
+    assert 'emitDeviceUiAck(requestId, true, "STOP_WATERING", reason)' in close
+    assert "emitDeviceIrrigationState(requestId)" in close
 
 
 def test_installed_relay_uses_high_level_trigger_with_low_safe_state():
