@@ -52,6 +52,7 @@ def snapshot_to_dashboard(snapshot: SensorSnapshot, received_at: datetime) -> di
             "humidityPercent": snapshot.air.humidityPercent,
         },
         "airPressureHpa": snapshot.airPressureHpa,
+        "flow": snapshot.flow.model_dump() if snapshot.flow is not None else None,
         "performance": (
             snapshot.performance.model_dump() if snapshot.performance is not None else None
         ),
@@ -699,6 +700,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       setValue('solar', s.solarOk ? s.solarRadiationWm2 : null, 'W/m²', 0);
       setValue('solarIncoming', s.solarIncomingWm2, 'W/m²', 0);
       setValue('solarReflected', s.solarReflectedWm2, 'W/m²', 0);
+      var flow = s.flow || {};
+      setValue('flowRate', flow.ok ? flow.flowRateLpm : null, 'L/min', 2);
+      el('flowTotal').textContent = flow.ok
+        ? '累计：' + number(flow.totalLiters, 3) + ' L　·　脉冲：' + number(flow.pulseCount, 0)
+        : '等待流量计数据';
       el('solarNote').textContent = s.solarSource === 'measured_reflection'
         ? '净短波 = 入射 − 反射（实测）'
         : s.solarSource === 'default_albedo_fallback'
@@ -811,6 +817,37 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       el('sampling').textContent = '推荐采样：' + (samplingLabels[samplingMode] || samplingMode) + '（' + (edge.recommendedReadIntervalMs || '--') + ' ms）' + (data.samplingConfig ? '；设备配置：' + data.samplingConfig.status : '');
       var actuator = data.actuator || {};
       el('valve').textContent = '水阀：' + (actuator.state || 'CLOSED') + '；数据新鲜度：' + (fresh.fresh ? '新鲜' : '需检查') + '（' + (has(fresh.ageSeconds) ? fresh.ageSeconds : '--') + ' 秒）';
+      var irrigation = data.deviceIrrigationState || {};
+      var hasClosedLoop = irrigation.wateringControlMode === 'volume_closed_loop';
+      var volumeParts = [];
+      if (has(irrigation.targetLiters)) volumeParts.push('目标：' + number(irrigation.targetLiters, 2) + ' L');
+      if (has(irrigation.deliveredLiters)) volumeParts.push('已灌溉：' + number(irrigation.deliveredLiters, 2) + ' L');
+      if (has(irrigation.remainingLiters)) volumeParts.push('剩余：' + number(irrigation.remainingLiters, 2) + ' L');
+      if (has(irrigation.flowRateLpm)) volumeParts.push('当前流量：' + number(irrigation.flowRateLpm, 2) + ' L/min');
+      if (has(irrigation.flowPulseCount)) volumeParts.push('脉冲：' + number(irrigation.flowPulseCount, 0));
+      if (hasClosedLoop) volumeParts.push('按目标升数闭环');
+      var volumeEl = el('irrigationVolume');
+      if (volumeParts.length) {
+        volumeEl.textContent = '本次灌溉：' + volumeParts.join('　·　');
+        volumeEl.className = 'meta' + (hasClosedLoop ? ' ok' : '');
+        volumeEl.hidden = false;
+      } else {
+        volumeEl.textContent = '';
+        volumeEl.className = 'meta';
+        volumeEl.hidden = true;
+      }
+      var faultEl = el('flowFaultAlert');
+      if (irrigation.flowFault === true) {
+        faultEl.textContent = irrigation.flowFaultReason === 'flow_fault'
+          ? '⚠ 流量异常：8 秒内无流量，已安全关阀'
+          : '⚠ 流量异常：' + (irrigation.flowFaultReason || '8 秒内无流量，已安全关阀');
+        faultEl.className = 'meta bad';
+        faultEl.hidden = false;
+      } else {
+        faultEl.textContent = '';
+        faultEl.className = 'meta';
+        faultEl.hidden = true;
+      }
     }, function (message) {
       el('connection').textContent = '数据读取失败：' + message;
       el('connection').className = 'bad';
@@ -1757,8 +1794,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div class="card sensor-card sensor-sun"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">🌤️</span><div class="label">净短波辐射（Rns）</div></div><div id="solar" class="value">-- <span class="unit">W/m²</span></div><div id="solarNote" class="sensor-note"></div></div>
       <div class="card sensor-card sensor-sun"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">☀️</span><div class="label">入射短波（Solar 2）</div></div><div id="solarIncoming" class="value">-- <span class="unit">W/m²</span></div></div>
       <div class="card sensor-card sensor-reflect"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">↗️</span><div class="label">反射短波（Solar 1）</div></div><div id="solarReflected" class="value">-- <span class="unit">W/m²</span></div></div>
+      <div class="card sensor-card sensor-water"><div class="sensor-card-head"><span class="sensor-icon" aria-hidden="true">🚰</span><div class="label">实时流量（YF-S201）</div></div><div id="flowRate" class="value">-- <span class="unit">L/min</span></div><div id="flowTotal" class="sensor-note">等待流量计数据</div></div>
     </section>
-    <section class="card wide mobile-full"><h2>设备状态</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div><div class="label" style="margin-top:14px">ESP32 边缘趋势</div><div id="edgePrediction" class="meta">等待 ESP32 趋势数据...</div></section>
+    <section class="card wide mobile-full"><h2>设备状态</h2><div id="risk" class="value" style="font-size:19px">等待数据...</div><div id="riskReasons" class="meta"></div><div id="riskThreshold" class="meta"></div><div id="sampling" class="meta"></div><div id="valve" class="meta"></div><div id="irrigationVolume" class="meta"></div><div id="flowFaultAlert" class="meta" hidden></div><div class="label" style="margin-top:14px">ESP32 边缘趋势</div><div id="edgePrediction" class="meta">等待 ESP32 趋势数据...</div></section>
     <section class="card wide performance-card" aria-labelledby="performanceTitle">
       <h2 id="performanceTitle">ESP32 设备性能</h2>
       <div class="meta">来自最新遥测包；仅用于运行状态监控，不参与预测和灌溉决策。</div>

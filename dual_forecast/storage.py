@@ -207,6 +207,7 @@ class Store:
             "windOk": payload["windOk"], "windSpeedMs": payload["windSpeedMs"],
             "windVoltage": payload["windVoltage"], "airOk": payload["airOk"],
             "air": payload["air"], "airPressureHpa": payload["airPressureHpa"],
+            "flow": payload.get("flow"),
             "soilOk": payload["soilOk"], "soil": payload["soil"],
             "solarOk": incoming is not None,
             "solarRadiationWm2": net_shortwave,

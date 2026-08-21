@@ -22,6 +22,15 @@ def payload(i=0, *, solar1=True, solar2=True):
         "solar1Ok": solar1, "solarRadiation1Wm2": 400,
         "solar2Ok": solar2, "solarRadiation2Wm2": 600,
         "AirPressure": 1013,
+        "flow": {
+            "ok": True,
+            "signalPin": 12,
+            "zeroIsValid": True,
+            "pulseCount": i * 450,
+            "frequencyHz": 0.0,
+            "flowRateLpm": 0.0,
+            "totalLiters": float(i),
+        },
         "receivedAt": (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=5 * i)).isoformat(),
     }
 
@@ -36,6 +45,16 @@ def test_schema_uses_solar2_as_incoming_and_solar1_as_reflection():
     assert snap.net_shortwave_solar() == (None, "incoming_invalid")
     snap = SensorSnapshot.model_validate(payload(solar1=False))
     assert snap.net_shortwave_solar() == (462, "default_albedo_fallback")
+
+
+def test_dashboard_exposes_flow_meter_data():
+    snap = SensorSnapshot.model_validate(payload(i=2))
+    dashboard = service_module.snapshot_to_dashboard(
+        snap, datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+
+    assert dashboard["flow"]["flowRateLpm"] == 0.0
+    assert dashboard["flow"]["totalLiters"] == 2.0
 
 
 def test_service_warms_up_and_latest_is_missing(tmp_path):
@@ -224,6 +243,8 @@ def test_dashboard_exposes_latest_snapshot(tmp_path):
     assert "参考作物蒸散率（ET₀）" in page.text
     assert "净短波辐射（Rns）" in page.text
     assert "sensor-card" in page.text
+    assert "实时流量（YF-S201）" in page.text
+    assert "flowRate" in page.text
     assert "🌡️" in page.text
     assert "💧" in page.text
     assert "🌱" in page.text
@@ -290,6 +311,42 @@ def test_dashboard_prefers_device_forecast_decision_and_cloud_result(tmp_path):
     assert body["decision"]["finalAction"] == "NO_OP"
     assert body["cloud"]["status"] == "offline"
     assert body["device"]["cloudResult"]["finalAction"] == "NO_OP"
+
+
+def test_dashboard_renders_volume_closed_loop_and_flow_fault(tmp_path):
+    settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
+    store = Store(settings.database_path)
+    store.save_device_irrigation_state(DeviceIrrigationState(
+        schemaVersion="2.0", updatedAt="2026-08-11T08:00:01Z", state="CLOSED",
+        action="NO_OP", reasonCode="flow_fault",
+        targetLiters=8.0, deliveredLiters=3.2, remainingLiters=4.8,
+        flowRateLpm=0.0, flowPulseCount=128, flowFault=True,
+        flowFaultReason="flow_fault", wateringControlMode="volume_closed_loop",
+    ))
+
+    client = TestClient(create_app(settings))
+    latest = client.get("/v1/dashboard/latest")
+    assert latest.status_code == 200
+    irrigation = latest.json()["deviceIrrigationState"]
+    assert irrigation["targetLiters"] == 8.0
+    assert irrigation["deliveredLiters"] == 3.2
+    assert irrigation["remainingLiters"] == 4.8
+    assert irrigation["flowRateLpm"] == 0.0
+    assert irrigation["flowPulseCount"] == 128
+    assert irrigation["flowFault"] is True
+    assert irrigation["flowFaultReason"] == "flow_fault"
+    assert irrigation["wateringControlMode"] == "volume_closed_loop"
+    assert irrigation["reasonCode"] == "flow_fault"
+
+    page = client.get("/dashboard")
+    assert page.status_code == 200
+    assert "irrigationVolume" in page.text
+    assert "flowFaultAlert" in page.text
+
+    app_js = client.get("/v1/dashboard/app.js").text
+    assert "按目标升数闭环" in app_js
+    assert "8 秒内无流量" in app_js
+    assert "volume_closed_loop" in app_js
 
 
 def test_device_dashboard_marks_old_rejection_as_expired_not_current_safety(tmp_path, monkeypatch):

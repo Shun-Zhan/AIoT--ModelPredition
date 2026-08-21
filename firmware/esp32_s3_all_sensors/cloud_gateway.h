@@ -89,6 +89,8 @@ public:
   // Portal helpers: pass an empty apiKey to preserve the stored key. Set
   // clearApiKey to true to remove it. Neither method returns the key.
   bool readPortalConfig(CloudGatewayPortalConfig &config) const;
+  // 只读农田档案数字字段（与 API Key 无关，Key 永不回显）。
+  bool readFarmNumber(const char *key, float &value) const;
   bool savePortalConfig(const CloudGatewayPortalConfig &config,
                         const char *apiKey,
                         bool clearApiKey = false);

@@ -20,7 +20,9 @@ static const char *const CLOUD_GATEWAY_DEFAULT_MODEL = "doubao-1.5-thinking-pro"
 static const char *const CLOUD_GATEWAY_DEFAULT_FARM_PROFILE =
     "{\"status\":\"configured\",\"source\":\"demo_default\","
     "\"crop\":\"番茄\",\"growthStage\":\"开花结果期\","
-    "\"soilType\":\"壤土\",\"irrigationMethod\":\"滴灌\"}";
+    "\"soilType\":\"壤土\",\"irrigationMethod\":\"滴灌\","
+    "\"plotAreaM2\":0.01,\"cropCoefficient\":1.15,"
+    "\"irrigationEfficiency\":0.90,\"flowPulsesPerLiter\":450.0}";
 static const char *const CLOUD_GATEWAY_LEGACY_EMPTY_FARM_PROFILE =
     "{\"status\":\"not_configured\"}";
 
@@ -166,6 +168,19 @@ bool CloudGateway::readPortalConfig(CloudGatewayPortalConfig &config) const {
     copyText(config.farmProfileJson, sizeof(config.farmProfileJson),
              CLOUD_GATEWAY_DEFAULT_FARM_PROFILE);
   }
+  return true;
+}
+
+bool CloudGateway::readFarmNumber(const char *key, float &value) const {
+  if (key == nullptr) return false;
+  JsonDocument farmProfile;
+  if (deserializeJson(farmProfile, _farmProfileJson) ||
+      !farmProfile.is<JsonObject>()) {
+    return false;
+  }
+  JsonObjectConst object = farmProfile.as<JsonObjectConst>();
+  if (!object[key].is<float>() && !object[key].is<int>()) return false;
+  value = object[key].as<float>();
   return true;
 }
 

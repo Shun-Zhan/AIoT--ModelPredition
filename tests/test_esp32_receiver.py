@@ -82,6 +82,41 @@ def test_zero_pressure_uses_configured_fallback():
     assert snapshot["AirPressure"] == 1013
 
 
+def test_flow_meter_zero_is_valid_and_is_normalized():
+    message = {
+        "uptime_ms": 1,
+        "wind": {"ok": True, "voltage_v": 0.0, "speed_m_s": 0.0},
+        "air_pressure_hpa": 1013,
+        "air": {"ok": True, "temperature_c": 20.0, "humidity_pct": 60.0},
+        "soil": {"ok": True, "temperature_c": 20.0, "moisture_pct": 50.0},
+        "solar": {
+            "sensor_1": {"ok": True, "radiation_w_m2": 0},
+            "sensor_2": {"ok": True, "radiation_w_m2": 0},
+        },
+        "flow": {
+            "ok": True,
+            "signal_pin": 12,
+            "zero_is_valid": True,
+            "pulse_count": 0,
+            "frequency_hz": 0,
+            "flow_rate_lpm": 0,
+            "total_liters": 0,
+        },
+    }
+
+    snapshot = esp32_message_to_snapshot(message)
+
+    assert snapshot["flow"] == {
+        "ok": True,
+        "signalPin": 12,
+        "zeroIsValid": True,
+        "pulseCount": 0,
+        "frequencyHz": 0.0,
+        "flowRateLpm": 0.0,
+        "totalLiters": 0.0,
+    }
+
+
 def test_prediction_requires_incoming_solar_sensor_2_not_only_reflection():
     base = {
         "windOk": True, "airOk": True, "soilOk": True,
@@ -280,6 +315,77 @@ def test_v2_irrigation_state_replaces_open_with_automatic_closed_state(tmp_path)
     assert state["state"] == "CLOSED"
     assert state["valveState"] == "CLOSED"
     assert state["remainingSeconds"] == 0
+
+
+def test_v2_irrigation_state_parses_volume_closed_loop_fields(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    line = (
+        '@IRRIGATION_STATE {"schemaVersion":"2.0","requestId":"volume-1",'
+        '"state":"OPEN","action":"START_WATERING","reasonCode":"volume_reached_closed",'
+        '"targetLiters":12.5,"deliveredLiters":12.5,"remainingLiters":0.0,'
+        '"flowRateLpm":0.0,"flowPulseCount":450,"flowFault":false,'
+        '"flowFaultReason":"","wateringControlMode":"volume_closed_loop"}'
+    )
+
+    parsed = parse_device_result_line(line)
+    assert parsed is not None
+    result_type, payload = parsed
+    assert result_type == "irrigation_state"
+    assert isinstance(payload, DeviceIrrigationState)
+    assert payload.targetLiters == 12.5
+    assert payload.deliveredLiters == 12.5
+    assert payload.remainingLiters == 0.0
+    assert payload.flowRateLpm == 0.0
+    assert payload.flowPulseCount == 450
+    assert payload.flowFault is False
+    assert payload.flowFaultReason == ""
+    assert payload.wateringControlMode == "volume_closed_loop"
+    assert payload.reasonCode == "volume_reached_closed"
+
+    assert _handle_device_result_line(line, store)
+    cached = store.latest_device_results()["irrigationState"]
+    assert cached["targetLiters"] == 12.5
+    assert cached["remainingLiters"] == 0.0
+    assert cached["wateringControlMode"] == "volume_closed_loop"
+    assert cached["flowFault"] is False
+
+
+def test_v2_irrigation_state_flow_fault_fields_round_trip(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    line = (
+        '@IRRIGATION_STATE {"schemaVersion":"2.0","requestId":"volume-2",'
+        '"state":"CLOSED","action":"NO_OP","reasonCode":"flow_fault",'
+        '"targetLiters":8.0,"deliveredLiters":3.2,"remainingLiters":4.8,'
+        '"flowRateLpm":0.0,"flowPulseCount":128,"flowFault":true,'
+        '"flowFaultReason":"flow_fault","wateringControlMode":"volume_closed_loop"}'
+    )
+
+    parsed = parse_device_result_line(line)
+    assert parsed is not None
+    payload = parsed[1]
+    assert payload.flowFault is True
+    assert payload.flowFaultReason == "flow_fault"
+    assert payload.reasonCode == "flow_fault"
+    assert payload.deliveredLiters == 3.2
+    assert payload.remainingLiters == 4.8
+    assert payload.flowPulseCount == 128
+
+    assert _handle_device_result_line(line, store)
+    cached = store.latest_device_results()["irrigationState"]
+    assert cached["flowFault"] is True
+    assert cached["flowFaultReason"] == "flow_fault"
+    assert cached["reasonCode"] == "flow_fault"
+
+
+def test_v2_irrigation_state_rejects_negative_volume_fields():
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        DeviceIrrigationState.model_validate({
+            "schemaVersion": "2.0", "state": "OPEN",
+            "targetLiters": -1.0, "wateringControlMode": "volume_closed_loop",
+        })
 
 
 def test_v2_ui_ack_updates_the_matching_command_queue(tmp_path):

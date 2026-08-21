@@ -77,6 +77,17 @@ def esp32_message_to_snapshot(
         "solarRadiation2Wm2": int(solar_2["radiation_w_m2"]),
         "AirPressure": air_pressure_hpa,
     }
+    raw_flow = message.get("flow")
+    if isinstance(raw_flow, dict):
+        snapshot["flow"] = {
+            "ok": bool(raw_flow.get("ok", False)),
+            "signalPin": raw_flow.get("signal_pin"),
+            "zeroIsValid": bool(raw_flow.get("zero_is_valid", True)),
+            "pulseCount": int(raw_flow.get("pulse_count", 0)),
+            "frequencyHz": max(0.0, float(raw_flow.get("frequency_hz", 0.0))),
+            "flowRateLpm": max(0.0, float(raw_flow.get("flow_rate_lpm", 0.0))),
+            "totalLiters": max(0.0, float(raw_flow.get("total_liters", 0.0))),
+        }
     raw_performance = message.get("performance")
     if isinstance(raw_performance, dict):
         raw_wifi = raw_performance.get("wifi")

@@ -121,6 +121,7 @@ dual-forecast offline-log --action export
 | ZH-SOIL7 土壤 | GPIO18 / GPIO17 | 设备 TTL UART 的 RX / TX，4800 8N1，Modbus-RTU 地址 0x03 |
 | SN-300AL 太阳辐射 | GPIO16 / GPIO15 | 经自动收发 RS485 转换器的 RO / DI；4800 8N1，地址 0x01/0x02 |
 | 水阀继电器 | GPIO11 | IN，3.3 V 单路继电器，高电平有效；上电默认 LOW |
+| YF-S201 流量计 | GPIO12 | 黄色脉冲 OUT 经 5 V→3.3 V 电平转换后接入；红线外部 5 V，黑线 GND |
 | Feather I²C 电源控制 | GPIO7 | 不外接，禁止复用 |
 
 土壤传感器这一版是 **TTL UART 电气层**，不是 RS485 电气层：模块的 TX 接 ESP32 GPIO18（RX），模块的 RX 接 ESP32 GPIO17（TX），并与 ESP32 共地。它传输的帧格式仍可以是 Modbus-RTU；“Modbus-RTU”是通信协议，不能据此判断必须使用 RS485。
@@ -130,6 +131,18 @@ dual-forecast offline-log --action export
 本方案没有硬件 RTC。设备仅在 NTP 校时成功后将 ESP32 系统时钟视为可信时间；当前运行周期内即使暂时断网仍可继续采集、预测和自动灌溉，但断网重启后必须再次联网校时。
 
 水阀的低压侧：继电器 DC+/VCC 接模块要求的 3.3 V，DC-/GND 与 ESP32 共地，IN 接 GPIO11。24 V 常闭水阀的触点侧：24 V 正极→COM，NO→水阀正极，水阀负极→24 V 负极。确认继电器触点的直流额定值高于负载；24 V 不能进入 ESP32 GPIO 或继电器 IN。
+
+YF-S201 接线：红线接稳定的 5 V 电源，黑线接电源负极并与 ESP32 GND 共地，黄线是脉冲输出，不能把 5 V 直接接到 ESP32。推荐用 10 kΩ 串联到 GPIO12、GPIO12 再用 20 kΩ 接 GND；如果实际模块是开集电极输出，可在 GPIO12 节点增加 3.3 V 上拉。传感器箭头方向按水流方向安装。固件按 f = 7.5 × Q 计算，其中 f 是 Hz，Q 是 L/min；没有水流时 0 L/min 是正常值，累计量按约 450 脉冲/L 统计。
+
+### 按升数闭环灌溉
+
+正式灌溉（START_WATERING / CONFIRM_WATERING / 自动模式）不再只看开阀时长，而是按本次目标升数闭环：
+
+$$V_{target} = \frac{ET_0 \times K_c \times A}{\eta}$$
+
+其中 ET₀ 取设备下一小时预报（mm），Kc 为作物系数，A 为灌溉面积（m²），η 为灌溉效率；因为 1 mm 水覆盖 1 m² 等于 1 L，单位直接换算为 L。演示默认：番茄、开花结果期、面积 0.01 m²（一平方分米）、Kc=1.15、η=0.90、滴灌、YF-S201 标定 450 脉冲/L。目标量小于等于 0 时不启动；小于 1 L 按实际值执行，不强制补足。
+
+开阀后 ESP32 用 YF-S201 脉冲换算实际出水量，达到目标升数立即关阀（`volume_reached_closed`）；开阀 8 秒仍无新脉冲则判 `FLOW_FAULT` 并安全关阀，故障不永久锁死、下次候选可重试；单次正式灌溉最长 300 秒硬超时。调试开阀（DEBUG_VALVE_PULSE）仍固定 5 秒，不参与流量闭环、不计入正式冷却与统计。0 L/min 本身不是故障。
 
 ## ESP32 配网
 

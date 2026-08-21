@@ -60,6 +60,19 @@ class DeviceCloudRuntime(BaseModel):
     requestPending: bool | None = None
 
 
+class FlowMeterData(BaseModel):
+    """YF-S201 pulse flow data; zero flow is a valid idle state."""
+
+    model_config = ConfigDict(extra="forbid")
+    ok: bool
+    signalPin: int | None = Field(default=None, ge=0, le=48)
+    zeroIsValid: bool = True
+    pulseCount: int = Field(default=0, ge=0)
+    frequencyHz: float = Field(default=0.0, ge=0)
+    flowRateLpm: float = Field(default=0.0, ge=0)
+    totalLiters: float = Field(default=0.0, ge=0)
+
+
 class SensorSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     uptimeMs: int = Field(ge=0, le=0xFFFFFFFF)
@@ -75,6 +88,7 @@ class SensorSnapshot(BaseModel):
     solar2Ok: bool
     solarRadiation2Wm2: int = Field(ge=0, le=65535)
     airPressureHpa: int = Field(ge=0, le=65535)
+    flow: FlowMeterData | None = None
     performance: DevicePerformance | None = None
     cloudRuntime: DeviceCloudRuntime | None = None
     edgePrediction: EdgePrediction | None = None
@@ -207,6 +221,17 @@ class DeviceIrrigationState(_DeviceProtocolModel):
     remainingSeconds: int | None = Field(default=None, ge=0, le=60)
     reasonCode: str | None = None
     reason: str | None = None
+    # Volume closed-loop irrigation fields (ESP32 "按升数闭环灌溉" protocol).
+    # Field names must stay byte-for-byte identical to the firmware so the
+    # receiver can validate and the dashboard can display them without mapping.
+    targetLiters: float | None = Field(default=None, ge=0)
+    deliveredLiters: float | None = Field(default=None, ge=0)
+    remainingLiters: float | None = Field(default=None, ge=0)
+    flowRateLpm: float | None = Field(default=None, ge=0)
+    flowPulseCount: int | None = Field(default=None, ge=0)
+    flowFault: bool | None = None
+    flowFaultReason: str | None = None
+    wateringControlMode: str | None = None
 
 
 class DeviceCloudResult(_DeviceProtocolModel):
@@ -241,6 +266,9 @@ class DeviceUiAck(_DeviceProtocolModel):
     relayGpio: int | None = Field(default=None, ge=0)
     relayOutputLevel: str | None = None
     physicalFeedbackAvailable: bool | None = None
+    # Volume closed-loop irrigation fields echoed by the device UI ack.
+    flowFault: bool | None = None
+    wateringControlMode: str | None = None
 
 
 class IrrigationDecision(BaseModel):

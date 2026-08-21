@@ -8,6 +8,7 @@
     4. SN-300AL-RA-N01 solar sensor 1: reflected shortwave Rs↑, RS485/Modbus
     5. SN-300AL-RA-N01 solar sensor 2: incoming shortwave Rs↓, RS485/Modbus
     6. Two analog wind speed sensors on GPIO9 and GPIO6 / ADC1
+    7. YF-S201 water flow meter on GPIO12 / pulse input
 
   Important:
     Soil uses direct TTL UART; the solar sensors use a separate RS485 bus.
@@ -76,6 +77,18 @@ static const uint32_t IRRIGATION_MAX_READ_INTERVAL_MS = 5000;
 // gateway or network is unavailable; it never opens the valve by itself.
 static const uint32_t EDGE_PREDICTION_INTERVAL_MS = 5UL * 60UL * 1000UL;
 
+// -------------------- YF-S201 flow meter --------------------
+
+// The YF-S201 requires 5-18 V power. Its pulse output can reach the sensor
+// supply voltage, so the yellow wire must pass through a 5 V -> 3.3 V level
+// shifter or resistor divider before reaching the ESP32.
+static const bool FLOW_METER_ENABLED = true;
+static const uint8_t FLOW_SIGNAL_PIN = 12;
+static const float FLOW_HZ_PER_LPM = 7.5f;
+static const float FLOW_PULSES_PER_LITER = FLOW_HZ_PER_LPM * 60.0f;
+static const uint32_t FLOW_NO_PULSE_TIMEOUT_US = 3000000UL;
+static const uint32_t FLOW_MIN_PULSE_INTERVAL_US = 100UL;
+
 // The USB cable used to upload this sketch can also carry telemetry to the
 // local computer.  Each sample is emitted as one line beginning with
 // "@TELEMETRY "; ordinary diagnostic logs use other prefixes and are ignored
@@ -105,7 +118,24 @@ static const size_t HOST_CONTROL_LINE_CAPACITY = 1024;
 static const uint8_t VALVE_RELAY_PIN = 11;
 static const bool VALVE_RELAY_ACTIVE_HIGH = true;
 static const uint32_t MAX_WATERING_MS = 60000;
+// 正式按升数闭环灌溉的硬超时：最长 300 秒，避免流量计故障时阀门永不关闭。
+static const uint32_t FORMAL_WATERING_MAX_MS = 300000UL;
+// 开阀后 8 秒内没有新脉冲才判定 FLOW_FAULT；0 L/min 本身不是故障。
+static const uint32_t FLOW_GRACE_MS = 8000UL;
 static const uint32_t HOST_HEARTBEAT_TIMEOUT_MS = 8000;
+
+// 按升数闭环灌溉状态。delivered/flowFault/flowFaultReason 在关阀后保留用于
+// 展示，直到下一次正式灌溉开始时被重置。
+struct VolumeWateringState {
+  bool active;
+  float targetLiters;
+  uint32_t startPulseCount;
+  float deliveredLiters;
+  uint32_t openedAtMs;
+  bool flowFault;
+  const char *flowFaultReason;
+};
+VolumeWateringState volumeWatering = {};
 
 bool valveOpen = false;
 uint32_t valveCloseAtMs = 0;
@@ -403,6 +433,17 @@ struct SensorSnapshot {
   uint16_t solarRadiation2Wm2;
 };
 
+struct FlowMeterReading {
+  uint32_t pulseCount;
+  float frequencyHz;
+  float flowRateLpm;
+  float totalLiters;
+};
+
+volatile uint32_t flowPulseCount = 0;
+volatile uint32_t flowLastPulseUs = 0;
+volatile uint32_t flowPeriodUs = 0;
+
 // Arduino's sketch preprocessor creates function declarations before this
 // file's later helper types.  Forward-declaring this one keeps those generated
 // declarations valid; its full layout remains next to the edge estimator.
@@ -535,6 +576,11 @@ void emitDeviceCloudResult(const CloudGatewayResult &result);
 bool appendDeviceV2Record(const DeviceRuntimeRecordV2 &record);
 void closeValveForSafety(const char *reason);
 void setValveRelay(bool open);
+static void IRAM_ATTR onFlowPulse();
+static FlowMeterReading readFlowMeter();
+static void printFlowMeter(const FlowMeterReading &reading);
+static float deviceComputeTargetLiters();
+static void serviceVolumeClosedLoop();
 static void serviceVoiceUart();
 static void voiceSpeak(uint8_t speechId);
 static void handleVoiceCommand(uint8_t commandId);
@@ -823,7 +869,53 @@ void setValveRelay(bool open) {
     valveRequiresHostHeartbeat = true;
     valveOpenedByLocalAuto = false;
     valveCountsForFormalCooldown = false;
+    // 只停掉本次闭环，保留 deliveredLiters/targetLiters/flowFault 用于展示。
+    volumeWatering.active = false;
   }
+}
+
+static void IRAM_ATTR onFlowPulse() {
+  const uint32_t nowUs = micros();
+  portENTER_CRITICAL_ISR(&deviceStateMux);
+  const uint32_t previousUs = flowLastPulseUs;
+  if (previousUs == 0 || nowUs - previousUs >= FLOW_MIN_PULSE_INTERVAL_US) {
+    if (previousUs != 0) flowPeriodUs = nowUs - previousUs;
+    flowLastPulseUs = nowUs;
+    ++flowPulseCount;
+  }
+  portEXIT_CRITICAL_ISR(&deviceStateMux);
+}
+
+static FlowMeterReading readFlowMeter() {
+  FlowMeterReading reading = {};
+  if (!FLOW_METER_ENABLED) return reading;
+
+  uint32_t pulseCount = 0;
+  uint32_t lastPulseUs = 0;
+  uint32_t periodUs = 0;
+  portENTER_CRITICAL(&deviceStateMux);
+  pulseCount = flowPulseCount;
+  lastPulseUs = flowLastPulseUs;
+  periodUs = flowPeriodUs;
+  portEXIT_CRITICAL(&deviceStateMux);
+
+  const uint32_t nowUs = micros();
+  const bool signalRecent = lastPulseUs != 0 &&
+                            nowUs - lastPulseUs <= FLOW_NO_PULSE_TIMEOUT_US;
+  reading.pulseCount = pulseCount;
+  reading.frequencyHz = signalRecent && periodUs > 0
+                            ? 1000000.0f / static_cast<float>(periodUs)
+                            : 0.0f;
+  reading.flowRateLpm = reading.frequencyHz / FLOW_HZ_PER_LPM;
+  reading.totalLiters = static_cast<float>(pulseCount) / FLOW_PULSES_PER_LITER;
+  return reading;
+}
+
+static void printFlowMeter(const FlowMeterReading &reading) {
+  Serial.printf("Flow meter (GPIO%d): %.2f Hz | %.3f L/min | total %.4f L | pulses %lu\n",
+                FLOW_SIGNAL_PIN, reading.frequencyHz, reading.flowRateLpm,
+                reading.totalLiters,
+                static_cast<unsigned long>(reading.pulseCount));
 }
 
 static void voiceSpeak(uint8_t speechId) {
@@ -1168,11 +1260,47 @@ void serviceUsbControl() {
              millis() - lastHostHeartbeatMs > HOST_HEARTBEAT_TIMEOUT_MS) {
     closeValveForSafety("host_heartbeat_timeout_closed");
   }
+  serviceVolumeClosedLoop();
 }
 
 // -------------------- Device-authoritative prediction and control --------------------
 
 static bool deviceFinite(float value) { return isfinite(value) != 0; }
+
+// V_target = ET0 * Kc * A / η（单位：L）。ET0 来自下一小时预报，其余参数
+// 优先读取农田档案，异常时回退到演示默认值。
+static float deviceComputeTargetLiters() {
+  const float et0 = deviceForecast.nextHourEt0Mm;
+  if (!deviceFinite(et0) || et0 <= 0.0f) return 0.0f;
+  float area = 0.01f, kc = 1.15f, efficiency = 0.90f;
+  CloudGatewayInstance.readFarmNumber("plotAreaM2", area);
+  CloudGatewayInstance.readFarmNumber("cropCoefficient", kc);
+  CloudGatewayInstance.readFarmNumber("irrigationEfficiency", efficiency);
+  if (!deviceFinite(area) || area <= 0.0f) area = 0.01f;
+  if (!deviceFinite(kc) || kc <= 0.0f) kc = 1.15f;
+  if (!deviceFinite(efficiency) || efficiency <= 0.0f) efficiency = 0.90f;
+  return et0 * kc * area / efficiency;
+}
+
+// 按升数闭环检测：累计脉冲换算为实际出水升数，达到目标量关阀；开阀 8 秒
+// 仍无新脉冲则判为流量故障并安全关阀。
+static void serviceVolumeClosedLoop() {
+  if (!volumeWatering.active || !valveOpen) return;
+  const FlowMeterReading flow = readFlowMeter();
+  volumeWatering.deliveredLiters =
+      static_cast<float>(flow.pulseCount - volumeWatering.startPulseCount) / FLOW_PULSES_PER_LITER;
+  if (volumeWatering.deliveredLiters < 0.0f) volumeWatering.deliveredLiters = 0.0f;
+  if (volumeWatering.deliveredLiters >= volumeWatering.targetLiters) {
+    volumeWatering.active = false;
+    closeValveForSafety("volume_reached_closed");
+  } else if (millis() - volumeWatering.openedAtMs >= FLOW_GRACE_MS &&
+             flow.pulseCount == volumeWatering.startPulseCount) {
+    volumeWatering.active = false;
+    volumeWatering.flowFault = true;
+    volumeWatering.flowFaultReason = "flow_fault";
+    closeValveForSafety("flow_fault");
+  }
+}
 
 static bool deviceReadTrustedEpoch(uint32_t &epochUtc) {
   const time_t systemNow = time(nullptr);
@@ -1496,6 +1624,16 @@ void emitDeviceIrrigationState(const char *requestId) {
                                       : 0;
   document["cooldownSeconds"] = DEVICE_RUNTIME_COOLDOWN_SECONDS;
   document["clockSource"] = deviceClockSourceText();
+  const FlowMeterReading flow = readFlowMeter();
+  document["targetLiters"] = volumeWatering.targetLiters;
+  document["deliveredLiters"] = volumeWatering.deliveredLiters;
+  document["remainingLiters"] = (volumeWatering.active && volumeWatering.targetLiters > volumeWatering.deliveredLiters)
+      ? volumeWatering.targetLiters - volumeWatering.deliveredLiters : 0.0f;
+  document["flowRateLpm"] = flow.flowRateLpm;
+  document["flowPulseCount"] = flow.pulseCount;
+  document["flowFault"] = volumeWatering.flowFault;
+  document["flowFaultReason"] = volumeWatering.flowFaultReason == nullptr ? "" : volumeWatering.flowFaultReason;
+  document["wateringControlMode"] = "volume_closed_loop";
   sendDeviceProtocol(USB_IRRIGATION_STATE_PREFIX, document);
 }
 
@@ -2034,15 +2172,29 @@ void handleDeviceUiCommand(const char *json) {
                              ? deviceConfirmedCloudStartAllowed(duration, requestId)
                              : deviceManualStartAllowed(duration, requestId);
     if (!allowed) return;
+    const float targetLiters = deviceComputeTargetLiters();
+    if (targetLiters <= 0.0f) {
+      emitDeviceUiAck(requestId, false, action, "target_volume_zero");
+      emitDeviceIrrigationState(requestId);
+      return;
+    }
+    const FlowMeterReading flow = readFlowMeter();
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
     // Voice commands are handled locally, so they must not depend on a PC
     // heartbeat. USB/TCP commands retain the existing heartbeat protection.
+    volumeWatering.active = true;
+    volumeWatering.targetLiters = targetLiters;
+    volumeWatering.startPulseCount = flow.pulseCount;
+    volumeWatering.deliveredLiters = 0.0f;
+    volumeWatering.openedAtMs = millis();
+    volumeWatering.flowFault = false;
+    volumeWatering.flowFaultReason = nullptr;
     valveRequiresHostHeartbeat = !voiceSource;
     valveOpenedByLocalAuto = false;
     valveCountsForFormalCooldown = true;
     setValveRelay(true);
-    valveCloseAtMs = millis() + duration * 1000UL;
+    valveCloseAtMs = millis() + FORMAL_WATERING_MAX_MS;
     lastHostHeartbeatMs = millis();
     pendingCloudWateringRequestId[0] = '\0';
     emitDeviceUiAck(requestId, true, action, "started");
@@ -2341,12 +2493,25 @@ void serviceDeviceRuntime() {
   latestIrrigationEvaluation = DeviceRuntimeInstance.evaluateLocalIrrigation(input);
   if (latestIrrigationEvaluation.shouldOpenValve) {
     const char *requestId = "local-auto";
+    const float targetLiters = deviceComputeTargetLiters();
+    if (targetLiters <= 0.0f) {
+      emitDeviceIrrigationState(requestId);
+      return;
+    }
+    const FlowMeterReading flow = readFlowMeter();
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
+    volumeWatering.active = true;
+    volumeWatering.targetLiters = targetLiters;
+    volumeWatering.startPulseCount = flow.pulseCount;
+    volumeWatering.deliveredLiters = 0.0f;
+    volumeWatering.openedAtMs = millis();
+    volumeWatering.flowFault = false;
+    volumeWatering.flowFaultReason = nullptr;
     valveRequiresHostHeartbeat = false;
     valveOpenedByLocalAuto = true;
     valveCountsForFormalCooldown = true;
     setValveRelay(true);
-    valveCloseAtMs = millis() + latestIrrigationEvaluation.durationSeconds * 1000UL;
+    valveCloseAtMs = millis() + FORMAL_WATERING_MAX_MS;
     emitDeviceIrrigationState(requestId);
   }
 }
@@ -3200,7 +3365,7 @@ String wifiSetupPage(const String &notice = "") {
                                                : F("<small>当前状态：未配置 API Key。</small>");
   page += F("<label>农田档案 JSON</label><textarea name='farmProfile' rows='5' style='width:100%;box-sizing:border-box'>");
   page += cloudReady ? String(cloud.farmProfileJson)
-                     : "{\"status\":\"configured\",\"source\":\"demo_default\",\"crop\":\"番茄\",\"growthStage\":\"开花结果期\",\"soilType\":\"壤土\",\"irrigationMethod\":\"滴灌\"}";
+                     : "{\"status\":\"configured\",\"source\":\"demo_default\",\"crop\":\"番茄\",\"growthStage\":\"开花结果期\",\"soilType\":\"壤土\",\"irrigationMethod\":\"滴灌\",\"plotAreaM2\":0.01,\"cropCoefficient\":1.15,\"irrigationEfficiency\":0.90,\"flowPulsesPerLiter\":450.0}";
   page += F("</textarea><button type='submit'>保存云端配置</button></form><form method='post' action='/cloud-clear-key'>"
             "<button type='submit' style='background:#6b746f'>清除云端 API Key</button></form>"
             "<p><small>云端不可用时，设备仍能离线采集、预测和执行本地安全策略。</small></p></main></html>");
@@ -3715,6 +3880,7 @@ EdgePrediction updateEdgePrediction(const SensorSnapshot &snapshot) {
 
 void sendTelemetry(const SensorSnapshot &snapshot,
                    const EdgePrediction &edgePrediction) {
+  const FlowMeterReading flow = readFlowMeter();
   uint8_t validWindCount = 0;
   float averageWindVoltage = 0.0f;
   float averageWindSpeedMs = 0.0f;
@@ -3754,7 +3920,7 @@ void sendTelemetry(const SensorSnapshot &snapshot,
     strlcpy(chipTemperatureJson, "null", sizeof(chipTemperatureJson));
   }
 
-  char packet[1800];
+  char packet[2200];
   const int written = snprintf(
       packet,
       sizeof(packet),
@@ -3766,6 +3932,7 @@ void sendTelemetry(const SensorSnapshot &snapshot,
       "\"soil\":{\"ok\":%s,\"temperature_c\":%.1f,\"moisture_pct\":%.1f},"
       "\"solar\":{\"sensor_1_role\":\"reflected_shortwave\",\"sensor_1\":{\"ok\":%s,\"radiation_w_m2\":%u},\"sensor_2_role\":\"incoming_shortwave\",\"sensor_2\":{\"ok\":%s,\"radiation_w_m2\":%u}},"
       "\"performance\":{\"chip_temperature_c\":%s,\"heap_free_bytes\":%lu,\"heap_min_free_bytes\":%lu,\"heap_size_bytes\":%lu,\"heap_used_percent\":%.1f,\"cpu_freq_mhz\":%lu,\"flash_size_bytes\":%lu,\"sketch_size_bytes\":%lu,\"free_sketch_bytes\":%lu,\"wifi\":{\"connected\":%s,\"rssi_dbm\":%d,\"ip\":\"%s\"}},"
+      "\"flow\":{\"ok\":%s,\"signal_pin\":%u,\"zero_is_valid\":true,\"pulse_count\":%lu,\"frequency_hz\":%.2f,\"flow_rate_lpm\":%.3f,\"total_liters\":%.4f},"
       "\"cloud\":{\"initialized\":%s,\"enabled\":%s,\"api_key_configured\":%s,\"request_pending\":%s},"
       "\"edge_prediction\":{\"valid\":%s,\"mode\":\"edge_fallback\",\"predicted_soil_moisture_30m_pct\":%.1f,"
       "\"drying_rate_pct_per_h\":%.3f,\"risk_level\":\"%s\",\"reason\":\"%s\",\"updated_uptime_ms\":%lu},"
@@ -3803,6 +3970,12 @@ void sendTelemetry(const SensorSnapshot &snapshot,
       wifiConnected ? "true" : "false",
       wifiRssiDbm,
       wifiIp.c_str(),
+      FLOW_METER_ENABLED ? "true" : "false",
+      FLOW_SIGNAL_PIN,
+      static_cast<unsigned long>(flow.pulseCount),
+      flow.frequencyHz,
+      flow.flowRateLpm,
+      flow.totalLiters,
       cloudInitialized ? "true" : "false",
       cloudEnabled ? "true" : "false",
       cloudKeyConfigured ? "true" : "false",
@@ -3862,6 +4035,12 @@ void setup() {
 
   SoilSerial.begin(SOIL_BAUD, SERIAL_8N1, SOIL_UART_RX_PIN, SOIL_UART_TX_PIN);
   SolarSerial.begin(SOLAR_BAUD, SERIAL_8N1, SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN);
+  if (FLOW_METER_ENABLED) {
+    pinMode(FLOW_SIGNAL_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(FLOW_SIGNAL_PIN), onFlowPulse, RISING);
+    Serial.printf("YF-S201 flow meter: signal=GPIO%d, calibration=%.1f Hz per L/min\n",
+                  FLOW_SIGNAL_PIN, FLOW_HZ_PER_LPM);
+  }
   if (VOICE_UART_ENABLED) {
     VoiceSerial.begin(VOICE_UART_BAUD, SERIAL_8N1,
                      VOICE_UART_RX_PIN, VOICE_UART_TX_PIN);
@@ -4045,6 +4224,8 @@ void loop() {
     Serial.printf("Solar net shortwave: %.0f W/m2 (%s)\n", netShortwaveRadiation(snapshot),
                   snapshot.solar1Ok ? "measured reflection" : "default albedo fallback");
   }
+
+  printFlowMeter(readFlowMeter());
 
   latestSensorSnapshotValid =
       (snapshot.wind1Ok || snapshot.wind2Ok) && snapshot.AirPressure > 0 &&

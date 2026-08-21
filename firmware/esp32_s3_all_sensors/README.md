@@ -29,6 +29,7 @@ arduino-cli compile \
 | ZH-SOIL7 土壤 | GPIO18 / GPIO17 | TX / RX | TTL UART，4800 8N1，Modbus-RTU 地址 0x03 |
 | SN-300AL 太阳辐射 | GPIO16 / GPIO15 | RS485 转换器 RO / DI | 4800 8N1，地址 0x01/0x02 |
 | 水阀继电器 | GPIO11 | IN | 3.3 V、高电平有效；上电先置 LOW |
+| YF-S201 流量计 | GPIO12 | 黄色脉冲 OUT | 红线外部 5 V，黑线 GND；黄线必须先降到 3.3 V |
 | 语音模块 UART | GPIO13 / GPIO14 | ESP32 RX / TX | 115200 8N1；GPIO14→模块 RX，GPIO13←模块 TX；信号必须为 ESP32 安全的 3.3 V 电平 |
 | Feather I²C 电源控制 | GPIO7 | 不外接 | 固件自动拉高，禁止复用 |
 
@@ -39,6 +40,10 @@ arduino-cli compile \
 太阳辐射才需要 RS485 转换器：两个太阳探头 A 对 A、B 对 B 并联在独立太阳总线上，转换器 RO→GPIO16，DI→GPIO15。地址 0x01 是反射短波，0x02 是入射短波；净短波为 `max(入射 - 反射, 0)`。
 
 继电器控制侧：DC+/VCC→模块要求的 3.3 V，DC-/GND→ESP32 GND，IN→GPIO11。24 V 常闭水阀的触点侧：24 V 正极→COM，NO→水阀正极，水阀负极→24 V 负极。24 V 不得接入 GPIO 或 IN；触点额定直流电压/电流应高于水阀负载。
+
+YF-S201 流量计：红线接稳定 5 V，黑线接电源 GND 并与 ESP32 共地，黄线为脉冲 OUT。YF-S201 在 5 V 供电时高电平可能接近 5 V，黄线不得直连 GPIO12；推荐黄线经 10 kΩ 串联到 GPIO12，并从 GPIO12 用 20 kΩ 接 GND。若确认输出为开集电极，再按模块情况增加 3.3 V 上拉。按外壳箭头方向接水管。流量公式为 f = 7.5 × Q，即 Q = f / 7.5（L/min）；无水流显示 0 L/min 属于正常空闲状态，累计量约按 450 脉冲/L 计算。
+
+正式灌溉按目标升数闭环：目标 V = ET₀ × Kc × A ÷ η（L），ET₀ 取下一小时预报，演示默认面积 0.01 m²（一平方分米）、Kc=1.15、η=0.90、450 脉冲/L。达到目标升数立即关阀（`volume_reached_closed`），开阀 8 秒无新脉冲判 `FLOW_FAULT` 并安全关阀，单次最长 300 秒硬超时。调试开阀仍固定 5 秒，不参与流量闭环。
 
 语音模块串口接线：ESP32 GPIO14（TX）→语音模块 RX，ESP32 GPIO13（RX）←语音模块 TX，语音模块 GND→ESP32 GND，语音模块按规格供 5 V。若模块 TX 上拉到 5 V，不能直接接 GPIO13，必须使用 5 V→3.3 V 电平转换或确认模块输出为 3.3 V/开漏并采用 3.3 V 上拉。
 
