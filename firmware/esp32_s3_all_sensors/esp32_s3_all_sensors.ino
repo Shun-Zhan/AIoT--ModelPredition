@@ -554,6 +554,7 @@ uint32_t deviceLastStatusEmitMs = 0;
 uint32_t deviceLastTargetZeroEmitMs = 0;
 uint32_t deviceLastSavedSlot = UINT32_MAX;
 uint32_t deviceLastWateringEpochUtc = 0;
+uint32_t deviceLastWateringMs = 0;
 uint32_t deviceValveOpenEpochUtc = 0;
 bool valveCountsForFormalCooldown = false;
 char pendingCloudWateringRequestId[CLOUD_GATEWAY_REQUEST_ID_CAPACITY] = {};
@@ -866,6 +867,11 @@ void setValveRelay(bool open) {
     const uint32_t nowEpochUtc = latestDeviceSample.epochUtc;
     if (valveCountsForFormalCooldown && nowEpochUtc != 0) {
       deviceLastWateringEpochUtc = nowEpochUtc;
+    }
+    // 单调时钟兜底：即使 NTP 失效（epochUtc==0），冷却计时依然生效，
+    // 避免自动模式在硬超时后立刻再次开阀。
+    if (valveCountsForFormalCooldown) {
+      deviceLastWateringMs = millis();
     }
   }
   valveOpen = open;
@@ -1207,6 +1213,7 @@ void handleValveCommand(const char *json) {
 
   if (strcmp(action, "STOP_WATERING") == 0) {
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
+    strlcpy(lastCloseReasonCode, "stopped", sizeof(lastCloseReasonCode));
     setValveRelay(false);
     activeRequestId[0] = '\0';
     sendValveAck(requestId, true, "stopped");
@@ -1267,10 +1274,13 @@ void serviceUsbControl() {
     }
   }
 
+  // 超时关阀与 heartbeat 兜底必须独立判断：若某条开阀路径的 valveCloseAtMs
+  // 意外未生效，不能让 else-if 把 heartbeat 兜底一起短路，导致阀门无人关闭。
   if (valveOpen && static_cast<int32_t>(millis() - valveCloseAtMs) >= 0) {
     closeValveForSafety("duration_timeout_closed");
-  } else if (valveOpen && valveRequiresHostHeartbeat &&
-             millis() - lastHostHeartbeatMs > HOST_HEARTBEAT_TIMEOUT_MS) {
+  }
+  if (valveOpen && valveRequiresHostHeartbeat &&
+      static_cast<int32_t>(millis() - lastHostHeartbeatMs) > HOST_HEARTBEAT_TIMEOUT_MS) {
     closeValveForSafety("host_heartbeat_timeout_closed");
   }
   serviceVolumeClosedLoop();
@@ -1279,6 +1289,18 @@ void serviceUsbControl() {
 // -------------------- Device-authoritative prediction and control --------------------
 
 static bool deviceFinite(float value) { return isfinite(value) != 0; }
+
+// 冷却是否生效：优先用 NTP epoch，时钟失效时回退到单调 millis 兜底。
+// deviceLastWateringMs 在关阀时无条件记录，保证断网/未同步时冷却依然生效。
+static bool deviceCooldownActive(uint32_t nowEpochUtc) {
+  if (deviceLastWateringEpochUtc != 0) {
+    return nowEpochUtc < deviceLastWateringEpochUtc ||
+           nowEpochUtc - deviceLastWateringEpochUtc < DEVICE_RUNTIME_COOLDOWN_SECONDS;
+  }
+  return deviceLastWateringMs != 0 &&
+         millis() - deviceLastWateringMs <
+             DEVICE_RUNTIME_COOLDOWN_SECONDS * 1000UL;
+}
 
 // deviceForecast 由推理任务在 deviceStateMux 临界区内整块改写。返回一份原子
 // 快照，避免读取端观测到半更新的“撕裂”预报。
@@ -1314,7 +1336,10 @@ static void serviceVolumeClosedLoop() {
   volumeWatering.deliveredLiters =
       static_cast<float>(flow.pulseCount - volumeWatering.startPulseCount) / FLOW_PULSES_PER_LITER;
   if (volumeWatering.deliveredLiters < 0.0f) volumeWatering.deliveredLiters = 0.0f;
-  if (volumeWatering.deliveredLiters >= volumeWatering.targetLiters) {
+  // 浮点除法存在舍入：目标水量可能对应非整数脉冲。允许半脉冲容差，避免
+  // 极小目标水量（约 1 脉冲）因舍入永远达不到而只能靠硬超时。
+  const float pulseTolerance = 0.5f / FLOW_PULSES_PER_LITER;
+  if (volumeWatering.deliveredLiters + pulseTolerance >= volumeWatering.targetLiters) {
     volumeWatering.active = false;
     closeValveForSafety("volume_reached_closed");
   } else if (millis() - volumeWatering.openedAtMs >= FLOW_GRACE_MS &&
@@ -1713,10 +1738,8 @@ void emitDeviceCloudResult(const CloudGatewayResult &result) {
   const bool confidenceValid = !startSuggested ||
                                (result.hasConfidence && result.confidence >= 0.5f);
   const bool valveSafe = !startSuggested || !valveOpen;
-  const bool cooldownSafe = !startSuggested || deviceLastWateringEpochUtc == 0 ||
-                            (latestDeviceSample.epochUtc >= deviceLastWateringEpochUtc &&
-                             latestDeviceSample.epochUtc - deviceLastWateringEpochUtc >=
-                                 DEVICE_RUNTIME_COOLDOWN_SECONDS);
+  const bool cooldownSafe = !startSuggested ||
+                            !deviceCooldownActive(latestDeviceSample.epochUtc);
   const bool localAccepted = !startSuggested ||
                              (cloudCandidate && sensorsValid && durationValid &&
                               confidenceValid && valveSafe && cooldownSafe);
@@ -2062,6 +2085,12 @@ static bool deviceManualStartAllowed(uint32_t durationSeconds,
   input.valveState = valveOpen ? DEVICE_VALVE_OPEN : DEVICE_VALVE_CLOSED;
   input.valveDriverHealthy = true;
   input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
+  // 手动/语音 START 同样受冷却保护；时钟失效时用单调兜底。
+  if (deviceCooldownActive(latestDeviceSample.epochUtc)) {
+    emitDeviceUiAck(requestId, false, "START_WATERING", "cooldown");
+    emitDeviceIrrigationState(requestId);
+    return false;
+  }
   const DeviceIrrigationEvaluation evaluation =
       evaluateLocalIrrigation(input, config);
   latestIrrigationEvaluation = evaluation;
@@ -2089,10 +2118,7 @@ static bool deviceConfirmedCloudStartAllowed(uint32_t durationSeconds,
   const bool durationValid = durationSeconds >= 1 &&
                              durationSeconds <= DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
   const bool valveSafe = !valveOpen;
-  const bool cooldownSafe = deviceLastWateringEpochUtc == 0 ||
-                            (latestDeviceSample.epochUtc >= deviceLastWateringEpochUtc &&
-                             latestDeviceSample.epochUtc - deviceLastWateringEpochUtc >=
-                                 DEVICE_RUNTIME_COOLDOWN_SECONDS);
+  const bool cooldownSafe = !deviceCooldownActive(latestDeviceSample.epochUtc);
   const char *reason = !sensorsValid ? "sensor_invalid"
                        : !candidate ? "irrigation_candidate_invalid"
                        : !durationValid ? "invalid_duration"
@@ -2143,6 +2169,7 @@ void handleDeviceUiCommand(const char *json) {
     return;
   }
   if (strcmp(action, "STOP_WATERING") == 0 || strcmp(action, "CANCEL") == 0) {
+    strlcpy(lastCloseReasonCode, "stopped", sizeof(lastCloseReasonCode));
     setValveRelay(false);
     activeRequestId[0] = '\0';
     emitDeviceUiAck(requestId, true, action, "stopped");
@@ -2535,6 +2562,9 @@ void serviceDeviceRuntime() {
   input.valveState = DEVICE_VALVE_CLOSED;
   input.valveDriverHealthy = true;
   input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
+  // 时钟失效时 deviceLastWateringEpochUtc 不会更新，此处用单调时钟兜底，
+  // 防止自动模式在硬超时后立刻再次开阀。
+  if (deviceCooldownActive(latestDeviceSample.epochUtc)) return;
   latestIrrigationEvaluation = DeviceRuntimeInstance.evaluateLocalIrrigation(input);
   if (latestIrrigationEvaluation.shouldOpenValve) {
     const char *requestId = "local-auto";
