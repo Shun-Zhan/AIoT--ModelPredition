@@ -296,3 +296,43 @@ def test_installed_relay_uses_high_level_trigger_with_low_safe_state():
     ).read_text(encoding="utf-8")
     assert "VALVE_RELAY_ACTIVE_HIGH = true" in firmware
     assert "open == VALVE_RELAY_ACTIVE_HIGH ? HIGH : LOW" in firmware
+
+
+def test_timeout_and_heartbeat_are_independent_safety_gates():
+    """超时关阀与心跳兜底必须是两个独立判断，不能用 else-if 互相短路。"""
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+    start = firmware.index("void serviceUsbControl() {")
+    end = firmware.index("// -------------------- Device-authoritative", start)
+    block = firmware[start:end]
+    # 两个 closeValveForSafety 调用必须各自独立成 if，不能是 else if。
+    assert block.count("closeValveForSafety(\"duration_timeout_closed\")") == 1
+    assert block.count("closeValveForSafety(\"host_heartbeat_timeout_closed\")") == 1
+    assert "else if (valveOpen && valveRequiresHostHeartbeat" not in block
+
+
+def test_cooldown_has_monotonic_fallback_when_clock_is_unset():
+    """NTP 失效时冷却计时必须回退到单调 millis，避免自动灌溉硬超时后立刻再次开阀。"""
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+    assert "uint32_t deviceLastWateringMs = 0;" in firmware
+    assert "static bool deviceCooldownActive(uint32_t nowEpochUtc)" in firmware
+    assert "deviceLastWateringMs = millis();" in firmware
+    # 冷却兜底必须在关阀路径记录单调时钟。
+    relay = firmware[firmware.index("void setValveRelay(bool open) {"):firmware.index("void closeValveForSafety(", firmware.index("void setValveRelay(bool open) {"))]
+    assert "deviceLastWateringMs = millis();" in relay
+
+
+def test_legacy_command_start_watering_uses_volume_closed_loop():
+    """旧 @COMMAND 的 START_WATERING 也必须接入按升数闭环，不能绕过流量保护。"""
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+    start = firmware.index("void handleValveCommand(")
+    end = firmware.index("void handleDisplayCommand", start)
+    block = firmware[start:end]
+    assert "deviceComputeTargetLiters()" in block
+    assert "volumeWatering.targetLiters = targetLiters" in block
+    assert "volumeWatering.startPulseCount = flow.pulseCount" in block
