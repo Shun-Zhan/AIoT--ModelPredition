@@ -1199,8 +1199,24 @@ void handleValveCommand(const char *json) {
     if (!deviceManualStartAllowed(static_cast<uint32_t>(durationSeconds), requestId)) {
       return;
     }
+    // 旧 @COMMAND 通道与 @UI_COMMAND 的 START_WATERING 共用同一套流量闭环，
+    // 避免手工串口命令绕过按升数灌溉与 8 秒无脉冲保护。
+    const float targetLiters = deviceComputeTargetLiters();
+    if (targetLiters <= 0.0f) {
+      sendValveAck(requestId, false, "target_volume_zero");
+      emitDeviceIrrigationState(requestId);
+      return;
+    }
+    const FlowMeterReading flow = readFlowMeter();
     strlcpy(lastRequestId, requestId, sizeof(lastRequestId));
     strlcpy(activeRequestId, requestId, sizeof(activeRequestId));
+    volumeWatering.active = true;
+    volumeWatering.targetLiters = targetLiters;
+    volumeWatering.startPulseCount = flow.pulseCount;
+    volumeWatering.deliveredLiters = 0.0f;
+    volumeWatering.openedAtMs = millis();
+    volumeWatering.flowFault = false;
+    volumeWatering.flowFaultReason = nullptr;
     valveRequiresHostHeartbeat = true;
     valveOpenedByLocalAuto = false;
     valveCountsForFormalCooldown = true;
