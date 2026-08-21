@@ -32,6 +32,11 @@ class Store:
     def connection(self):
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        # FastAPI 同步端点在多线程下会并发访问 SQLite；WAL 让读写不互斥，
+        # 15 秒 busy timeout 覆盖 receiver/cloud worker/请求处理线程的瞬时竞争，
+        # 避免偶发 "database is locked" 导致 500。
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
         try:
             yield conn
             conn.commit()
