@@ -87,7 +87,9 @@ static const uint8_t FLOW_SIGNAL_PIN = 12;
 static const float FLOW_HZ_PER_LPM = 7.5f;
 static const float FLOW_PULSES_PER_LITER = FLOW_HZ_PER_LPM * 60.0f;
 static const uint32_t FLOW_NO_PULSE_TIMEOUT_US = 3000000UL;
-static const uint32_t FLOW_MIN_PULSE_INTERVAL_US = 100UL;
+// YF-S201 输出约 450 脉冲/L，最高约 600 Hz。1000 us 防抖既滤除接触噪声，
+// 又不会误吞正常流量脉冲。
+static const uint32_t FLOW_MIN_PULSE_INTERVAL_US = 1000UL;
 
 // The USB cable used to upload this sketch can also carry telemetry to the
 // local computer.  Each sample is emitted as one line beginning with
@@ -117,9 +119,6 @@ static const size_t HOST_CONTROL_LINE_CAPACITY = 1024;
 // always the safe/off state. GPIO11 is reserved exclusively for this relay.
 static const uint8_t VALVE_RELAY_PIN = 11;
 static const bool VALVE_RELAY_ACTIVE_HIGH = true;
-static const uint32_t MAX_WATERING_MS = 60000;
-// 正式按升数闭环灌溉的硬超时：最长 300 秒，避免流量计故障时阀门永不关闭。
-static const uint32_t FORMAL_WATERING_MAX_MS = 300000UL;
 // 开阀后 8 秒内没有新脉冲才判定 FLOW_FAULT；0 L/min 本身不是故障。
 static const uint32_t FLOW_GRACE_MS = 8000UL;
 static const uint32_t HOST_HEARTBEAT_TIMEOUT_MS = 8000;
@@ -148,6 +147,9 @@ bool tcpClientJustConnected = false;
 uint32_t lastTcpTelemetryEmitMs = 0;
 char activeRequestId[101] = {};
 char lastRequestId[101] = {};
+// 最近一次安全关阀的原因。用于让 @IRRIGATION_STATE 在 CLOSED 状态下也反映
+// 真实关闭原因，而不是继续显示过期的“允许开阀”。
+char lastCloseReasonCode[65] = {};
 uint32_t readIntervalMs = DEFAULT_READ_INTERVAL_MS;
 char samplingMode[32] = "OFFLINE_LOGGING";
 uint32_t nextSensorReadAtMs = 0;
@@ -200,6 +202,10 @@ static const bool DISPLAY_ENABLED = false;
 // with the existing I2C, ADC or RS485 assignments.
 static const uint8_t DISPLAY_UART_RX_PIN = 12;
 static const uint8_t DISPLAY_UART_TX_PIN = 13;
+// 流量计与显示屏当前共用 GPIO12。显示屏关闭时无冲突；一旦未来启用显示屏，
+// 必须先把其中一个迁到别的空闲引脚，避免同脚复用导致信号互相干扰。
+static_assert(!DISPLAY_ENABLED || FLOW_SIGNAL_PIN != DISPLAY_UART_RX_PIN,
+              "FLOW_SIGNAL_PIN conflicts with DISPLAY_UART_RX_PIN");
 // The replacement M070 VisualTFT project staged on the TF card uses 19200
 // baud. Keep this in sync with the project loaded on the screen itself.
 static const uint32_t DISPLAY_BAUD = 19200;
@@ -545,6 +551,7 @@ bool deviceSyntheticHistoryActive = false;
 bool deviceSyntheticHistoryInjected = false;
 uint32_t deviceLastNtpAttemptMs = 0;
 uint32_t deviceLastStatusEmitMs = 0;
+uint32_t deviceLastTargetZeroEmitMs = 0;
 uint32_t deviceLastSavedSlot = UINT32_MAX;
 uint32_t deviceLastWateringEpochUtc = 0;
 uint32_t deviceValveOpenEpochUtc = 0;
@@ -864,7 +871,9 @@ void setValveRelay(bool open) {
   valveOpen = open;
   digitalWrite(VALVE_RELAY_PIN,
                open == VALVE_RELAY_ACTIVE_HIGH ? HIGH : LOW);
-  if (!open) {
+  if (open) {
+    lastCloseReasonCode[0] = '\0';
+  } else {
     valveCloseAtMs = 0;
     valveRequiresHostHeartbeat = true;
     valveOpenedByLocalAuto = false;
@@ -906,6 +915,8 @@ static FlowMeterReading readFlowMeter() {
   reading.frequencyHz = signalRecent && periodUs > 0
                             ? 1000000.0f / static_cast<float>(periodUs)
                             : 0.0f;
+  // 频率超过 600 Hz 视为接触噪声，按 0 处理，避免瞬间虚高流量错误关阀。
+  if (reading.frequencyHz > 600.0f) reading.frequencyHz = 0.0f;
   reading.flowRateLpm = reading.frequencyHz / FLOW_HZ_PER_LPM;
   reading.totalLiters = static_cast<float>(pulseCount) / FLOW_PULSES_PER_LITER;
   return reading;
@@ -1134,6 +1145,8 @@ void closeValveForSafety(const char *reason) {
   if (!valveOpen) return;
   char requestId[sizeof(activeRequestId)];
   strlcpy(requestId, activeRequestId, sizeof(requestId));
+  strlcpy(lastCloseReasonCode, reason == nullptr ? "" : reason,
+          sizeof(lastCloseReasonCode));
   setValveRelay(false);
   // Keep legacy controllers working, then publish the v2 state immediately so
   // the dashboard reflects both voice- and web-initiated automatic closure.
@@ -1267,10 +1280,21 @@ void serviceUsbControl() {
 
 static bool deviceFinite(float value) { return isfinite(value) != 0; }
 
+// deviceForecast 由推理任务在 deviceStateMux 临界区内整块改写。返回一份原子
+// 快照，避免读取端观测到半更新的“撕裂”预报。
+static DeviceForecastState deviceForecastSnapshot() {
+  DeviceForecastState copy = {};
+  portENTER_CRITICAL(&deviceStateMux);
+  copy = deviceForecast;
+  portEXIT_CRITICAL(&deviceStateMux);
+  return copy;
+}
+
 // V_target = ET0 * Kc * A / η（单位：L）。ET0 来自下一小时预报，其余参数
 // 优先读取农田档案，异常时回退到演示默认值。
 static float deviceComputeTargetLiters() {
-  const float et0 = deviceForecast.nextHourEt0Mm;
+  const DeviceForecastState forecast = deviceForecastSnapshot();
+  const float et0 = forecast.nextHourEt0Mm;
   if (!deviceFinite(et0) || et0 <= 0.0f) return 0.0f;
   float area = 0.01f, kc = 1.15f, efficiency = 0.90f;
   CloudGatewayInstance.readFarmNumber("plotAreaM2", area);
@@ -1610,15 +1634,24 @@ void emitDeviceIrrigationState(const char *requestId) {
   JsonDocument document;
   document["schemaVersion"] = "2.0";
   document["requestId"] = requestId == nullptr ? "" : requestId;
+  const bool closedForReason = !valveOpen && lastCloseReasonCode[0] != '\0';
   document["state"] = valveOpen ? "OPEN" : "CLOSED";
   document["accepted"] = true;
-  document["action"] = latestIrrigationEvaluation.shouldOpenValve ? "START_WATERING" : "NO_OP";
+  document["action"] = closedForReason ? "STOP_WATERING"
+                                       : (latestIrrigationEvaluation.shouldOpenValve
+                                              ? "START_WATERING"
+                                              : "NO_OP");
   document["automaticMode"] = DeviceRuntimeInstance.automaticModeEnabled();
   document["valveState"] = valveOpen ? "OPEN" : "CLOSED";
-  document["candidate"] = latestIrrigationEvaluation.candidate;
-  document["shouldOpen"] = latestIrrigationEvaluation.shouldOpenValve;
-  document["reasonCode"] = deviceIrrigationReasonText(latestIrrigationEvaluation.reason);
-  document["reason"] = deviceIrrigationReasonText(latestIrrigationEvaluation.reason);
+  document["candidate"] = closedForReason ? false : latestIrrigationEvaluation.candidate;
+  document["shouldOpen"] = closedForReason ? false
+                                           : latestIrrigationEvaluation.shouldOpenValve;
+  document["reasonCode"] = closedForReason
+                               ? lastCloseReasonCode
+                               : deviceIrrigationReasonText(latestIrrigationEvaluation.reason);
+  document["reason"] = closedForReason
+                           ? lastCloseReasonCode
+                           : deviceIrrigationReasonText(latestIrrigationEvaluation.reason);
   document["remainingSeconds"] = valveOpen && valveCloseAtMs > millis()
                                       ? (valveCloseAtMs - millis() + 999) / 1000
                                       : 0;
@@ -1835,18 +1868,19 @@ static void deviceBuildCloudContext(String &context) {
     trends["dataEnd"] = deviceIsoUtc(endEpoch);
   }
 
+  const DeviceForecastState forecastSnapshot = deviceForecastSnapshot();
   JsonObject forecast = document["forecast"].to<JsonObject>();
-  forecast["status"] = deviceForecast.status;
-  forecast["generatedAt"] = deviceIsoUtc(deviceForecast.generatedEpochUtc);
+  forecast["status"] = forecastSnapshot.status;
+  forecast["generatedAt"] = deviceIsoUtc(forecastSnapshot.generatedEpochUtc);
   forecast["requiredSamples"] = DEVICE_RUNTIME_RING_CAPACITY;
-  forecast["availableSamples"] = deviceForecast.availableSamples;
+  forecast["availableSamples"] = forecastSnapshot.availableSamples;
   JsonArray forecastPoints = forecast["forecast"].to<JsonArray>();
-  if (deviceForecast.valid) {
+  if (forecastSnapshot.valid) {
     for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
       JsonObject point = forecastPoints.add<JsonObject>();
-      point["timestamp"] = deviceIsoUtc(deviceForecast.timestampsUtc[index]);
-      point["et0Mm"] = deviceForecast.et0Mm[index];
-      point["soilMoisturePercent"] = deviceForecast.soilMoisturePercent[index];
+      point["timestamp"] = deviceIsoUtc(forecastSnapshot.timestampsUtc[index]);
+      point["et0Mm"] = forecastSnapshot.et0Mm[index];
+      point["soilMoisturePercent"] = forecastSnapshot.soilMoisturePercent[index];
     }
   }
 
@@ -1878,7 +1912,7 @@ static void deviceBuildCloudContext(String &context) {
   irrigationCandidate["eligible"] = candidate;
   if (candidateRule != nullptr) irrigationCandidate["rule"] = candidateRule;
   irrigationCandidate["moisturePercent"] = latestDeviceSample.soilMoisturePercent;
-  irrigationCandidate["forecastReady"] = deviceForecast.valid;
+  irrigationCandidate["forecastReady"] = forecastSnapshot.valid;
   context = "";
   serializeJson(document, context);
 }
@@ -1895,15 +1929,16 @@ static bool deviceCloudIrrigationCandidate(const char **rule) {
     if (rule != nullptr) *rule = "SEVERE_DRY";
     return true;
   }
-  if (!deviceForecast.valid) return false;
+  const DeviceForecastState forecast = deviceForecastSnapshot();
+  if (!forecast.valid) return false;
   const float endMoisture =
-      deviceForecast.soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1];
+      forecast.soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1];
   float minimumMoisture = 100.0f;
-  for (float value : deviceForecast.soilMoisturePercent) {
+  for (float value : forecast.soilMoisturePercent) {
     minimumMoisture = min(minimumMoisture, value);
   }
   const bool declining = endMoisture < moisture;
-  const bool highEt0 = deviceForecast.nextHourEt0Mm >= DEVICE_RUNTIME_ET0_TRIGGER_MM;
+  const bool highEt0 = forecast.nextHourEt0Mm >= DEVICE_RUNTIME_ET0_TRIGGER_MM;
   if (moisture < DEVICE_RUNTIME_SOIL_TRIGGER_PERCENT && (declining || highEt0)) {
     if (rule != nullptr) *rule = "DECLINING_OR_HIGH_ET0";
     return true;
@@ -2011,18 +2046,19 @@ static bool deviceManualStartAllowed(uint32_t durationSeconds,
   input.clockValid = deviceClockValid;
   input.nowEpochUtc = latestDeviceSample.epochUtc;
   input.sensors = latestDeviceSample;
-  input.prediction.valid = deviceForecast.valid;
-  input.prediction.complete = deviceForecast.valid;
+  const DeviceForecastState forecast = deviceForecastSnapshot();
+  input.prediction.valid = forecast.valid;
+  input.prediction.complete = forecast.valid;
   input.prediction.pointCount = DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
   input.prediction.horizonMinutes = 60;
   input.prediction.finalSoilMoisturePercent =
-      deviceForecast.soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1];
+      forecast.soilMoisturePercent[DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR - 1];
   input.prediction.minimumSoilMoisturePercent = 100.0f;
   for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
     input.prediction.minimumSoilMoisturePercent = min(
-        input.prediction.minimumSoilMoisturePercent, deviceForecast.soilMoisturePercent[index]);
+        input.prediction.minimumSoilMoisturePercent, forecast.soilMoisturePercent[index]);
   }
-  input.prediction.nextHourEt0Mm = deviceForecast.nextHourEt0Mm;
+  input.prediction.nextHourEt0Mm = forecast.nextHourEt0Mm;
   input.valveState = valveOpen ? DEVICE_VALVE_OPEN : DEVICE_VALVE_CLOSED;
   input.valveDriverHealthy = true;
   input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
@@ -2168,6 +2204,12 @@ void handleDeviceUiCommand(const char *json) {
         return;
       }
     }
+    if (strcmp(action, "START_WATERING") == 0 &&
+        (duration < 1 || duration > DEVICE_RUNTIME_SINGLE_WATERING_SECONDS)) {
+      emitDeviceUiAck(requestId, false, action, "invalid_duration");
+      emitDeviceIrrigationState(requestId);
+      return;
+    }
     const bool allowed = strcmp(action, "CONFIRM_WATERING") == 0
                              ? deviceConfirmedCloudStartAllowed(duration, requestId)
                              : deviceManualStartAllowed(duration, requestId);
@@ -2194,7 +2236,9 @@ void handleDeviceUiCommand(const char *json) {
     valveOpenedByLocalAuto = false;
     valveCountsForFormalCooldown = true;
     setValveRelay(true);
-    valveCloseAtMs = millis() + FORMAL_WATERING_MAX_MS;
+    // 正式灌溉仍以目标升数为主要控制量；按命令时长设置最终硬超时，避免
+    // 流量计故障时阀门永不关闭。duration 已在 1..60 秒范围内校验。
+    valveCloseAtMs = millis() + duration * 1000UL;
     lastHostHeartbeatMs = millis();
     pendingCloudWateringRequestId[0] = '\0';
     emitDeviceUiAck(requestId, true, action, "started");
@@ -2479,14 +2523,15 @@ void serviceDeviceRuntime() {
   input.clockValid = deviceClockValid;
   input.nowEpochUtc = latestDeviceSample.epochUtc;
   input.sensors = latestDeviceSample;
-  input.prediction.valid = deviceForecast.valid;
-  input.prediction.complete = deviceForecast.valid;
+  const DeviceForecastState forecast = deviceForecastSnapshot();
+  input.prediction.valid = forecast.valid;
+  input.prediction.complete = forecast.valid;
   input.prediction.pointCount = DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
   input.prediction.horizonMinutes = 60;
-  input.prediction.finalSoilMoisturePercent = deviceForecast.soilMoisturePercent[11];
+  input.prediction.finalSoilMoisturePercent = forecast.soilMoisturePercent[11];
   input.prediction.minimumSoilMoisturePercent = 100.0f;
-  for (float value : deviceForecast.soilMoisturePercent) input.prediction.minimumSoilMoisturePercent = min(input.prediction.minimumSoilMoisturePercent, value);
-  input.prediction.nextHourEt0Mm = deviceForecast.nextHourEt0Mm;
+  for (float value : forecast.soilMoisturePercent) input.prediction.minimumSoilMoisturePercent = min(input.prediction.minimumSoilMoisturePercent, value);
+  input.prediction.nextHourEt0Mm = forecast.nextHourEt0Mm;
   input.valveState = DEVICE_VALVE_CLOSED;
   input.valveDriverHealthy = true;
   input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
@@ -2495,7 +2540,13 @@ void serviceDeviceRuntime() {
     const char *requestId = "local-auto";
     const float targetLiters = deviceComputeTargetLiters();
     if (targetLiters <= 0.0f) {
-      emitDeviceIrrigationState(requestId);
+      // 自动分支每个 loop 迭代都会执行；目标水量为 0 时只节流上报一次，
+      // 避免刷爆串口，并补充一条 UI 确认便于调试。
+      if (millis() - deviceLastTargetZeroEmitMs >= DEVICE_STATUS_INTERVAL_MS) {
+        deviceLastTargetZeroEmitMs = millis();
+        emitDeviceUiAck(requestId, false, "START_WATERING", "target_volume_zero");
+        emitDeviceIrrigationState(requestId);
+      }
       return;
     }
     const FlowMeterReading flow = readFlowMeter();
@@ -2511,7 +2562,8 @@ void serviceDeviceRuntime() {
     valveOpenedByLocalAuto = true;
     valveCountsForFormalCooldown = true;
     setValveRelay(true);
-    valveCloseAtMs = millis() + FORMAL_WATERING_MAX_MS;
+    // 自动灌溉同样以目标升数闭环，durationSeconds 来自本地安全评估（60 秒）。
+    valveCloseAtMs = millis() + latestIrrigationEvaluation.durationSeconds * 1000UL;
     emitDeviceIrrigationState(requestId);
   }
 }
@@ -4036,10 +4088,17 @@ void setup() {
   SoilSerial.begin(SOIL_BAUD, SERIAL_8N1, SOIL_UART_RX_PIN, SOIL_UART_TX_PIN);
   SolarSerial.begin(SOLAR_BAUD, SERIAL_8N1, SOLAR_RS485_RX_PIN, SOLAR_RS485_TX_PIN);
   if (FLOW_METER_ENABLED) {
-    pinMode(FLOW_SIGNAL_PIN, INPUT);
-    attachInterrupt(digitalPinToInterrupt(FLOW_SIGNAL_PIN), onFlowPulse, RISING);
-    Serial.printf("YF-S201 flow meter: signal=GPIO%d, calibration=%.1f Hz per L/min\n",
-                  FLOW_SIGNAL_PIN, FLOW_HZ_PER_LPM);
+    // 脉冲输出为开漏/集电极开路型，内部上拉保证悬空时电平稳定，避免误计数。
+    pinMode(FLOW_SIGNAL_PIN, INPUT_PULLUP);
+    const uint8_t flowInterrupt = digitalPinToInterrupt(FLOW_SIGNAL_PIN);
+    if (flowInterrupt == NOT_AN_INTERRUPT) {
+      Serial.printf("YF-S201 flow meter: GPIO%d does not support interrupts.\n",
+                    FLOW_SIGNAL_PIN);
+    } else {
+      attachInterrupt(flowInterrupt, onFlowPulse, RISING);
+      Serial.printf("YF-S201 flow meter: signal=GPIO%d, calibration=%.1f Hz per L/min\n",
+                    FLOW_SIGNAL_PIN, FLOW_HZ_PER_LPM);
+    }
   }
   if (VOICE_UART_ENABLED) {
     VoiceSerial.begin(VOICE_UART_BAUD, SERIAL_8N1,
