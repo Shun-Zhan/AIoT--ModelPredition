@@ -702,7 +702,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   function setValue(id, value, unit, digits) {
     el(id).innerHTML = number(value, has(digits) ? digits : 1) + ' <span class="unit">' + unit + '</span>';
   }
-  function forecastChart(points, key, digits, color, unit, label) {
+  function forecastChart(points, key, digits, color, unit, label, chartType) {
+    chartType = chartType || 'line';
     var values = [], i;
     for (i = 0; i < points.length; i++) {
       var raw = Number(points[i][key]);
@@ -715,7 +716,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     var plotWidth = width - left - right, plotHeight = height - top - bottom;
     var minimum = Math.min.apply(Math, values), maximum = Math.max.apply(Math, values);
     var padding = Math.max((maximum - minimum) * 0.16, key === 'et0Mm' ? 0.002 : 0.4);
-    var yMin = Math.max(key === 'et0Mm' ? 0 : -Infinity, minimum - padding);
+    var yMin = chartType === 'bar'
+      ? 0
+      : Math.max(key === 'et0Mm' ? 0 : -Infinity, minimum - padding);
     var yMax = maximum + padding;
     if (yMax === yMin) yMax = yMin + 1;
     var svg = [], coords = [];
@@ -730,10 +733,21 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       var y = top + (yMax - values[i]) / (yMax - yMin) * plotHeight;
       coords.push(x.toFixed(1) + ',' + y.toFixed(1));
     }
-    svg.push('<polyline points="' + coords.join(' ') + '" fill="none" stroke="' + color + '" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>');
-    for (i = 0; i < values.length; i++) {
-      var parts = coords[i].split(',');
-      svg.push('<circle cx="' + parts[0] + '" cy="' + parts[1] + '" r="4.5" fill="' + color + '" class="chart-point"><title>未来 ' + ((i + 1) * 5) + ' 分钟：' + values[i].toFixed(digits) + ' ' + unit + '</title></circle>');
+    if (chartType === 'bar') {
+      var slotWidth = plotWidth / values.length;
+      var barWidth = Math.max(8, slotWidth * 0.58);
+      var zeroY = top + (yMax - yMin) / (yMax - yMin) * plotHeight;
+      for (i = 0; i < values.length; i++) {
+        var barX = left + slotWidth * i + (slotWidth - barWidth) / 2;
+        var barY = top + (yMax - values[i]) / (yMax - yMin) * plotHeight;
+        svg.push('<rect x="' + barX.toFixed(1) + '" y="' + barY.toFixed(1) + '" width="' + barWidth.toFixed(1) + '" height="' + Math.max(1, zeroY - barY).toFixed(1) + '" rx="4" fill="' + color + '" class="chart-bar"><title>未来 ' + ((i + 1) * 5) + ' 分钟：' + values[i].toFixed(digits) + ' ' + unit + '</title></rect>');
+      }
+    } else {
+      svg.push('<polyline points="' + coords.join(' ') + '" fill="none" stroke="' + color + '" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>');
+      for (i = 0; i < values.length; i++) {
+        var parts = coords[i].split(',');
+        svg.push('<circle cx="' + parts[0] + '" cy="' + parts[1] + '" r="4.5" fill="' + color + '" class="chart-point"><title>未来 ' + ((i + 1) * 5) + ' 分钟：' + values[i].toFixed(digits) + ' ' + unit + '</title></circle>');
+      }
     }
     var xTicks = [0, Math.floor((values.length - 1) / 2), values.length - 1];
     var seen = {};
@@ -759,8 +773,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     empty.hidden = true;
     charts.hidden = false;
     el('forecastSummary').hidden = false;
-    el('et0ForecastChart').innerHTML = forecastChart(points, 'et0Mm', 3, '#6C63FF', 'mm', 'ET₀');
-    el('soilForecastChart').innerHTML = forecastChart(points, 'soilMoisturePercent', 1, '#167B72', '%', '土壤湿度');
+    el('et0ForecastChart').innerHTML = forecastChart(points, 'et0Mm', 3, '#6C63FF', 'mm', 'ET₀', 'bar');
+    el('soilForecastChart').innerHTML = forecastChart(points, 'soilMoisturePercent', 1, '#167B72', '%', '土壤湿度', 'line');
     var first = points[0], last = points[points.length - 1];
     el('forecastSummary').textContent =
       '未来 1 小时累计 ET₀：' + number(points.reduce(function (sum, point) { return sum + Number(point.et0Mm || 0); }, 0), 3) + ' mm'
@@ -1941,6 +1955,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     .chart-grid { stroke: rgba(107, 114, 128, .22); stroke-width: 1; stroke-dasharray: 4 5; }
     .chart-axis, .chart-unit, .chart-empty { fill: var(--muted); font-size: 11px; font-family: inherit; }
     .chart-unit { font-size: 10px; font-weight: 650; }
+    .chart-bar { opacity: .82; transition: opacity .16s ease; }
+    .chart-bar:hover { opacity: 1; }
     .chart-point { stroke: var(--bg); stroke-width: 2; }
     .forecast-summary { margin-top: 14px; padding: 11px 14px; border-radius: 15px; box-shadow: var(--shadow-inset); color: var(--text); font-size: 13px; font-weight: 650; text-align: center; }
     .forecast-empty { padding: 34px 18px; border-radius: 20px; box-shadow: var(--shadow-inset); color: var(--muted); text-align: center; font-size: 14px; }
@@ -2128,8 +2144,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div id="forecastEmpty" class="forecast-empty">收到实时遥测后先显示演示趋势；积累连续 288 个五分钟数据点后自动切换为正式模型预测。</div>
       <div id="forecastCharts" class="forecast-charts" hidden>
         <div class="forecast-panel">
-          <div class="forecast-panel-title"><span>ET₀ 预测</span><span class="forecast-legend"><span class="forecast-dot"></span><span id="et0ForecastLegend">N-BEATS</span></span></div>
-          <svg id="et0ForecastChart" class="forecast-svg" viewBox="0 0 640 220" role="img" aria-label="未来一小时 ET₀ 预测曲线"></svg>
+          <div class="forecast-panel-title"><span>ET₀ 预测 · 每 5 分钟</span><span class="forecast-legend"><span class="forecast-dot"></span><span id="et0ForecastLegend">N-BEATS</span></span></div>
+          <svg id="et0ForecastChart" class="forecast-svg" viewBox="0 0 640 220" role="img" aria-label="未来一小时每五分钟 ET₀ 预测"></svg>
         </div>
         <div class="forecast-panel">
           <div class="forecast-panel-title"><span>土壤湿度预测</span><span class="forecast-legend"><span class="forecast-dot soil"></span><span id="soilForecastLegend">LSTM</span></span></div>

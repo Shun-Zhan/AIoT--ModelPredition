@@ -290,8 +290,11 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "analyzeStatus" in html
     assert "et0ForecastChart" in html
     assert "soilForecastChart" in html
-    assert "未来一小时 ET₀ 预测曲线" in html
+    assert "未来一小时每五分钟 ET₀ 预测" in html
     assert "forecastChart(points" in app_js.text
+    assert "chartType === 'bar'" in app_js.text
+    assert "'ET₀', 'bar'" in app_js.text
+    assert "'土壤湿度', 'line'" in app_js.text
     assert "renderForecastCharts(forecastPoints)" in app_js.text
     assert "电脑端本地边缘网关 · ESP32 安全执行" not in html
     assert "font-size: 34px" in html
