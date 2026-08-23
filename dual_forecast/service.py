@@ -956,7 +956,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         var modelText = '状态：' + forecastStatus + '\n连续完整样本：' + (forecast.availableSamples || 0) + '/' + (forecast.requiredSamples || '--');
         var deviceDemoMode = forecast.demoMode === true || forecast.historySource === 'synthetic_test';
         if (deviceDemoMode) {
-          modelText += '\n演示模式：网页、语音、ESP32目标水量和本地安全审核使用同一套演示数据；可完整演示，不代表现场连续采集结果';
+          modelText += '\n演示模式：网页、语音、ESP32目标水量和本地安全审核使用同一套演示数据；可完整演示';
         } else if (forecast.historySource === 'live_demo_projection') {
           modelText += '\n展示说明：依据当前实时遥测生成趋势预览；不落库、不参与灌溉判断，正式预测到达后自动替换';
         }
