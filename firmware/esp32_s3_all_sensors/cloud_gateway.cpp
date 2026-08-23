@@ -262,12 +262,13 @@ bool CloudGateway::submit(const CloudGatewayRequest &request) {
     return false;
   }
 
-  CloudGatewayResult validation;
-  resetResult(validation);
-  validation.type = request.type;
-  copyText(validation.requestId, sizeof(validation.requestId), request.requestId);
-  if (!validateRequest(request, validation)) {
-    _result = validation;
+  // CloudGatewayResult is several kilobytes because it also stores the
+  // bounded cloud answer/evidence strings. Keep validation in the object
+  // instead of placing another large copy on the Arduino loop task stack.
+  resetResult(_result);
+  _result.type = request.type;
+  copyText(_result.requestId, sizeof(_result.requestId), request.requestId);
+  if (!validateRequest(request, _result)) {
     _resultReady = true;
     return false;
   }
@@ -422,8 +423,8 @@ bool CloudGateway::buildOpenAiRequest(String &payload) const {
   context["constraints"]["farmProfile"] = farmProfile.as<JsonObjectConst>();
   if (_pendingType == CLOUD_GATEWAY_ANALYSIS) {
     // The expiry is embedded before the potentially two-minute HTTPS call.
-    // Leave another minute for the operator to review and confirm the result.
-    const time_t expiryEpoch = time(nullptr) + 180;
+    // Leave a bounded 15-minute review window for a human demonstration.
+    const time_t expiryEpoch = time(nullptr) + 15 * 60;
     struct tm expiryUtc = {};
     gmtime_r(&expiryEpoch, &expiryUtc);
     char expiryText[CLOUD_GATEWAY_EXPIRES_AT_CAPACITY] = {};

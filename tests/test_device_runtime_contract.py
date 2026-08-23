@@ -132,7 +132,7 @@ def test_manual_debug_valve_pulse_is_explicit_fixed_and_does_not_weaken_formal_g
     debug_block = firmware[debug_start:formal_start]
 
     assert "duration != 5UL" in debug_block
-    assert "deviceSyntheticHistoryBlocksValve" in debug_block
+    assert "deviceSyntheticHistoryBlocksValve" not in debug_block
     assert "valve_already_open" in debug_block
     assert "DEVICE_RUNTIME_DAILY_WATERING_LIMIT_SECONDS" not in debug_block
     assert '"daily_limit"' not in debug_block
@@ -142,6 +142,15 @@ def test_manual_debug_valve_pulse_is_explicit_fixed_and_does_not_weaken_formal_g
     formal_block = firmware[formal_start:]
     assert "deviceManualStartAllowed" in formal_block
     assert "valveCountsForFormalCooldown = true" in formal_block
+
+
+def test_synthetic_demo_history_does_not_lock_unified_valve_controls():
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+
+    assert "deviceSyntheticHistoryBlocksValve" not in firmware
+    assert '"synthetic_history_test_valve_locked"' not in firmware
 
 
 def test_voice_open_valve_uses_debug_path_but_voice_start_uses_formal_path():
@@ -207,6 +216,15 @@ def test_first_cloud_request_waits_for_complete_sensor_sample():
     assert runtime_update < cycle_block.index("serviceUsbControl()")
     assert runtime_update < cycle_block.index("sendTelemetry(snapshot, edgePrediction)")
     assert cycle_block.count("processDeviceRuntimeSample(snapshot)") == 1
+
+
+def test_zero_soil_moisture_is_valid_sensor_input():
+    firmware = (
+        ROOT / "firmware" / "esp32_s3_all_sensors" / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+
+    assert "soilMoisturePercent > 0.0f" not in firmware
+    assert firmware.count("soilMoisturePercent >= 0.0f") == 5
 
 
 def test_cloud_confirmation_reuses_cloud_candidate_gates_without_prediction_only_rejection():

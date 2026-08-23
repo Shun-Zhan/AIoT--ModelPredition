@@ -70,12 +70,14 @@ def test_worker_api_does_not_force_network_work_into_loop():
     assert "bool pollResult(CloudGatewayResult &result);" in header
     assert "do not call it from loop()" in header
     assert "bool CloudGateway::runWorkerOnce()" in source
+    assert "CloudGatewayResult validation;" not in source
+    assert "resetResult(_result);" in source
     assert "WiFi.status() != WL_CONNECTED" in source
     assert "offlineFallback" in header + source
     assert "CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS = 120000UL" in header
     assert "explicit CloudGateway(uint32_t timeoutMs = CLOUD_GATEWAY_DEFAULT_TIMEOUT_MS)" in header
     assert "CloudGateway::CloudGateway(uint32_t timeoutMs)" in source
-    assert "time(nullptr) + 180" in source
+    assert "time(nullptr) + 15 * 60" in source
 
 
 def test_portal_cloud_save_returns_small_closed_response_without_network_call():

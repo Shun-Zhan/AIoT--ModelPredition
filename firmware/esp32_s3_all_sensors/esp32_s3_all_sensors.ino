@@ -41,7 +41,8 @@
 #include "device_runtime.h"
 #include "edge_model.h"
 
-// Synthetic history exists only for a controlled, relay-locked bench test.
+// Synthetic history is an explicit demonstration fixture. It is only enabled
+// by a compile-time flag and never changes the device's unified valve rules.
 // A generated fixture file may be present in a working tree, so its presence
 // must never turn a deployed field device into test mode by accident.
 #ifndef AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE
@@ -103,6 +104,10 @@ static const char *USB_UI_ACK_PREFIX = "@UI_ACK ";
 static const char *USB_FORECAST_PREFIX = "@FORECAST ";
 static const char *USB_IRRIGATION_STATE_PREFIX = "@IRRIGATION_STATE ";
 static const char *USB_CLOUD_RESULT_PREFIX = "@CLOUD_RESULT ";
+// Keep a completed cloud recommendation visible and confirmable long enough
+// for a human demonstration, while still requiring a fresh analysis after
+// the bounded review window expires.
+static const uint32_t DEVICE_CLOUD_DECISION_TTL_SECONDS = 15UL * 60UL;
 static const char *USB_ACK_PREFIX = "@ACK ";
 static const char *USB_CONFIG_PREFIX = "@CONFIG ";
 static const char *USB_CONFIG_ACK_PREFIX = "@CONFIG_ACK ";
@@ -595,7 +600,6 @@ static void handleVoiceCommand(uint8_t commandId);
 static bool deviceReadTrustedEpoch(uint32_t &epochUtc);
 static const char *deviceClockSourceText();
 static void deviceTryInjectSyntheticHistory();
-static bool deviceSyntheticHistoryBlocksValve();
 static bool deviceRunModelInference(edge_model::ModelOutput &result);
 static bool deviceCloudIrrigationCandidate(const char **rule = nullptr);
 static bool deviceCloudInputReady();
@@ -1746,7 +1750,7 @@ void emitDeviceCloudResult(const CloudGatewayResult &result) {
   const bool cloudCandidate = deviceCloudIrrigationCandidate();
   const bool sensorsValid = latestDeviceSample.validityMask ==
                                 DEVICE_SENSOR_ALL_REQUIRED_VALID &&
-                            latestDeviceSample.soilMoisturePercent > 0.0f &&
+                            latestDeviceSample.soilMoisturePercent >= 0.0f &&
                             latestDeviceSample.soilMoisturePercent <= 100.0f;
   const bool durationValid = !startSuggested ||
                              (result.durationSeconds >= 1 &&
@@ -1766,7 +1770,8 @@ void emitDeviceCloudResult(const CloudGatewayResult &result) {
     strlcpy(pendingCloudWateringRequestId, result.requestId,
             sizeof(pendingCloudWateringRequestId));
     pendingCloudWateringDurationSeconds = result.durationSeconds;
-    pendingCloudWateringExpiresAtMs = millis() + 55UL * 1000UL;
+    pendingCloudWateringExpiresAtMs =
+        millis() + DEVICE_CLOUD_DECISION_TTL_SECONDS * 1000UL;
   }
   document["status"] = result.status == CLOUD_GATEWAY_OK
                            ? ((startSuggested || stopSuggested) && localAccepted
@@ -1845,7 +1850,7 @@ static void deviceBuildCloudContext(String &context) {
   current["airPressureHpa"] = latestDeviceSample.airPressureHpa;
   current["allSensorsValid"] =
       latestDeviceSample.validityMask == DEVICE_SENSOR_ALL_REQUIRED_VALID &&
-      latestDeviceSample.soilMoisturePercent > 0.0f &&
+      latestDeviceSample.soilMoisturePercent >= 0.0f &&
       latestDeviceSample.soilMoisturePercent <= 100.0f;
   current["fresh"] = true;
 
@@ -1960,7 +1965,7 @@ static bool deviceCloudIrrigationCandidate(const char **rule) {
   if (rule != nullptr) *rule = nullptr;
   const bool sensorsValid =
       latestDeviceSample.validityMask == DEVICE_SENSOR_ALL_REQUIRED_VALID &&
-      latestDeviceSample.soilMoisturePercent > 0.0f &&
+      latestDeviceSample.soilMoisturePercent >= 0.0f &&
       latestDeviceSample.soilMoisturePercent <= 100.0f;
   if (!sensorsValid) return false;
   const float moisture = latestDeviceSample.soilMoisturePercent;
@@ -1992,7 +1997,7 @@ static bool deviceCloudIrrigationCandidate(const char **rule) {
 
 static bool deviceCloudInputReady() {
   return latestDeviceSample.validityMask == DEVICE_SENSOR_ALL_REQUIRED_VALID &&
-         latestDeviceSample.soilMoisturePercent > 0.0f &&
+         latestDeviceSample.soilMoisturePercent >= 0.0f &&
          latestDeviceSample.soilMoisturePercent <= 100.0f;
 }
 
@@ -2060,25 +2065,23 @@ static bool deviceSubmitCloud(CloudGatewayRequestType type, const char *requestI
 }
 
 static void deviceSubmitPendingCloudWhenReady() {
-  if (pendingCloudAnalysisRequestId[0] == '\0' || !deviceCloudInputReady()) return;
+  if (pendingCloudAnalysisRequestId[0] == '\0' || !deviceCloudInputReady() ||
+      CloudGatewayInstance.busy() || CloudGatewayInstance.hasResult()) {
+    return;
+  }
   char requestId[CLOUD_GATEWAY_REQUEST_ID_CAPACITY] = {};
   char question[CLOUD_GATEWAY_QUESTION_CAPACITY] = {};
   strlcpy(requestId, pendingCloudAnalysisRequestId, sizeof(requestId));
   strlcpy(question, pendingCloudAnalysisQuestion, sizeof(question));
   const CloudGatewayRequestType type = pendingCloudAnalysisType;
-  pendingCloudAnalysisRequestId[0] = '\0';
-  pendingCloudAnalysisQuestion[0] = '\0';
-  deviceSubmitCloud(type, requestId, question);
+  if (deviceSubmitCloud(type, requestId, question)) {
+    pendingCloudAnalysisRequestId[0] = '\0';
+    pendingCloudAnalysisQuestion[0] = '\0';
+  }
 }
 
 static bool deviceManualStartAllowed(uint32_t durationSeconds,
                                      const char *requestId) {
-  if (deviceSyntheticHistoryBlocksValve()) {
-    emitDeviceUiAck(requestId, false, "START_WATERING",
-                    "synthetic_history_test_valve_locked");
-    emitDeviceIrrigationState(requestId);
-    return false;
-  }
   DeviceRuntimeConfig config = DeviceRuntimeInstance.config();
   config.automaticModeEnabled = true;
   DeviceIrrigationInput input = {};
@@ -2129,7 +2132,7 @@ static bool deviceConfirmedCloudStartAllowed(uint32_t durationSeconds,
   const bool candidate = deviceCloudIrrigationCandidate();
   const bool sensorsValid = latestDeviceSample.validityMask ==
                                 DEVICE_SENSOR_ALL_REQUIRED_VALID &&
-                            latestDeviceSample.soilMoisturePercent > 0.0f &&
+                            latestDeviceSample.soilMoisturePercent >= 0.0f &&
                             latestDeviceSample.soilMoisturePercent <= 100.0f;
   const bool durationValid = durationSeconds >= 1 &&
                              durationSeconds <= DEVICE_RUNTIME_SINGLE_WATERING_SECONDS;
@@ -2160,12 +2163,6 @@ void handleDeviceUiCommand(const char *json) {
   const bool voiceSource = strcmp(document["source"] | "", "voice") == 0;
   if (strcmp(action, "SET_AUTO_MODE") == 0) {
     const bool enabled = document["enabled"] | false;
-    if (enabled && deviceSyntheticHistoryBlocksValve()) {
-      emitDeviceUiAck(requestId, false, action,
-                      "synthetic_history_test_valve_locked");
-      emitDeviceIrrigationState(requestId);
-      return;
-    }
     DeviceRuntimeInstance.setAutomaticModeEnabled(enabled);
     emitDeviceUiAck(requestId, true, action, enabled ? "enabled" : "disabled");
     emitDeviceIrrigationState(requestId);
@@ -2197,11 +2194,6 @@ void handleDeviceUiCommand(const char *json) {
     // irrigation and is deliberately fixed at five seconds. Keep the hard
     // actuator protections that remain meaningful without a model forecast.
     const uint32_t duration = document["durationSeconds"] | 0UL;
-    if (deviceSyntheticHistoryBlocksValve()) {
-      emitDeviceUiAck(requestId, false, action,
-                      "synthetic_history_test_valve_locked");
-      return;
-    }
     if (duration != 5UL) {
       emitDeviceUiAck(requestId, false, action, "debug_duration_must_be_5s");
       return;
@@ -2413,10 +2405,6 @@ void initDeviceRuntime() {
   }
 }
 
-static bool deviceSyntheticHistoryBlocksValve() {
-  return deviceSyntheticHistoryActive;
-}
-
 static void deviceTryInjectSyntheticHistory() {
 #if AIOT_TEST_HISTORY_FIXTURE_ENABLED
   // The bench path runs the model inline so it can diagnose the kernel even
@@ -2521,7 +2509,7 @@ static void deviceTryInjectSyntheticHistory() {
 static void deviceServiceNtp() {
   if (!wifiReady || WiFi.status() != WL_CONNECTED) return;
   if (!deviceNtpStarted) {
-    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    configTime(0, 0, "time.cloudflare.com", "pool.ntp.org", "time.google.com");
     deviceNtpStarted = true;
     deviceLastNtpAttemptMs = millis();
   }
@@ -2543,6 +2531,10 @@ static void deviceServiceNtp() {
 
 void serviceDeviceRuntime() {
   deviceServiceNtp();
+  // A cloud request received just after Wi-Fi association may have been held
+  // until NTP made TLS validation safe. Retry it immediately after clock sync,
+  // without waiting for the next five-minute sensor slot.
+  deviceSubmitPendingCloudWhenReady();
   deviceTryInjectSyntheticHistory();
   CloudGatewayResult cloudResult = {};
   if (CloudGatewayInstance.pollResult(cloudResult)) {

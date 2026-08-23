@@ -458,6 +458,18 @@ def _send_heartbeat(connection: Any) -> None:
     connection.write(b"@HEARTBEAT\n")
 
 
+def _send_time_sync(connection: Any) -> None:
+    """Give the ESP32 a trusted UTC value before it starts HTTPS/TLS."""
+    payload = {
+        "schemaVersion": "2.0",
+        "requestId": "host-time-" + str(int(time.time() * 1000)),
+        "action": "SET_TIME",
+        "epochUtc": int(time.time()),
+    }
+    line = "@UI_COMMAND " + json.dumps(payload, separators=(",", ":")) + "\n"
+    connection.write(line.encode("utf-8"))
+
+
 def receive_esp32(args: argparse.Namespace) -> None:
     """Keep one TCP connection to ESP32 and forward sampled messages to FastAPI."""
     state = _ReceiverState()
@@ -505,6 +517,7 @@ def receive_esp32(args: argparse.Namespace) -> None:
                     pending_text = ""
                     next_control_at = 0.0
                     print("Connected. Receiving ESP32 telemetry.")
+                    _send_time_sync(writer)
 
                     while True:
                         now = time.monotonic()
@@ -577,6 +590,7 @@ def receive_esp32_serial(args: argparse.Namespace) -> None:
                 # USB-UART bridge more likely to reset.  This matches the TCP
                 # receiver's two-second control cadence.
                 next_control_at = 0.0
+                _send_time_sync(connection)
                 while True:
                     now = time.monotonic()
                     if now >= next_control_at:

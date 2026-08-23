@@ -265,6 +265,11 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "本次云端 AI 返回" in html
     assert "等待 ESP32 完成云端分析" in app_js.text
     assert "pendingCloudRequestId" in app_js.text
+    assert "dashboardRefreshSequence" in app_js.text
+    assert "cloudRefreshSequence" in app_js.text
+    assert "refreshSequence !== dashboardRefreshSequence" in app_js.text
+    assert "refreshSequence !== cloudRefreshSequence" in app_js.text
+    assert "请求已发送，正在等待 ESP32 完成本次 LLM 分析。" in app_js.text
     assert "isGovernanceOnlyDecision" in app_js.text
     assert "该历史结果混淆了灌溉建议与硬件执行权限" in app_js.text
     assert "云端把执行权限误作灌溉依据，结果已被系统拒绝" in app_js.text

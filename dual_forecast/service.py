@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import math
 import os
 import struct
 import threading
@@ -127,6 +128,32 @@ def demo_forecast_from_live_snapshot(snapshot: dict | None) -> dict | None:
     }
 
 
+def _device_forecast_is_usable(forecast: dict | None) -> bool:
+    """Return whether a device forecast contains real, displayable points."""
+    if not isinstance(forecast, dict) or forecast.get("status") != "ok":
+        return False
+    points = forecast.get("forecast")
+    if not isinstance(points, list) or not points:
+        return False
+    for point in points:
+        if not isinstance(point, dict):
+            return False
+        timestamp = point.get("timestamp")
+        if not timestamp:
+            return False
+        try:
+            parsed_timestamp = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            et0 = float(point.get("et0Mm"))
+            soil_moisture = float(point.get("soilMoisturePercent"))
+        except (TypeError, ValueError):
+            return False
+        if parsed_timestamp.year <= 1970 or not math.isfinite(et0) or not math.isfinite(soil_moisture):
+            return False
+        if et0 < 0 or not 0 <= soil_moisture <= 100:
+            return False
+    return True
+
+
 def qr_png(url: str, *, border: int = 2, pixel_size: int = 6) -> bytes:
     """Create a QR PNG without Pillow so a fresh install stays self-contained."""
     code = qrcode.QRCode(border=border)
@@ -162,6 +189,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         "last_live_snapshot": None,
         "last_automatic_analysis_at": None,
         "next_automatic_analysis_at": None,
+        "auto_reanalysis_session": None,
     }
     stop_periodic = threading.Event()
     wake_periodic = threading.Event()
@@ -224,6 +252,41 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         except (TypeError, ValueError):
             return None
 
+    def auto_reanalyze_after_device_restart(
+        session_started_at: datetime | None,
+        current_result: dict | None,
+        historical_result: dict | None,
+    ) -> None:
+        """Refresh the cloud analysis once after a device reboot.
+
+        A reboot invalidates the old actuator authorization, but the dashboard
+        should recover the analysis workflow automatically for demonstrations.
+        The new request still ends in the normal human-confirmation path.
+        """
+        if (
+            not device_authoritative
+            or session_started_at is None
+            or current_result is not None
+            or historical_result is None
+        ):
+            return
+        live = current_live_snapshot()
+        runtime = live.get("cloudRuntime") if live else None
+        if not isinstance(runtime, dict) or runtime.get("enabled") is not True:
+            return
+        session_key = session_started_at.isoformat()
+        if state["auto_reanalysis_session"] == session_key:
+            return
+        # Mark before enqueueing so two browser refreshes cannot create two
+        # requests for the same reboot boundary.
+        state["auto_reanalysis_session"] = session_key
+        queued = store.latest_command("CLOUD_ANALYZE")
+        if queued:
+            queued_at = datetime.fromisoformat(queued["queuedAt"].replace("Z", "+00:00"))
+            if queued_at >= session_started_at:
+                return
+        queue_device_command("CLOUD_ANALYZE", reasonCode="AUTO_REANALYZE_AFTER_RESTART")
+
     def device_cloud_display_state() -> tuple[dict | None, dict | None]:
         """Return request-correlated cloud/decision state for the UI.
 
@@ -232,9 +295,23 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         older cached result must never be presented as the new analysis.
         """
         session_started_at = device_session_started_at()
+        raw_latest = store.latest_device_result("cloud_result")
         latest = active_device_cloud_decision(
             store.latest_device_result("cloud_result", not_before=session_started_at)
         )
+        auto_reanalyze_after_device_restart(session_started_at, latest, raw_latest)
+        # Keep a result from a previous device boot visible as history. It is
+        # deliberately downgraded to an expired, non-executable decision so a
+        # reboot can never make an old cloud recommendation open the valve.
+        if latest is None and raw_latest is not None:
+            historical = active_device_cloud_decision(raw_latest)
+            if historical is not None:
+                historical["status"] = "expired"
+                historical["finalAction"] = "NO_OP"
+                historical["safetyReasons"] = [
+                    "ESP32 已重启或当前运行周期已变化，请重新请求云端分析"
+                ]
+                latest = historical
         analyze = store.latest_command("CLOUD_ANALYZE")
         if analyze:
             queued_at = datetime.fromisoformat(analyze["queuedAt"].replace("Z", "+00:00"))
@@ -242,7 +319,10 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                 analyze = None
         if analyze:
             queued_at = datetime.fromisoformat(analyze["queuedAt"].replace("Z", "+00:00"))
-            result_missing = latest is None or latest.get("requestId") != analyze["requestId"]
+            current_result = active_device_cloud_decision(
+                store.latest_device_result("cloud_result", not_before=session_started_at)
+            )
+            result_missing = current_result is None or current_result.get("requestId") != analyze["requestId"]
             request_age = (datetime.now(timezone.utc) - queued_at).total_seconds()
             if result_missing and request_age <= DEVICE_CLOUD_RESULT_GRACE_SECONDS:
                 pending = {
@@ -463,6 +543,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   var analyzeStatusTimer = null;
   var pendingCloudRequestId = '';
   var pendingCloudStartedAt = 0;
+  var dashboardRefreshSequence = 0;
+  var cloudRefreshSequence = 0;
   var lastRenderedDecisionId = '';
   var modeSwitchBusy = false;
   var tcpLastReceivedAt = '';
@@ -475,6 +557,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   function has(value) { return value !== null && value !== undefined; }
   function number(value, digits) {
     return has(value) && isFinite(Number(value)) ? Number(value).toFixed(digits) : '--';
+  }
+  function volumeText(value) {
+    if (!has(value) || !isFinite(Number(value))) return '--';
+    var milliliters = Number(value) * 1000;
+    var digits = Math.abs(milliliters) < 100 ? 3 : (Math.abs(milliliters) < 1000 ? 2 : 1);
+    return milliliters.toFixed(digits) + ' mL';
   }
   function setValue(id, value, unit, digits) {
     el(id).innerHTML = number(value, has(digits) ? digits : 1) + ' <span class="unit">' + unit + '</span>';
@@ -666,7 +754,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     }
   }
   function refresh() {
+    var refreshSequence = ++dashboardRefreshSequence;
     request('GET', '/v1/dashboard/latest', null, function (data) {
+      if (refreshSequence !== dashboardRefreshSequence) return;
       var s = data.snapshot;
       if (!s) {
         el('connection').textContent = '等待 ESP32 数据';
@@ -703,7 +793,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       var flow = s.flow || {};
       setValue('flowRate', flow.ok ? flow.flowRateLpm : null, 'L/min', 2);
       el('flowTotal').textContent = flow.ok
-        ? '累计：' + number(flow.totalLiters, 3) + ' L　·　脉冲：' + number(flow.pulseCount, 0)
+        ? '累计：' + volumeText(flow.totalLiters) + '　·　脉冲：' + number(flow.pulseCount, 0)
         : '等待流量计数据';
       el('solarNote').textContent = s.solarSource === 'measured_reflection'
         ? '净短波 = 入射 − 反射（实测）'
@@ -725,7 +815,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         else if (forecastStatus === 'model_unavailable') forecastStatus = '模型未就绪';
         var modelText = '状态：' + forecastStatus + '\n连续完整样本：' + (forecast.availableSamples || 0) + '/' + (forecast.requiredSamples || '--');
         if (forecast.historySource === 'synthetic_test') {
-          modelText += '\n测试历史：伪造数据，仅验证模型链路；水阀已锁定';
+          modelText += '\n演示历史：使用仓库内完整样本展示模型链路；水阀仍按统一安全流程控制';
         } else if (forecast.historySource === 'live_demo_projection') {
           modelText += '\n展示说明：依据当前实时遥测生成趋势预览；不落库、不参与灌溉判断，正式预测到达后自动替换';
         }
@@ -820,9 +910,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       var irrigation = data.deviceIrrigationState || {};
       var hasClosedLoop = irrigation.wateringControlMode === 'volume_closed_loop';
       var volumeParts = [];
-      if (has(irrigation.targetLiters)) volumeParts.push('目标：' + number(irrigation.targetLiters, 2) + ' L');
-      if (has(irrigation.deliveredLiters)) volumeParts.push('已灌溉：' + number(irrigation.deliveredLiters, 2) + ' L');
-      if (has(irrigation.remainingLiters)) volumeParts.push('剩余：' + number(irrigation.remainingLiters, 2) + ' L');
+      if (has(irrigation.targetLiters)) volumeParts.push('目标：' + volumeText(irrigation.targetLiters));
+      if (has(irrigation.deliveredLiters)) volumeParts.push('已灌溉：' + volumeText(irrigation.deliveredLiters));
+      if (has(irrigation.remainingLiters)) volumeParts.push('剩余：' + volumeText(irrigation.remainingLiters));
       if (has(irrigation.flowRateLpm)) volumeParts.push('当前流量：' + number(irrigation.flowRateLpm, 2) + ' L/min');
       if (has(irrigation.flowPulseCount)) volumeParts.push('脉冲：' + number(irrigation.flowPulseCount, 0));
       if (hasClosedLoop) volumeParts.push('按目标升数闭环');
@@ -1111,7 +1201,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     }
   }
   function refreshCloud() {
+    var refreshSequence = ++cloudRefreshSequence;
     request('GET', '/v1/cloud/status', null, function (data) {
+      if (refreshSequence !== cloudRefreshSequence) return;
       var decision = data.decision, actuator = data.actuator || {}, cloud = data.latestCall || data.cloud || null;
       var deviceRequestPending = !!(data.cloudRuntime && data.cloudRuntime.requestPending);
       var analysisPending = !!pendingCloudRequestId || deviceRequestPending || (cloud && cloud.status === 'pending');
@@ -1130,6 +1222,25 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         pendingCloudRequestId = '';
         pendingCloudStartedAt = 0;
         finishAnalyze('error', '等待 ESP32 云端回执超时；请查看设备网络和串口/TCP 接收器日志。');
+      }
+      // A status request started before the button click can finish after the
+      // click and still contain the previous irrigation state. Keep the
+      // browser view bound to the request that the user just submitted until
+      // the device publishes a result carrying the same requestId.
+      if (pendingCloudRequestId) {
+        if (!cloud || cloud.requestId !== pendingCloudRequestId || cloud.status !== 'pending') {
+          cloud = {
+            schemaVersion: '2.0', status: 'pending',
+            requestId: pendingCloudRequestId, action: null,
+            proposedAction: null, finalAction: null,
+            reason: '请求已发送，正在等待 ESP32 完成本次 LLM 分析。',
+            safetyReasons: []
+          };
+        }
+        if (!decision || decision.requestId !== pendingCloudRequestId || decision.status !== 'pending') {
+          decision = cloud;
+        }
+        analysisPending = true;
       }
       var confirm = el('confirm');
       var automatic = data.autoIrrigation || {};
@@ -1884,7 +1995,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       <div id="confirmStatus" class="meta" aria-live="polite"></div>
       <div class="actuator-debug">
         <div class="decision-section-title">水阀调试（本地安全模式）</div>
-        <div class="meta">调试开阀固定 5 秒，不参与正式灌溉预测、15 分钟冷却和累计统计；仍保留水阀状态、重复请求和设备测试锁保护。关阀指令可随时下发。</div>
+        <div class="meta">调试开阀固定 5 秒，不参与正式灌溉预测、15 分钟冷却和累计统计；仍保留水阀状态、重复请求和设备自身安全保护。关阀指令可随时下发。</div>
         <div class="decision-actions">
           <button id="debugOpenValve" class="hold debug-hold" type="button">长按 1.5 秒调试开阀 5 秒</button>
           <button id="debugCloseValve" class="secondary" type="button">调试关阀</button>
@@ -1969,11 +2080,16 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         live_snapshot = current_live_snapshot() if device_authoritative else (
                 current_live_snapshot() or store.latest_snapshot()
             )
-        selected_forecast = device_forecast or (
+        reference_forecast = (
             reference_response.model_dump(mode="json") if reference_response else None
         )
-        if not selected_forecast or not selected_forecast.get("forecast"):
-            selected_forecast = demo_forecast_from_live_snapshot(live_snapshot) or selected_forecast
+        if _device_forecast_is_usable(device_forecast):
+            selected_forecast = device_forecast
+        elif not device_authoritative and _device_forecast_is_usable(reference_forecast):
+            selected_forecast = reference_forecast
+        else:
+            candidate_forecast = device_forecast or reference_forecast
+            selected_forecast = demo_forecast_from_live_snapshot(live_snapshot) or candidate_forecast
         cloud_decision = cloud_decision_state if cloud_decision_state and (
             cloud_decision_state.get("status") == "pending"
             or cloud_decision_state.get("action")

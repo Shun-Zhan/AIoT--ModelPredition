@@ -18,6 +18,20 @@ arduino-cli compile \
   firmware/esp32_s3_all_sensors
 ```
 
+### 评委演示固件
+
+需要立即展示未来一小时正式模型曲线时，在编译命令上增加演示宏。设备会加载仓库内 288 条演示历史并运行真实 N-BEATS/SoilLSTM；演示历史只改变模型历史来源，不锁定水阀。网页和语音仍进入 ESP32 统一控制流程：打开水阀为固定 5 秒调试脉冲，开始灌溉仍执行正式安全审核。演示结束后重新编译生产固件即可恢复真实采集：
+
+```bash
+arduino-cli compile \
+  --fqbn 'esp32:esp32:adafruit_feather_esp32s3_nopsram:PartitionScheme=default_8MB,CDCOnBoot=default,UploadMode=default' \
+  --build-path /tmp/aiot-esp32-demo-build \
+  --build-property 'compiler.cpp.extra_flags=-DAIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE=1' \
+  firmware/esp32_s3_all_sensors
+```
+
+演示固件烧录后，网页中的模型状态应显示 `预测正常`、`288/288`，历史来源显示为演示数据；这不是实时传感器历史，但仍可用于现场展示统一的网页/语音控制流程。正式灌溉是否开阀仍由 ESP32 本地安全审核决定。
+
 ## 引脚与接线
 
 | 功能 | ESP32-S3 | 外设侧 | 说明 |
@@ -70,7 +84,9 @@ YF-S201 流量计：红线接稳定 5 V，黑线接电源 GND 并与 ESP32 共�
 
 配网页面保存 Wi-Fi 凭据，以及云端开关、模型名、农田档案和 API Key。云端 Key 只保存在 ESP32 NVS：页面只显示是否已配置，绝不回显、写日志、出现在遥测或提交到 Git。空 Key 更新保留旧 Key；清除是显式操作。
 
-设备通过 HTTPS 直接调用火山引擎网关，并验证根证书；禁止使用 `setInsecure()`。云端网络/TLS/JSON/服务失败时只返回离线状态，采集、预测和本地安全闭环继续运行。正式部署前应作废历史聊天、终端或截图中泄露过的 Key。
+设备通过 HTTPS 直接调用火山引擎网关，并验证根证书；禁止使用 `setInsecure()`。云端网络/TLS/JSON/服务失败时只返回离线状态，采集、预测和本地安全闭环继续运行。灌溉建议返回后保留 15 分钟人工确认窗口，过期后必须重新分析，不能用旧建议直接开阀。正式部署前应作废历史聊天、终端或截图中泄露过的 Key。
+
+电脑接收器每次建立 USB/TCP 连接都会先向 ESP32 发送一次 `SET_TIME`，避免刚连上热点时 NTP 尚未完成导致 HTTPS 证书校验失败；设备也会自行从多个 NTP 服务器重试。若串口出现 `LittleFS mount failed (-84)`，说明离线历史分区已损坏，不是豆包网络错误。先导出还能读取的记录，然后通过串口发送**明确的** `@OFFLINE_LOG_ERASE CONFIRM` 清空并重新格式化分区，再重新测试云端；固件不会在启动时静默擦除历史数据。
 
 ## 与 Dashboard 的协议
 

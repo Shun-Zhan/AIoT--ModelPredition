@@ -8,7 +8,7 @@ import dual_forecast.service as service_module
 from dual_forecast.config import SETTINGS
 from dual_forecast.irrigation import IrrigationService
 from dual_forecast.schemas import SensorSnapshot
-from dual_forecast.schemas import DeviceCloudResult, DeviceForecast, DeviceIrrigationState
+from dual_forecast.schemas import DeviceCloudResult, DeviceForecast, DeviceIrrigationState, ForecastResponse
 from dual_forecast.service import create_app, demo_forecast_from_live_snapshot
 from dual_forecast.storage import Store
 
@@ -136,6 +136,7 @@ def test_device_analysis_hides_cached_result_until_matching_llm_result(tmp_path,
         SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
     )
     store = Store(settings.database_path)
+    previous_boot_result_at = datetime.now(timezone.utc) - timedelta(minutes=10)
     store.save_device_cloud_result(DeviceCloudResult(
         schemaVersion="2.0", status="awaiting_confirmation", requestId="old-result",
         action="START_WATERING", proposedAction="START_WATERING",
@@ -274,6 +275,78 @@ def test_live_telemetry_refreshes_dashboard_without_storing_model_sample(tmp_pat
     assert client.get("/v1/forecast/latest").status_code == 404
 
 
+def test_dashboard_replaces_warming_up_placeholder_points_with_demo_preview(tmp_path):
+    settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
+    store = Store(settings.database_path)
+    store.save_device_forecast(DeviceForecast(
+        schemaVersion="2.0", generatedAt="1970-01-01T00:00:00Z", status="warming_up",
+        modelVersion="nbeats-et0-v1", availableSamples=7, requiredSamples=288,
+        forecast=[
+            {"timestamp": "1970-01-01T00:00:00Z", "et0Mm": 0.0, "soilMoisturePercent": 0.0}
+            for _ in range(12)
+        ],
+    ))
+    client = TestClient(create_app(settings))
+    live_payload = payload()
+
+    assert client.post("/v1/telemetry/live", json=live_payload).status_code == 200
+    latest = client.get("/v1/dashboard/latest").json()
+
+    assert latest["forecast"]["status"] == "demo_preview"
+    assert latest["forecast"]["historySource"] == "live_demo_projection"
+    assert latest["forecast"]["displayOnly"] is True
+    assert len(latest["forecast"]["forecast"]) == 12
+    assert latest["deviceForecast"]["status"] == "warming_up"
+    assert latest["deviceForecast"]["availableSamples"] == 7
+
+
+def test_dashboard_keeps_valid_device_forecast_over_demo_preview(tmp_path):
+    settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
+    store = Store(settings.database_path)
+    store.save_device_forecast(DeviceForecast(
+        schemaVersion="2.0", generatedAt="2026-08-23T01:00:00Z", status="ok",
+        modelVersion="nbeats-et0-v1", availableSamples=288, requiredSamples=288,
+        forecast=[
+            {"timestamp": "2026-08-23T01:05:00Z", "et0Mm": 0.01, "soilMoisturePercent": 42.0}
+        ],
+    ))
+    client = TestClient(create_app(settings))
+    live_payload = payload()
+
+    assert client.post("/v1/telemetry/live", json=live_payload).status_code == 200
+    latest = client.get("/v1/dashboard/latest").json()
+
+    assert latest["forecast"]["status"] == "ok"
+    assert latest["forecast"]["historySource"] is None
+    assert latest["forecast"]["forecast"][0]["soilMoisturePercent"] == 42.0
+
+
+def test_legacy_desktop_mode_keeps_valid_reference_forecast_when_device_is_warming_up(tmp_path):
+    settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
+    store = Store(settings.database_path)
+    store.save_device_forecast(DeviceForecast(
+        schemaVersion="2.0", generatedAt="1970-01-01T00:00:00Z", status="warming_up",
+        availableSamples=7, requiredSamples=288,
+        forecast=[
+            {"timestamp": "1970-01-01T00:00:00Z", "et0Mm": 0.0, "soilMoisturePercent": 0.0}
+            for _ in range(12)
+        ],
+    ))
+    client = TestClient(create_app(settings))
+    live_payload = payload()
+    assert client.post("/v1/telemetry/live", json=live_payload).status_code == 200
+
+    store.save_forecast(ForecastResponse(
+        status="ok", generatedAt="2026-08-23T01:00:00Z", requiredSamples=288,
+        availableSamples=288,
+        forecast=[{"timestamp": "2026-08-23T01:05:00Z", "et0Mm": 0.02, "soilMoisturePercent": 45.0}],
+    ))
+    latest = client.get("/v1/dashboard/latest").json()
+
+    assert latest["forecast"]["status"] == "ok"
+    assert latest["forecast"]["forecast"][0]["soilMoisturePercent"] == 45.0
+
+
 def test_demo_forecast_requires_live_soil_and_et0_and_is_bounded():
     assert demo_forecast_from_live_snapshot(None) is None
     assert demo_forecast_from_live_snapshot({"soil": {"moisturePercent": 50}}) is None
@@ -347,6 +420,9 @@ def test_dashboard_renders_volume_closed_loop_and_flow_fault(tmp_path):
     assert "按目标升数闭环" in app_js
     assert "8 秒内无流量" in app_js
     assert "volume_closed_loop" in app_js
+    assert "function volumeText(value)" in app_js
+    assert "volumeText(irrigation.targetLiters)" in app_js
+    assert "milliliters.toFixed(digits) + ' mL'" in app_js
 
 
 def test_device_dashboard_marks_old_rejection_as_expired_not_current_safety(tmp_path, monkeypatch):
@@ -370,7 +446,7 @@ def test_device_dashboard_marks_old_rejection_as_expired_not_current_safety(tmp_
     assert body["decision"]["finalAction"] == "NO_OP"
 
 
-def test_device_reboot_hides_cloud_rejection_from_previous_boot(tmp_path, monkeypatch):
+def test_device_reboot_keeps_previous_cloud_result_as_non_executable_history(tmp_path, monkeypatch):
     monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
     settings = replace(
         SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
@@ -393,10 +469,46 @@ def test_device_reboot_hides_cloud_rejection_from_previous_boot(tmp_path, monkey
     latest = client.get("/v1/dashboard/latest").json()
     status = client.get("/v1/cloud/status").json()
 
-    assert latest["cloud"] is None
-    assert latest["deviceCloudResult"] is None
-    assert status["latestCall"] is None
-    assert status["decision"] is None
+    assert latest["cloud"]["status"] == "expired"
+    assert latest["cloud"]["finalAction"] == "NO_OP"
+    assert "重新请求云端分析" in latest["cloud"]["safetyReasons"][0]
+    assert latest["deviceCloudResult"]["status"] == "expired"
+    assert status["latestCall"]["status"] == "expired"
+    assert status["decision"]["status"] == "expired"
+    assert status["decision"]["finalAction"] == "NO_OP"
+
+
+def test_device_reboot_automatically_queues_one_fresh_cloud_analysis(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
+    )
+    store = Store(settings.database_path)
+    previous_boot_result_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    store.save_device_cloud_result(DeviceCloudResult(
+        schemaVersion="2.0", status="awaiting_confirmation", requestId="previous-boot",
+        action="START_WATERING", proposedAction="START_WATERING", finalAction="START_WATERING",
+        durationSeconds=30, reason="soil is dry",
+        expiresAt=(datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
+    ), previous_boot_result_at)
+    live = payload()
+    live["uptimeMs"] = 5_000
+    live["receivedAt"] = datetime.now(timezone.utc).isoformat()
+    live["cloudRuntime"] = {
+        "initialized": True, "enabled": True,
+        "apiKeyConfigured": True, "requestPending": False,
+    }
+
+    client = TestClient(create_app(settings))
+    assert client.post("/v1/telemetry/live", json=live).status_code == 200
+    latest = client.get("/v1/dashboard/latest").json()
+
+    assert latest["decision"]["status"] == "pending"
+    queued = store.latest_command("CLOUD_ANALYZE")
+    assert queued is not None
+    assert queued["command"]["reasonCode"] == "AUTO_REANALYZE_AFTER_RESTART"
+    client.get("/v1/dashboard/latest")
+    assert store.latest_command("CLOUD_ANALYZE")["requestId"] == queued["requestId"]
 
 
 def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):

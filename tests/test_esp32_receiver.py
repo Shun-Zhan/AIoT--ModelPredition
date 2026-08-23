@@ -8,6 +8,7 @@ from dual_forecast.esp32_receiver import (
     _handle_config_ack_line,
     _send_pending_commands,
     _send_pending_configs,
+    _send_time_sync,
     esp32_message_to_snapshot,
     parse_discovery_announcement,
     parse_device_result_line,
@@ -17,6 +18,24 @@ from dual_forecast.esp32_receiver import (
 )
 from dual_forecast.storage import Store
 from dual_forecast.schemas import DeviceCloudResult, DeviceForecast, DeviceIrrigationState, DeviceUiAck
+
+
+def test_time_sync_command_is_a_non_secret_ui_command():
+    class Writer:
+        def __init__(self):
+            self.data = b""
+
+        def write(self, data):
+            self.data += data
+
+    writer = Writer()
+    _send_time_sync(writer)
+    line = writer.data.decode("utf-8").strip()
+    assert line.startswith("@UI_COMMAND ")
+    payload = json.loads(line.removeprefix("@UI_COMMAND "))
+    assert payload["action"] == "SET_TIME"
+    assert payload["epochUtc"] > 1_700_000_000
+    assert "apiKey" not in payload
 
 
 def test_firmware_tcp_control_buffer_accepts_full_command_envelope():
