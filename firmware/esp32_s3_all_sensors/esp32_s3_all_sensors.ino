@@ -205,6 +205,9 @@ static const uint32_t TCP_DISCOVERY_INTERVAL_MS = 3000;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 static const uint32_t WIFI_STATUS_PRINT_INTERVAL_MS = 10000;
 static const uint32_t TCP_DISPLAY_REFRESH_INTERVAL_MS = 2000;
+// Keep the no-computer logger at its configured cadence, but sample the full
+// live snapshot at the dashboard cadence while a TCP viewer is connected.
+static const uint32_t LIVE_SENSOR_REFRESH_INTERVAL_MS = 2000;
 
 // -------------------- M-series UART display --------------------
 
@@ -1544,6 +1547,26 @@ static void deviceSetForecastStatus(const char *status) {
   portEXIT_CRITICAL(&deviceStateMux);
 }
 
+// The evaluator-facing demo keeps the soil trend visually intuitive: the
+// forecast starts at the model output and dries gradually over one hour.
+// Production builds retain the unmodified SoilLSTM output.
+static void deviceApplyDemoDryingTrend(float *values) {
+#if AIOT_DEMO_MODE
+  if (values == nullptr) return;
+  float start = values[0];
+  if (!deviceFinite(start)) start = 16.2f;
+  start = constrain(start, 0.0f, 100.0f);
+  const float end = max(start - 2.4f, 0.0f);
+  for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
+    const float progress = static_cast<float>(index + 1) /
+                           DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
+    values[index] = start + (end - start) * progress;
+  }
+#else
+  (void)values;
+#endif
+}
+
 static void deviceSetDemoForecastFallback() {
 #if AIOT_DEMO_MODE
   const uint32_t baseEpoch = latestDeviceSample.epochUtc != 0
@@ -1568,6 +1591,7 @@ static void deviceSetDemoForecastFallback() {
         DEVICE_DEMO_ET0_MM / DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
     deviceForecast.soilMoisturePercent[index] = soilMoisture;
   }
+  deviceApplyDemoDryingTrend(deviceForecast.soilMoisturePercent);
   portEXIT_CRITICAL(&deviceStateMux);
   deviceSyntheticHistoryActive = true;
 #endif
@@ -1659,6 +1683,7 @@ static void deviceInferenceTask(void *) {
         deviceForecast.soilMoisturePercent[index] =
             deviceModelOutput.soilMoisturePercent[index];
       }
+      deviceApplyDemoDryingTrend(deviceForecast.soilMoisturePercent);
       for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
         const float weight = weightSum > 0.0f ? weights[index] / weightSum : 1.0f / 12.0f;
         deviceForecast.et0Mm[index] = deviceModelOutput.et0Mm * weight;
@@ -2578,6 +2603,7 @@ static void deviceTryInjectSyntheticHistory() {
       deviceForecast.et0Mm[index] = deviceModelOutput.et0Mm /
                                     DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
     }
+    deviceApplyDemoDryingTrend(deviceForecast.soilMoisturePercent);
     strlcpy(deviceForecast.status, "ok", sizeof(deviceForecast.status));
   } else {
     deviceForecast.valid = false;
@@ -3905,6 +3931,14 @@ void acceptTcpClient() {
   TcpClient.setNoDelay(true);
   TcpClient.println("ESP32-S3 IOT sensor server ready");
   tcpClientJustConnected = true;
+  // Start a fresh live sampling cycle as soon as the dashboard connects.
+  nextSensorReadAtMs = 0;
+  // The demo forecast can be ready before the dashboard connects after boot.
+  // Replay the cached device-owned result so the dashboard never falls back
+  // to a stale forecast from its local database.
+  if (deviceForecast.valid || AIOT_DEMO_MODE) {
+    deviceForecastPendingEmit = true;
+  }
   Serial.println("[TCP] Client connected.");
 }
 
@@ -4492,7 +4526,12 @@ void loop() {
         return;
       }
     }
-    nextSensorReadAtMs = millis() + readIntervalMs;
+    const bool dashboardConnected =
+        WIFI_TELEMETRY_ENABLED && TcpClient && TcpClient.connected();
+    const uint32_t nextReadIntervalMs = dashboardConnected
+                                            ? LIVE_SENSOR_REFRESH_INTERVAL_MS
+                                            : readIntervalMs;
+    nextSensorReadAtMs = millis() + nextReadIntervalMs;
   }
   Serial.println("=================================");
 }
