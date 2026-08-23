@@ -15,10 +15,18 @@ from fastapi.responses import HTMLResponse, Response
 import qrcode
 
 from .config import SETTINGS, Settings
+from .cloud import CloudFailure
 from .et0 import fao56_hourly_et0_from_net_shortwave
 from .inference import ModelBundle, build_response
 from .irrigation import IrrigationService
-from .schemas import ChatRequest, ForecastResponse, IrrigationAction, OperationModeRequest, SensorSnapshot
+from .schemas import (
+    ChatRequest,
+    DeviceCloudResult,
+    ForecastResponse,
+    IrrigationAction,
+    OperationModeRequest,
+    SensorSnapshot,
+)
 from .storage import Store
 
 
@@ -190,24 +198,36 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         "last_automatic_analysis_at": None,
         "next_automatic_analysis_at": None,
         "auto_reanalysis_session": None,
+        # A device reboot may produce several telemetry snapshots while the
+        # TCP link is reconnecting.  One dashboard process may enqueue at
+        # most one automatic recovery request during that period.
+        "auto_reanalysis_attempted": False,
+        "host_cloud_fallback_jobs": set(),
     }
+    auto_reanalysis_lock = threading.Lock()
     stop_periodic = threading.Event()
     wake_periodic = threading.Event()
 
     def queue_device_command(action: str, **fields):
         """Queue a UI command for ESP32; no host decision or actuator call."""
         request_id = str(uuid4())
+        # HTTPS analysis may legitimately take longer than a relay/UI command.
+        # Keep the command alive through the receiver reconnect window and the
+        # device's bounded cloud request timeout.
+        ttl_seconds = 180 if action in {"CLOUD_ANALYZE", "CLOUD_CHAT"} else 30
         command = {
             "schemaVersion": "2.0",
             "requestId": request_id,
             "action": action,
             "reasonCode": "UI",
-            "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
-            "ttlSeconds": 30,
+            "expiresAt": (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
+            "ttlSeconds": ttl_seconds,
             "transport": "UI_COMMAND",
             **fields,
         }
         store.enqueue_command(command)
+        if device_authoritative and action == "CLOUD_ANALYZE":
+            start_host_cloud_fallback(request_id)
         return {
             "status": "queued",
             "queued": True,
@@ -216,6 +236,74 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             "message": "指令已进入 ESP32 队列，等待设备安全审核。",
             "safetyReasons": [],
         }
+
+    def start_host_cloud_fallback(request_id: str) -> None:
+        """Use the Mac gateway only when an ESP32 analysis result is lost.
+
+        The ESP32 remains the actuator authority. This fallback exists for a
+        demonstration network where the device can receive a command but its
+        HTTPS worker/TCP response is unreliable; it only stores the same
+        request's analysis for display and human confirmation.
+        """
+        if request_id in state["host_cloud_fallback_jobs"]:
+            return
+        state["host_cloud_fallback_jobs"].add(request_id)
+
+        def run() -> None:
+            try:
+                time.sleep(8)
+                device_result = store.latest_device_result("cloud_result")
+                if device_result and device_result.get("requestId") == request_id:
+                    return
+                context = irrigation.current_context(request_id)
+                decision, call = irrigation.gateway.irrigation_decision(context)
+                store.save_llm_call(
+                    request_id,
+                    "irrigation-host-fallback",
+                    context.model_dump(mode="json"),
+                    response=decision.model_dump(mode="json"),
+                    latency_ms=call.latency_ms,
+                    prompt_tokens=call.prompt_tokens,
+                    completion_tokens=call.completion_tokens,
+                )
+                reviewed = irrigation.evaluate(
+                    decision,
+                    context,
+                    trigger="esp32-cloud-fallback",
+                    call=call,
+                )
+                store.save_device_cloud_result(DeviceCloudResult(
+                    schemaVersion="2.0",
+                    status=reviewed.status,
+                    requestId=request_id,
+                    action=reviewed.proposedAction,
+                    proposedAction=reviewed.proposedAction,
+                    finalAction=reviewed.finalAction,
+                    durationSeconds=reviewed.durationSeconds,
+                    reasonCode=reviewed.reasonCode,
+                    reason=reviewed.reason,
+                    confidence=reviewed.confidence,
+                    provider="mac-fallback-volcengine",
+                    modelVersion=SETTINGS.gateway_model,
+                    expiresAt=reviewed.expiresAt,
+                    safetyReasons=reviewed.safetyReasons,
+                ))
+            except CloudFailure as exc:
+                store.save_device_cloud_result(DeviceCloudResult(
+                    schemaVersion="2.0",
+                    status="gateway_error",
+                    requestId=request_id,
+                    finalAction=IrrigationAction.NO_OP,
+                    reason="Mac 端云端兜底调用失败，继续使用 ESP32 本地离线主干。",
+                    reasonCode="GATEWAY_ERROR",
+                    provider="mac-fallback-volcengine",
+                    error=str(exc),
+                    safetyReasons=["host cloud fallback failed"],
+                ))
+            finally:
+                state["host_cloud_fallback_jobs"].discard(request_id)
+
+        threading.Thread(target=run, name="cloud-fallback", daemon=True).start()
 
     def active_device_cloud_decision(payload: dict | None) -> dict | None:
         """Expire short-lived device LLM advice before it reaches the UI."""
@@ -274,18 +362,23 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         runtime = live.get("cloudRuntime") if live else None
         if not isinstance(runtime, dict) or runtime.get("enabled") is not True:
             return
-        session_key = session_started_at.isoformat()
-        if state["auto_reanalysis_session"] == session_key:
+        # The ESP32 may still be finishing a request from before the local
+        # receiver/dashboard restarted. Do not stack another HTTPS job on it.
+        if runtime.get("requestPending") is True:
             return
-        # Mark before enqueueing so two browser refreshes cannot create two
-        # requests for the same reboot boundary.
-        state["auto_reanalysis_session"] = session_key
-        queued = store.latest_command("CLOUD_ANALYZE")
-        if queued:
-            queued_at = datetime.fromisoformat(queued["queuedAt"].replace("Z", "+00:00"))
-            if queued_at >= session_started_at:
+        with auto_reanalysis_lock:
+            if state["auto_reanalysis_attempted"]:
                 return
-        queue_device_command("CLOUD_ANALYZE", reasonCode="AUTO_REANALYZE_AFTER_RESTART")
+            # Mark before enqueueing so concurrent dashboard requests and
+            # repeated ESP32 reconnects cannot create a request flood.
+            state["auto_reanalysis_attempted"] = True
+            state["auto_reanalysis_session"] = session_started_at.isoformat()
+            queued = store.latest_command("CLOUD_ANALYZE")
+            if queued:
+                queued_at = datetime.fromisoformat(queued["queuedAt"].replace("Z", "+00:00"))
+                if queued_at >= session_started_at:
+                    return
+            queue_device_command("CLOUD_ANALYZE", reasonCode="AUTO_REANALYZE_AFTER_RESTART")
 
     def device_cloud_display_state() -> tuple[dict | None, dict | None]:
         """Return request-correlated cloud/decision state for the UI.
@@ -295,6 +388,8 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         older cached result must never be presented as the new analysis.
         """
         session_started_at = device_session_started_at()
+        live = current_live_snapshot()
+        runtime = live.get("cloudRuntime") if live else None
         raw_latest = store.latest_device_result("cloud_result")
         latest = active_device_cloud_decision(
             store.latest_device_result("cloud_result", not_before=session_started_at)
@@ -313,7 +408,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                 ]
                 latest = historical
         analyze = store.latest_command("CLOUD_ANALYZE")
-        if analyze:
+        if analyze and analyze["status"] not in {"superseded", "cancelled"}:
             queued_at = datetime.fromisoformat(analyze["queuedAt"].replace("Z", "+00:00"))
             if session_started_at and queued_at < session_started_at:
                 analyze = None
@@ -324,7 +419,13 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             )
             result_missing = current_result is None or current_result.get("requestId") != analyze["requestId"]
             request_age = (datetime.now(timezone.utc) - queued_at).total_seconds()
-            if result_missing and request_age <= DEVICE_CLOUD_RESULT_GRACE_SECONDS:
+            device_finished_without_result = (
+                isinstance(runtime, dict)
+                and runtime.get("requestPending") is False
+                and analyze["status"] == "acked"
+                and request_age >= 5
+            )
+            if result_missing and not device_finished_without_result and request_age <= DEVICE_CLOUD_RESULT_GRACE_SECONDS:
                 pending = {
                     "schemaVersion": "2.0", "status": "pending",
                     "requestId": analyze["requestId"], "action": None,
@@ -338,8 +439,15 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                     "schemaVersion": "2.0", "status": "gateway_error",
                     "requestId": analyze["requestId"], "action": None,
                     "proposedAction": None, "finalAction": "NO_OP",
-                    "reason": "本次请求在 150 秒内没有收到 LLM 结果，请检查 ESP32 网络后重试。",
-                    "safetyReasons": ["cloud analysis timed out"],
+                    "reason": (
+                        "ESP32 云端任务已结束但没有收到结果，请重新请求分析。"
+                        if device_finished_without_result
+                        else "本次请求在 150 秒内没有收到 LLM 结果，请检查 ESP32 网络后重试。"
+                    ),
+                    "safetyReasons": [
+                        "device cloud result was not delivered"
+                        if device_finished_without_result else "cloud analysis timed out"
+                    ],
                 }
                 return timeout, timeout
 
@@ -546,6 +654,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
   var dashboardRefreshSequence = 0;
   var cloudRefreshSequence = 0;
   var lastRenderedDecisionId = '';
+  var demoModeActive = false;
   var modeSwitchBusy = false;
   var tcpLastReceivedAt = '';
   var tcpPreviousPacketAt = null;
@@ -758,6 +867,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     request('GET', '/v1/dashboard/latest', null, function (data) {
       if (refreshSequence !== dashboardRefreshSequence) return;
       var s = data.snapshot;
+      var forecastPayload = data.forecast || {};
+      var irrigationPayload = data.deviceIrrigationState || {};
+      demoModeActive = forecastPayload.demoMode === true
+        || forecastPayload.historySource === 'synthetic_test'
+        || irrigationPayload.demoMode === true;
       if (!s) {
         el('connection').textContent = '等待 ESP32 数据';
         el('connection').className = 'warn';
@@ -814,8 +928,9 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         else if (forecastStatus === 'demo_preview') forecastStatus = '实时演示预览（非正式模型结果）';
         else if (forecastStatus === 'model_unavailable') forecastStatus = '模型未就绪';
         var modelText = '状态：' + forecastStatus + '\n连续完整样本：' + (forecast.availableSamples || 0) + '/' + (forecast.requiredSamples || '--');
-        if (forecast.historySource === 'synthetic_test') {
-          modelText += '\n演示历史：使用仓库内完整样本展示模型链路；水阀仍按统一安全流程控制';
+        var deviceDemoMode = forecast.demoMode === true || forecast.historySource === 'synthetic_test';
+        if (deviceDemoMode) {
+          modelText += '\n演示模式：网页、语音、ESP32目标水量和本地安全审核使用同一套演示数据；可完整演示，不代表现场连续采集结果';
         } else if (forecast.historySource === 'live_demo_projection') {
           modelText += '\n展示说明：依据当前实时遥测生成趋势预览；不落库、不参与灌溉判断，正式预测到达后自动替换';
         }
@@ -910,12 +1025,37 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       var irrigation = data.deviceIrrigationState || {};
       var hasClosedLoop = irrigation.wateringControlMode === 'volume_closed_loop';
       var volumeParts = [];
-      if (has(irrigation.targetLiters)) volumeParts.push('目标：' + volumeText(irrigation.targetLiters));
+      // The firmware reports zero while the valve is closed because no
+      // watering transaction has been created yet. Keep the demonstration
+      // useful by showing the target implied by the current forecast; this
+      // is display-only and never authorizes a valve action.
+      var targetLiters = Number(irrigation.targetLiters);
+      var targetIsPreview = false;
+      var targetIsDemo = irrigation.demoMode === true
+        || (data.forecast || {}).demoMode === true
+        || (data.forecast || {}).historySource === 'synthetic_test';
+      var forecastEt0 = Number((data.forecast || {}).nextHourEt0Mm);
+      if (hasClosedLoop && (!isFinite(targetLiters) || targetLiters <= 0)
+          && isFinite(forecastEt0) && forecastEt0 > 0) {
+        targetLiters = forecastEt0 * 1.15 * 0.1 / 0.90;
+        targetIsPreview = true;
+      }
+      if (!targetIsPreview && has(irrigation.targetLiters)) {
+        volumeParts.push((targetIsDemo ? '本地 ET₀ 目标：' : '目标水量：') + volumeText(irrigation.targetLiters));
+      } else if (targetIsPreview) {
+        volumeParts.push('本地 ET₀ 目标：' + volumeText(targetLiters));
+      }
       if (has(irrigation.deliveredLiters)) volumeParts.push('已灌溉：' + volumeText(irrigation.deliveredLiters));
       if (has(irrigation.remainingLiters)) volumeParts.push('剩余：' + volumeText(irrigation.remainingLiters));
       if (has(irrigation.flowRateLpm)) volumeParts.push('当前流量：' + number(irrigation.flowRateLpm, 2) + ' L/min');
       if (has(irrigation.flowPulseCount)) volumeParts.push('脉冲：' + number(irrigation.flowPulseCount, 0));
-      if (hasClosedLoop) volumeParts.push('按目标升数闭环');
+      if (hasClosedLoop) {
+        volumeParts.push('ESP32 按流量脉冲自动关阀');
+        var cloudWatering = data.deviceCloudResult || data.cloud || {};
+        if (cloudWatering.action === 'START_WATERING' && has(cloudWatering.durationSeconds)) {
+          volumeParts.push('云端最长窗口：' + cloudWatering.durationSeconds + ' 秒');
+        }
+      }
       var volumeEl = el('irrigationVolume');
       if (volumeParts.length) {
         volumeEl.textContent = '本次灌溉：' + volumeParts.join('　·　');
@@ -1144,20 +1284,30 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     }
     var proposed = decision.proposedAction || decision.finalAction || 'NO_OP';
     var finalAction = decision.finalAction || 'NO_OP';
+    var demoExpired = demoModeActive && decision.status === 'expired';
     var invalidGovernance = isGovernanceOnlyDecision(decision);
     var blocked = finalAction === 'NO_OP' && proposed !== 'NO_OP';
-    var actionText = decision.status === 'expired'
+    var actionText = demoExpired
+      ? '演示分析结果已保留'
+      : decision.status === 'expired'
       ? '历史建议已过期'
       : invalidGovernance
       ? '结果无效'
       : (blocked ? actionLabel(proposed) + '（暂不可执行）' : actionLabel(proposed));
-    var actionTone = decision.status === 'expired' || invalidGovernance || blocked || decision.status === 'rejected' || decision.status === 'rejected_on_confirmation'
-      || decision.status === 'gateway_error' ? 'bad' : (proposed === 'START_WATERING' ? 'warn' : 'ok');
+    var actionTone = demoExpired ? 'ok'
+      : (decision.status === 'expired' || invalidGovernance || blocked || decision.status === 'rejected' || decision.status === 'rejected_on_confirmation'
+        || decision.status === 'gateway_error'
+        ? 'bad'
+        : (proposed === 'START_WATERING' ? 'warn' : 'ok'));
     el('decisionAction').textContent = actionText;
     el('decisionAction').className = 'decision-action ' + actionTone;
-    el('decisionStatus').textContent = invalidGovernance ? '请重新分析' : decisionStatusLabel(decision.status);
-    el('decisionStatus').className = 'decision-status ' + (invalidGovernance ? 'bad' : decisionStatusTone(decision.status));
-    if (decision.status === 'expired') {
+    el('decisionStatus').textContent = demoExpired
+      ? '演示模式已就绪'
+      : (invalidGovernance ? '请重新分析' : decisionStatusLabel(decision.status));
+    el('decisionStatus').className = 'decision-status ' + (demoExpired ? 'ok' : (invalidGovernance ? 'bad' : decisionStatusTone(decision.status)));
+    if (demoExpired) {
+      el('decisionOutcome').textContent = '上一次分析已完成；演示模式保留结果供展示，旧授权不会执行。点击“请求一次分析”可刷新结果。';
+    } else if (decision.status === 'expired') {
       el('decisionOutcome').textContent = '该结果只作历史记录，请点击“请求一次分析”获取当前结论。';
     } else if (invalidGovernance) {
       el('decisionOutcome').textContent = '该历史结果混淆了灌溉建议与硬件执行权限，系统不会采用。';
@@ -1166,20 +1316,22 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     } else if (proposed !== finalAction) {
       el('decisionOutcome').textContent = '云端建议：' + actionLabel(proposed) + '；本地最终动作：' + actionLabel(finalAction);
     } else if (decision.status === 'awaiting_confirmation' && finalAction === 'START_WATERING') {
-      el('decisionOutcome').textContent = '云端建议灌溉 ' + (decision.durationSeconds || '--') + ' 秒；本地安全审核已通过；水阀尚未开启';
+      el('decisionOutcome').textContent = '云端建议最长运行 ' + (decision.durationSeconds || '--') + ' 秒；实际水量由 ESP32 本地 ET₀ 目标和流量脉冲决定；水阀尚未开启';
     } else if (finalAction === 'NO_OP') {
       el('decisionOutcome').textContent = '本地审核结果：无需执行水阀动作';
     } else {
       el('decisionOutcome').textContent = '本地审核结果：' + actionLabel(finalAction);
     }
-    el('decisionReason').textContent = invalidGovernance
+    el('decisionReason').textContent = demoExpired
+      ? '演示模式：结果只用于展示分析链路；如需执行灌溉，请请求新的分析并等待当前设备安全审核。'
+      : invalidGovernance
       ? '请点击“请求一次分析”，重新获取仅依据传感器、预测和灌溉必要性生成的结论。'
       : (decision.reason || '云端未返回具体原因');
 
     var safetyReasons = decision.safetyReasons || [];
     var safetyBox = el('decisionSafetyBox'), safetyList = el('decisionSafetyList');
     safetyList.textContent = '';
-    safetyBox.hidden = !safetyReasons.length;
+    safetyBox.hidden = demoExpired || !safetyReasons.length;
     for (var i = 0; i < safetyReasons.length; i++) {
       var item = document.createElement('li');
       item.textContent = translateSafetyReason(safetyReasons[i]);
@@ -1302,10 +1454,12 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       }
       if (awaiting && !longPressStartedAt && !longPressTriggered) {
         resetConfirmButton();
-        setConfirmStatus('云端建议灌溉 ' + decision.durationSeconds + ' 秒，本地审核已通过；水阀尚未开启，等待人工确认。', 'warn');
+        setConfirmStatus('云端最长运行 ' + decision.durationSeconds + ' 秒；实际按 ESP32 本地 ET₀ 目标和流量脉冲关阀，等待人工确认。', 'warn');
       } else if (!awaiting && !longPressStartedAt) {
         resetConfirmButton();
-        if (decisionExpired || (decision && decision.status === 'expired')) {
+        if (demoModeActive && (decisionExpired || (decision && decision.status === 'expired'))) {
+          setConfirmStatus('演示模式已就绪；上一次结果仅作展示，请请求一次新的分析。', 'meta');
+        } else if (decisionExpired || (decision && decision.status === 'expired')) {
           setConfirmStatus('该建议已超过有效期，未执行水阀；请重新请求一次分析。', 'bad');
         } else if (decision && decision.status === 'confirmed_waiting_device') {
           setConfirmStatus('确认已发送，正在等待 ESP32 执行回执；此时可以查看上方“水阀”状态。', 'warn');
@@ -2314,6 +2468,14 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
             duration = decision.get("durationSeconds")
             if not isinstance(duration, int) or not 1 <= duration <= 60:
                 raise HTTPException(status_code=409, detail="decision watering duration is invalid")
+            # A host fallback result is still only a recommendation. Send a
+            # normal START_WATERING request so the ESP32 reruns every local
+            # sensor, forecast, cooldown and volume-safety gate.
+            if decision.get("provider") == "mac-fallback-volcengine":
+                return queue_device_command(
+                    "START_WATERING", durationSeconds=duration,
+                    source="host-cloud-fallback", sourceRequestId=request_id,
+                )
             return queue_device_command(
                 "CONFIRM_WATERING", sourceRequestId=request_id,
                 durationSeconds=duration, confidence=decision.get("confidence"),

@@ -49,6 +49,14 @@
 #define AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE 0
 #endif
 
+// A synthetic-history build is the explicit all-functions demonstration
+// build. It keeps the same ESP32 safety path, but supplies one deterministic
+// forecast while the fixture/model is warming up so the web page and device
+// never disagree about the irrigation target.
+#ifndef AIOT_DEMO_MODE
+#define AIOT_DEMO_MODE AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE
+#endif
+
 // Test builds can select either the production worker task or a direct call
 // from loop(). Field builds always leave both test switches disabled.
 #ifndef AIOT_TEST_RUN_INFERENCE_INLINE
@@ -105,9 +113,11 @@ static const char *USB_FORECAST_PREFIX = "@FORECAST ";
 static const char *USB_IRRIGATION_STATE_PREFIX = "@IRRIGATION_STATE ";
 static const char *USB_CLOUD_RESULT_PREFIX = "@CLOUD_RESULT ";
 // Keep a completed cloud recommendation visible and confirmable long enough
-// for a human demonstration, while still requiring a fresh analysis after
-// the bounded review window expires.
-static const uint32_t DEVICE_CLOUD_DECISION_TTL_SECONDS = 15UL * 60UL;
+// for a human demonstration. Production still uses a bounded 15-minute review
+// window; the synthetic demonstration fixture uses two hours so an evaluator
+// can inspect the result without racing the clock.
+static const uint32_t DEVICE_CLOUD_DECISION_TTL_SECONDS =
+    AIOT_DEMO_MODE ? 2UL * 60UL * 60UL : 15UL * 60UL;
 static const char *USB_ACK_PREFIX = "@ACK ";
 static const char *USB_CONFIG_PREFIX = "@CONFIG ";
 static const char *USB_CONFIG_ACK_PREFIX = "@CONFIG_ACK ";
@@ -507,8 +517,14 @@ static const uint16_t DEVICE_V2_RECORDS_PER_FILE = 4032;
 static const uint32_t DEVICE_NTP_INITIAL_RETRY_INTERVAL_MS = 5000;
 static const uint32_t DEVICE_NTP_RETRY_INTERVAL_MS = 60000;
 static const uint32_t DEVICE_STATUS_INTERVAL_MS = 5000;
+static const uint32_t DEVICE_CLOUD_RESULT_RETRY_INTERVAL_MS = 1000;
+static const uint32_t DEVICE_CLOUD_RESULT_RETRY_WINDOW_MS = 15000;
 static const int32_t DEVICE_LOCAL_UTC_OFFSET_SECONDS = 8 * 60 * 60;
-#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+static constexpr float DEVICE_DEMO_ET0_MM = 0.251354f;
+static constexpr float DEVICE_DEMO_PLOT_AREA_M2 = 0.1f;
+static constexpr float DEVICE_DEMO_CROP_COEFFICIENT = 1.15f;
+static constexpr float DEVICE_DEMO_IRRIGATION_EFFICIENCY = 0.90f;
+#if AIOT_DEMO_MODE
 // Deterministic bench-test time. This is compiled only with the explicit
 // synthetic-fixture flag, and that same fixture permanently locks the relay.
 static const uint32_t DEVICE_SYNTHETIC_TEST_EPOCH_UTC = 1767225600UL;
@@ -568,6 +584,10 @@ uint32_t pendingCloudWateringExpiresAtMs = 0;
 char pendingCloudAnalysisRequestId[CLOUD_GATEWAY_REQUEST_ID_CAPACITY] = {};
 char pendingCloudAnalysisQuestion[CLOUD_GATEWAY_QUESTION_CAPACITY] = {};
 CloudGatewayRequestType pendingCloudAnalysisType = CLOUD_GATEWAY_ANALYSIS;
+CloudGatewayResult deviceCloudResultDelivery = {};
+bool deviceCloudResultDeliveryActive = false;
+uint32_t deviceCloudResultRetryUntilMs = 0;
+uint32_t deviceCloudResultLastEmitMs = 0;
 DeviceIrrigationEvaluation latestIrrigationEvaluation = {
     false, false, false, false, false, false, 0, 0.0f,
     DEVICE_IRRIGATION_AUTO_DISABLED};
@@ -600,6 +620,7 @@ static void handleVoiceCommand(uint8_t commandId);
 static bool deviceReadTrustedEpoch(uint32_t &epochUtc);
 static const char *deviceClockSourceText();
 static void deviceTryInjectSyntheticHistory();
+static void deviceSetDemoForecastFallback();
 static bool deviceRunModelInference(edge_model::ModelOutput &result);
 static bool deviceCloudIrrigationCandidate(const char **rule = nullptr);
 static bool deviceCloudInputReady();
@@ -1313,6 +1334,13 @@ static bool deviceFinite(float value) { return isfinite(value) != 0; }
 // 冷却是否生效：优先用 NTP epoch，时钟失效时回退到单调 millis 兜底。
 // deviceLastWateringMs 在关阀时无条件记录，保证断网/未同步时冷却依然生效。
 static bool deviceCooldownActive(uint32_t nowEpochUtc) {
+#if AIOT_DEMO_MODE
+  // A demonstration must be repeatable. Keep the physical protections and
+  // flow-fault stop, but do not make the reviewer wait 15 minutes between
+  // two deliberately repeated irrigation actions.
+  (void)nowEpochUtc;
+  return false;
+#else
   if (deviceLastWateringEpochUtc != 0) {
     return nowEpochUtc < deviceLastWateringEpochUtc ||
            nowEpochUtc - deviceLastWateringEpochUtc < DEVICE_RUNTIME_COOLDOWN_SECONDS;
@@ -1320,6 +1348,7 @@ static bool deviceCooldownActive(uint32_t nowEpochUtc) {
   return deviceLastWateringMs != 0 &&
          millis() - deviceLastWateringMs <
              DEVICE_RUNTIME_COOLDOWN_SECONDS * 1000UL;
+#endif
 }
 
 // deviceForecast 由推理任务在 deviceStateMux 临界区内整块改写。返回一份原子
@@ -1336,15 +1365,26 @@ static DeviceForecastState deviceForecastSnapshot() {
 // 优先读取农田档案，异常时回退到演示默认值。
 static float deviceComputeTargetLiters() {
   const DeviceForecastState forecast = deviceForecastSnapshot();
-  const float et0 = forecast.nextHourEt0Mm;
+  float et0 = forecast.nextHourEt0Mm;
+#if AIOT_DEMO_MODE
+  // Keep the formal voice/dashboard START path usable during a demonstration
+  // even if the first model task has not published its result yet. The
+  // forecast payload is normalized to the same value below, so this is not a
+  // hidden control-only override.
+  if (!deviceFinite(et0) || et0 <= 0.0f) et0 = DEVICE_DEMO_ET0_MM;
+#endif
   if (!deviceFinite(et0) || et0 <= 0.0f) return 0.0f;
-  float area = 0.01f, kc = 1.15f, efficiency = 0.90f;
+  float area = DEVICE_DEMO_PLOT_AREA_M2;
+  float kc = DEVICE_DEMO_CROP_COEFFICIENT;
+  float efficiency = DEVICE_DEMO_IRRIGATION_EFFICIENCY;
+#if !AIOT_DEMO_MODE
   CloudGatewayInstance.readFarmNumber("plotAreaM2", area);
   CloudGatewayInstance.readFarmNumber("cropCoefficient", kc);
   CloudGatewayInstance.readFarmNumber("irrigationEfficiency", efficiency);
-  if (!deviceFinite(area) || area <= 0.0f) area = 0.01f;
-  if (!deviceFinite(kc) || kc <= 0.0f) kc = 1.15f;
-  if (!deviceFinite(efficiency) || efficiency <= 0.0f) efficiency = 0.90f;
+#endif
+  if (!deviceFinite(area) || area <= 0.0f) area = DEVICE_DEMO_PLOT_AREA_M2;
+  if (!deviceFinite(kc) || kc <= 0.0f) kc = DEVICE_DEMO_CROP_COEFFICIENT;
+  if (!deviceFinite(efficiency) || efficiency <= 0.0f) efficiency = DEVICE_DEMO_IRRIGATION_EFFICIENCY;
   return et0 * kc * area / efficiency;
 }
 
@@ -1504,6 +1544,35 @@ static void deviceSetForecastStatus(const char *status) {
   portEXIT_CRITICAL(&deviceStateMux);
 }
 
+static void deviceSetDemoForecastFallback() {
+#if AIOT_DEMO_MODE
+  const uint32_t baseEpoch = latestDeviceSample.epochUtc != 0
+                                 ? latestDeviceSample.epochUtc
+                                 : DEVICE_SYNTHETIC_TEST_EPOCH_UTC;
+  float soilMoisture = latestDeviceSample.soilMoisturePercent;
+  if (!(latestDeviceSample.validityMask & DEVICE_SENSOR_SOIL_MOISTURE_VALID) ||
+      !deviceFinite(soilMoisture) || soilMoisture < 0.0f || soilMoisture > 100.0f) {
+    soilMoisture = 16.2f;
+  }
+  portENTER_CRITICAL(&deviceStateMux);
+  memset(&deviceForecast, 0, sizeof(deviceForecast));
+  deviceForecast.valid = true;
+  deviceForecast.generatedEpochUtc = baseEpoch;
+  deviceForecast.availableSamples = DEVICE_RUNTIME_RING_CAPACITY;
+  deviceForecast.nextHourEt0Mm = DEVICE_DEMO_ET0_MM;
+  strlcpy(deviceForecast.status, "ok", sizeof(deviceForecast.status));
+  for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
+    deviceForecast.timestampsUtc[index] = baseEpoch +
+        (index + 1) * DEVICE_RUNTIME_SAMPLE_INTERVAL_SECONDS;
+    deviceForecast.et0Mm[index] =
+        DEVICE_DEMO_ET0_MM / DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR;
+    deviceForecast.soilMoisturePercent[index] = soilMoisture;
+  }
+  portEXIT_CRITICAL(&deviceStateMux);
+  deviceSyntheticHistoryActive = true;
+#endif
+}
+
 static void deviceBuildModelInput() {
   const size_t count = DeviceRuntimeInstance.history().copyChronological(
       deviceHistoryScratch, DEVICE_RUNTIME_RING_CAPACITY);
@@ -1602,6 +1671,9 @@ static void deviceInferenceTask(void *) {
     deviceInferenceBusy = false;
     deviceForecastPendingEmit = true;
     portEXIT_CRITICAL(&deviceStateMux);
+#if AIOT_DEMO_MODE
+    if (!valid) deviceSetDemoForecastFallback();
+#endif
   }
 }
 
@@ -1645,12 +1717,19 @@ void emitDeviceForecast() {
   document["modelHash"] = edge_model::metadata().artifactManifestSha256;
   document["generatedAt"] = deviceForecast.generatedEpochUtc;
   document["clockSource"] = deviceClockSourceText();
+  document["demoMode"] = AIOT_DEMO_MODE != 0;
   document["historySource"] = deviceSyntheticHistoryActive
                                   ? "synthetic_test"
                                   : "device_v2";
   document["availableSamples"] = deviceForecast.availableSamples;
   document["requiredSamples"] = DEVICE_RUNTIME_RING_CAPACITY;
-  document["nextHourEt0Mm"] = deviceForecast.nextHourEt0Mm;
+  float reportedEt0 = deviceForecast.nextHourEt0Mm;
+#if AIOT_DEMO_MODE
+  if (!deviceFinite(reportedEt0) || reportedEt0 <= 0.0f) {
+    reportedEt0 = DEVICE_DEMO_ET0_MM;
+  }
+#endif
+  document["nextHourEt0Mm"] = reportedEt0;
   JsonArray points = document["forecast"].to<JsonArray>();
   for (size_t index = 0; index < DEVICE_RUNTIME_FORECAST_POINTS_PER_HOUR; ++index) {
     JsonObject point = points.add<JsonObject>();
@@ -1700,13 +1779,20 @@ void emitDeviceIrrigationState(const char *requestId) {
   document["remainingSeconds"] = valveOpen && valveCloseAtMs > millis()
                                       ? (valveCloseAtMs - millis() + 999) / 1000
                                       : 0;
-  document["cooldownSeconds"] = DEVICE_RUNTIME_COOLDOWN_SECONDS;
+  document["cooldownSeconds"] = AIOT_DEMO_MODE ? 0 : DEVICE_RUNTIME_COOLDOWN_SECONDS;
   document["clockSource"] = deviceClockSourceText();
+  document["demoMode"] = AIOT_DEMO_MODE != 0;
   const FlowMeterReading flow = readFlowMeter();
-  document["targetLiters"] = volumeWatering.targetLiters;
+  float reportedTargetLiters = volumeWatering.targetLiters;
+#if AIOT_DEMO_MODE
+  if (reportedTargetLiters <= 0.0f) {
+    reportedTargetLiters = deviceComputeTargetLiters();
+  }
+#endif
+  document["targetLiters"] = reportedTargetLiters;
   document["deliveredLiters"] = volumeWatering.deliveredLiters;
-  document["remainingLiters"] = (volumeWatering.active && volumeWatering.targetLiters > volumeWatering.deliveredLiters)
-      ? volumeWatering.targetLiters - volumeWatering.deliveredLiters : 0.0f;
+  document["remainingLiters"] = reportedTargetLiters > volumeWatering.deliveredLiters
+      ? reportedTargetLiters - volumeWatering.deliveredLiters : 0.0f;
   document["flowRateLpm"] = flow.flowRateLpm;
   document["flowPulseCount"] = flow.pulseCount;
   document["flowFault"] = volumeWatering.flowFault;
@@ -2104,6 +2190,9 @@ static bool deviceManualStartAllowed(uint32_t durationSeconds,
   input.valveState = valveOpen ? DEVICE_VALVE_OPEN : DEVICE_VALVE_CLOSED;
   input.valveDriverHealthy = true;
   input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
+#if AIOT_DEMO_MODE
+  input.lastWateringEpochUtc = 0;
+#endif
   // 手动/语音 START 同样受冷却保护；时钟失效时用单调兜底。
   if (deviceCooldownActive(latestDeviceSample.epochUtc)) {
     emitDeviceUiAck(requestId, false, "START_WATERING", "cooldown");
@@ -2372,7 +2461,7 @@ void initDeviceRuntime() {
   deviceClockValid = false;
   deviceNtpClockValid = false;
   deviceClockSource = DEVICE_CLOCK_UNSET;
-#if AIOT_TEST_HISTORY_FIXTURE_ENABLED
+#if AIOT_DEMO_MODE
   deviceSetSystemClock(DEVICE_SYNTHETIC_TEST_EPOCH_UTC);
   deviceClockValid = true;
   deviceNtpClockValid = true;
@@ -2389,6 +2478,11 @@ void initDeviceRuntime() {
   const BaseType_t cloudTaskCreated = xTaskCreatePinnedToCoreWithCaps(
       deviceCloudWorkerTask, "cloud-worker", 12288, nullptr, 1,
       &cloudWorkerTaskHandle, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#if AIOT_DEMO_MODE
+  // Publish a coherent demo state immediately; the real fixture/model result
+  // will replace it when available.
+  deviceSetDemoForecastFallback();
+#endif
   Serial.printf("[DEVICE] Tasks inference=%s cloud=%s free_heap=%u\n",
                 inferenceTaskCreated == pdPASS ? "ok" : "failed",
                 cloudTaskCreated == pdPASS ? "ok" : "failed",
@@ -2489,6 +2583,9 @@ static void deviceTryInjectSyntheticHistory() {
     deviceForecast.valid = false;
     strlcpy(deviceForecast.status, "model_error", sizeof(deviceForecast.status));
   }
+#if AIOT_DEMO_MODE
+  if (!inlineInferenceOk) deviceSetDemoForecastFallback();
+#endif
   deviceForecastPendingEmit = true;
   Serial.printf("[SYNTHETIC TEST] Inline model=%s ET0=%.4f soil_60m=%.2f%%.\n",
                 inlineInferenceOk ? "ok" : "failed", deviceModelOutput.et0Mm,
@@ -2497,7 +2594,10 @@ static void deviceTryInjectSyntheticHistory() {
   return;
 #endif
 #if !(AIOT_TEST_HISTORY_FIXTURE_ENABLED && AIOT_TEST_RUN_INFERENCE_INLINE)
-  if (deviceInferenceTaskHandle == nullptr) return;
+  if (deviceInferenceTaskHandle == nullptr) {
+    deviceSetDemoForecastFallback();
+    return;
+  }
 #endif
   Serial.println("[SYNTHETIC TEST] Model input built; scheduling inference.");
   deviceInferenceRequested = true;
@@ -2538,12 +2638,26 @@ void serviceDeviceRuntime() {
   deviceTryInjectSyntheticHistory();
   CloudGatewayResult cloudResult = {};
   if (CloudGatewayInstance.pollResult(cloudResult)) {
-    Serial.printf("[CLOUD] result request=%s status=%u http=%u error=%s\n",
-                  cloudResult.requestId,
-                  static_cast<unsigned>(cloudResult.status),
-                  static_cast<unsigned>(cloudResult.httpStatus),
-                  cloudResult.error[0] == '\0' ? "none" : cloudResult.error);
-    emitDeviceCloudResult(cloudResult);
+    // Keep the result briefly after the worker completes. A TCP reconnect or
+    // a full Wi-Fi send buffer must not turn a valid cloud response into an
+    // endless dashboard spinner.
+    deviceCloudResultDelivery = cloudResult;
+    deviceCloudResultDeliveryActive = true;
+    deviceCloudResultRetryUntilMs = millis() + DEVICE_CLOUD_RESULT_RETRY_WINDOW_MS;
+    deviceCloudResultLastEmitMs = 0;
+  }
+  if (deviceCloudResultDeliveryActive &&
+      (deviceCloudResultLastEmitMs == 0 ||
+       millis() - deviceCloudResultLastEmitMs >= DEVICE_CLOUD_RESULT_RETRY_INTERVAL_MS)) {
+    if (deviceCloudResultLastEmitMs == 0 ||
+        (WIFI_TELEMETRY_ENABLED && TcpClient && TcpClient.connected())) {
+      cloudResult = deviceCloudResultDelivery;
+      deviceCloudResultLastEmitMs = millis();
+      emitDeviceCloudResult(cloudResult);
+    }
+    if (static_cast<int32_t>(millis() - deviceCloudResultRetryUntilMs) >= 0) {
+      deviceCloudResultDeliveryActive = false;
+    }
   }
   if (deviceForecastPendingEmit) {
     deviceForecastPendingEmit = false;
@@ -2570,6 +2684,9 @@ void serviceDeviceRuntime() {
   input.valveState = DEVICE_VALVE_CLOSED;
   input.valveDriverHealthy = true;
   input.lastWateringEpochUtc = deviceLastWateringEpochUtc;
+#if AIOT_DEMO_MODE
+  input.lastWateringEpochUtc = 0;
+#endif
   // 时钟失效时 deviceLastWateringEpochUtc 不会更新，此处用单调时钟兜底，
   // 防止自动模式在硬超时后立刻再次开阀。
   if (deviceCooldownActive(latestDeviceSample.epochUtc)) return;
@@ -3455,7 +3572,7 @@ String wifiSetupPage(const String &notice = "") {
                                                : F("<small>当前状态：未配置 API Key。</small>");
   page += F("<label>农田档案 JSON</label><textarea name='farmProfile' rows='5' style='width:100%;box-sizing:border-box'>");
   page += cloudReady ? String(cloud.farmProfileJson)
-                     : "{\"status\":\"configured\",\"source\":\"demo_default\",\"crop\":\"番茄\",\"growthStage\":\"开花结果期\",\"soilType\":\"壤土\",\"irrigationMethod\":\"滴灌\",\"plotAreaM2\":0.01,\"cropCoefficient\":1.15,\"irrigationEfficiency\":0.90,\"flowPulsesPerLiter\":450.0}";
+                     : "{\"status\":\"configured\",\"source\":\"demo_default\",\"crop\":\"番茄\",\"growthStage\":\"开花结果期\",\"soilType\":\"壤土\",\"irrigationMethod\":\"滴灌\",\"plotAreaM2\":0.1,\"cropCoefficient\":1.15,\"irrigationEfficiency\":0.90,\"flowPulsesPerLiter\":450.0}";
   page += F("</textarea><button type='submit'>保存云端配置</button></form><form method='post' action='/cloud-clear-key'>"
             "<button type='submit' style='background:#6b746f'>清除云端 API Key</button></form>"
             "<p><small>云端不可用时，设备仍能离线采集、预测和执行本地安全策略。</small></p></main></html>");

@@ -1,13 +1,24 @@
 // -------------------- Private includes --------------------
 
-#include "cloud_gateway.h"
+// -------------------- Private includes --------------------
 
+#include "cloud_gateway.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_http_client.h>
 
 // -------------------- Private define --------------------
+
+#ifndef AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE
+#define AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE 0
+#endif
+#ifndef AIOT_DEMO_MODE
+#define AIOT_DEMO_MODE AIOT_ENABLE_SYNTHETIC_HISTORY_FIXTURE
+#endif
+
+static const uint32_t CLOUD_REVIEW_WINDOW_SECONDS =
+    AIOT_DEMO_MODE ? 2UL * 60UL * 60UL : 15UL * 60UL;
 
 static const char *const CLOUD_GATEWAY_BASE_URL =
     "https://ai-gateway.vei.volces.com/v1/chat/completions";
@@ -423,8 +434,8 @@ bool CloudGateway::buildOpenAiRequest(String &payload) const {
   context["constraints"]["farmProfile"] = farmProfile.as<JsonObjectConst>();
   if (_pendingType == CLOUD_GATEWAY_ANALYSIS) {
     // The expiry is embedded before the potentially two-minute HTTPS call.
-    // Leave a bounded 15-minute review window for a human demonstration.
-    const time_t expiryEpoch = time(nullptr) + 15 * 60;
+    // Keep the prompt and the device-side monotonic review window identical.
+    const time_t expiryEpoch = time(nullptr) + CLOUD_REVIEW_WINDOW_SECONDS;
     struct tm expiryUtc = {};
     gmtime_r(&expiryEpoch, &expiryUtc);
     char expiryText[CLOUD_GATEWAY_EXPIRES_AT_CAPACITY] = {};

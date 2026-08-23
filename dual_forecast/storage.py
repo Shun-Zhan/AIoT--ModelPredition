@@ -494,6 +494,10 @@ class Store:
                 "FROM command_queue ORDER BY queued_at DESC"
             ).fetchall()
         for row in rows:
+            # Superseded commands are retained for diagnostics, but must not
+            # become the current UI command after a reconnect or restart.
+            if row["status"] in {"superseded", "cancelled"}:
+                continue
             command = json.loads(row["command_json"])
             if action is not None and command.get("action") != action:
                 continue

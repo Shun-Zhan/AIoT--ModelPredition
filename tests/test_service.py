@@ -417,12 +417,15 @@ def test_dashboard_renders_volume_closed_loop_and_flow_fault(tmp_path):
     assert "flowFaultAlert" in page.text
 
     app_js = client.get("/v1/dashboard/app.js").text
-    assert "按目标升数闭环" in app_js
+    assert "ESP32 按流量脉冲自动关阀" in app_js
     assert "8 秒内无流量" in app_js
     assert "volume_closed_loop" in app_js
     assert "function volumeText(value)" in app_js
     assert "volumeText(irrigation.targetLiters)" in app_js
     assert "milliliters.toFixed(digits) + ' mL'" in app_js
+    assert "本地 ET₀ 目标：" in app_js
+    assert "云端最长窗口：" in app_js
+    assert "实际水量由 ESP32 本地 ET₀ 目标和流量脉冲决定" in app_js
 
 
 def test_device_dashboard_marks_old_rejection_as_expired_not_current_safety(tmp_path, monkeypatch):
@@ -444,6 +447,15 @@ def test_device_dashboard_marks_old_rejection_as_expired_not_current_safety(tmp_
     assert body["decision"]["status"] == "expired"
     assert body["decision"]["safetyReasons"] == ["decision has expired"]
     assert body["decision"]["finalAction"] == "NO_OP"
+
+
+def test_dashboard_has_neutral_expired_copy_for_demo_mode(tmp_path):
+    settings = replace(SETTINGS, database_path=tmp_path / "demo-ui.sqlite", artifact_dir=tmp_path / "artifacts")
+    app_js = TestClient(create_app(settings)).get("/v1/dashboard/app.js").text
+    assert "var demoModeActive = false;" in app_js
+    assert "演示分析结果已保留" in app_js
+    assert "演示模式已就绪；上一次结果仅作展示" in app_js
+    assert "safetyBox.hidden = demoExpired || !safetyReasons.length" in app_js
 
 
 def test_device_reboot_keeps_previous_cloud_result_as_non_executable_history(tmp_path, monkeypatch):
@@ -507,6 +519,7 @@ def test_device_reboot_automatically_queues_one_fresh_cloud_analysis(tmp_path, m
     queued = store.latest_command("CLOUD_ANALYZE")
     assert queued is not None
     assert queued["command"]["reasonCode"] == "AUTO_REANALYZE_AFTER_RESTART"
+    assert queued["command"]["ttlSeconds"] == 180
     client.get("/v1/dashboard/latest")
     assert store.latest_command("CLOUD_ANALYZE")["requestId"] == queued["requestId"]
 
