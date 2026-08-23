@@ -465,6 +465,32 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
                 decision["status"] = "executed"
             elif confirm["status"] == "acked" and ack.get("actualState") == "CLOSED":
                 decision["status"] = "completed"
+
+        # The device is the final authority for the physical irrigation
+        # result. A volume-closed-loop completion can arrive as an
+        # IRRIGATION_STATE packet after the cloud result (or without a
+        # matching host-side confirmation row). Do not leave the old cloud
+        # rejection/safety text on screen once the ESP32 has closed the valve
+        # after delivering water.
+        device_state = store.latest_device_result("irrigation_state") or {}
+        cloud_result_received_at = store.latest_device_result_received_at("cloud_result")
+        device_state_received_at = store.latest_device_result_received_at("irrigation_state")
+        completed_by_device = (
+            decision is not None
+            and str(device_state.get("state", "")).upper() == "CLOSED"
+            and device_state.get("reasonCode") == "volume_reached_closed"
+            and float(device_state.get("deliveredLiters") or 0.0) > 0.0
+            and str(decision.get("action") or decision.get("proposedAction")) == "START_WATERING"
+            and cloud_result_received_at is not None
+            and device_state_received_at is not None
+            and device_state_received_at >= cloud_result_received_at
+        )
+        if completed_by_device:
+            decision["status"] = "completed"
+            decision["finalAction"] = "NO_OP"
+            decision["reasonCode"] = "VOLUME_REACHED_CLOSED"
+            decision["reason"] = "本次灌溉已完成，水阀已关闭。"
+            decision["safetyReasons"] = []
         return latest, decision
 
     def current_live_snapshot() -> dict | None:
@@ -1269,6 +1295,17 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       el('decisionNextStep').hidden = true;
       return;
     }
+    // Do not put stale safety-history language in front of an evaluator. The
+    // expired record remains in the API/technical logs, but the demo surface
+    // returns to its clean waiting state until a fresh analysis arrives.
+    if (demoModeActive && decision.status === 'expired') {
+      empty.hidden = false;
+      empty.textContent = '等待新的云端分析结果。';
+      result.hidden = true;
+      el('decisionNextStep').hidden = true;
+      el('decisionSafetyBox').hidden = true;
+      return;
+    }
     empty.hidden = true;
     result.hidden = false;
     if (decision.status === 'pending') {
@@ -1285,16 +1322,22 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     var proposed = decision.proposedAction || decision.finalAction || 'NO_OP';
     var finalAction = decision.finalAction || 'NO_OP';
     var demoExpired = demoModeActive && decision.status === 'expired';
+    var wateringCompleted = decision.status === 'completed';
+    var wateringExecuted = decision.status === 'executed';
     var invalidGovernance = isGovernanceOnlyDecision(decision);
     var blocked = finalAction === 'NO_OP' && proposed !== 'NO_OP';
-    var actionText = demoExpired
+    var actionText = wateringCompleted
+      ? '灌溉已完成'
+      : wateringExecuted
+      ? '水阀已执行'
+      : demoExpired
       ? '演示分析结果已保留'
       : decision.status === 'expired'
       ? '历史建议已过期'
       : invalidGovernance
       ? '结果无效'
       : (blocked ? actionLabel(proposed) + '（暂不可执行）' : actionLabel(proposed));
-    var actionTone = demoExpired ? 'ok'
+    var actionTone = wateringCompleted || wateringExecuted || demoExpired ? 'ok'
       : (decision.status === 'expired' || invalidGovernance || blocked || decision.status === 'rejected' || decision.status === 'rejected_on_confirmation'
         || decision.status === 'gateway_error'
         ? 'bad'
@@ -1305,7 +1348,11 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       ? '演示模式已就绪'
       : (invalidGovernance ? '请重新分析' : decisionStatusLabel(decision.status));
     el('decisionStatus').className = 'decision-status ' + (demoExpired ? 'ok' : (invalidGovernance ? 'bad' : decisionStatusTone(decision.status)));
-    if (demoExpired) {
+    if (wateringCompleted) {
+      el('decisionOutcome').textContent = '本次灌溉已完成，水阀已关闭。';
+    } else if (wateringExecuted) {
+      el('decisionOutcome').textContent = 'ESP32 已执行水阀动作，当前状态已同步。';
+    } else if (demoExpired) {
       el('decisionOutcome').textContent = '上一次分析已完成；演示模式保留结果供展示，旧授权不会执行。点击“请求一次分析”可刷新结果。';
     } else if (decision.status === 'expired') {
       el('decisionOutcome').textContent = '该结果只作历史记录，请点击“请求一次分析”获取当前结论。';
@@ -1331,7 +1378,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     var safetyReasons = decision.safetyReasons || [];
     var safetyBox = el('decisionSafetyBox'), safetyList = el('decisionSafetyList');
     safetyList.textContent = '';
-    safetyBox.hidden = demoExpired || !safetyReasons.length;
+    safetyBox.hidden = wateringCompleted || wateringExecuted || demoExpired || !safetyReasons.length;
     for (var i = 0; i < safetyReasons.length; i++) {
       var item = document.createElement('li');
       item.textContent = translateSafetyReason(safetyReasons[i]);
@@ -1458,7 +1505,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
       } else if (!awaiting && !longPressStartedAt) {
         resetConfirmButton();
         if (demoModeActive && (decisionExpired || (decision && decision.status === 'expired'))) {
-          setConfirmStatus('演示模式已就绪；上一次结果仅作展示，请请求一次新的分析。', 'meta');
+          setConfirmStatus('等待新的云端分析结果。', 'meta');
         } else if (decisionExpired || (decision && decision.status === 'expired')) {
           setConfirmStatus('该建议已超过有效期，未执行水阀；请重新请求一次分析。', 'bad');
         } else if (decision && decision.status === 'confirmed_waiting_device') {

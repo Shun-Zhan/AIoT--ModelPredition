@@ -216,6 +216,62 @@ def test_device_confirmation_ack_is_reflected_in_decision_state(tmp_path, monkey
     assert decision["safetyReasons"] == ["cooldown"]
 
 
+def test_device_volume_completion_overrides_stale_cloud_rejection(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
+    )
+    store = Store(settings.database_path)
+    request_id = "volume-complete-1"
+    store.save_device_cloud_result(DeviceCloudResult(
+        schemaVersion="2.0", status="rejected", requestId=request_id,
+        action="START_WATERING", proposedAction="START_WATERING",
+        finalAction="NO_OP", durationSeconds=30, reason="soil dry",
+        reasonCode="SEVERE_SOIL_DRYNESS", safetyReasons=["valve is already open"],
+        expiresAt=datetime.now(timezone.utc) + timedelta(minutes=2),
+    ))
+    store.save_device_irrigation_state(DeviceIrrigationState(
+        schemaVersion="2.0", state="CLOSED", action="STOP_WATERING",
+        reasonCode="volume_reached_closed", deliveredLiters=0.031111,
+        targetLiters=0.032117, remainingLiters=0.001006,
+        flowPulseCount=36, wateringControlMode="volume_closed_loop",
+    ))
+
+    decision = TestClient(create_app(settings)).get("/v1/cloud/status").json()["decision"]
+
+    assert decision["status"] == "completed"
+    assert decision["finalAction"] == "NO_OP"
+    assert decision["reasonCode"] == "VOLUME_REACHED_CLOSED"
+    assert decision["safetyReasons"] == []
+
+
+def test_old_device_volume_completion_does_not_override_new_cloud_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIOT_DEVICE_AUTHORITATIVE", "1")
+    settings = replace(
+        SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts"
+    )
+    store = Store(settings.database_path)
+    store.save_device_irrigation_state(DeviceIrrigationState(
+        schemaVersion="2.0", state="CLOSED", action="STOP_WATERING",
+        reasonCode="volume_reached_closed", deliveredLiters=0.031111,
+        targetLiters=0.032117, remainingLiters=0.001006,
+        flowPulseCount=36, wateringControlMode="volume_closed_loop",
+    ))
+    store.save_device_cloud_result(DeviceCloudResult(
+        schemaVersion="2.0", status="rejected", requestId="new-analysis-1",
+        action="START_WATERING", proposedAction="START_WATERING",
+        finalAction="NO_OP", durationSeconds=30, reason="new result",
+        reasonCode="COOLDOWN", safetyReasons=["watering cooldown is active"],
+        expiresAt=datetime.now(timezone.utc) + timedelta(minutes=2),
+    ))
+
+    decision = TestClient(create_app(settings)).get("/v1/cloud/status").json()["decision"]
+
+    assert decision["status"] == "rejected"
+    assert decision["reasonCode"] == "COOLDOWN"
+    assert decision["safetyReasons"] == ["watering cooldown is active"]
+
+
 def test_duplicate_is_reported(tmp_path):
     settings = replace(SETTINGS, database_path=tmp_path / "db.sqlite", artifact_dir=tmp_path / "artifacts")
     client = TestClient(create_app(settings))
@@ -426,6 +482,7 @@ def test_dashboard_renders_volume_closed_loop_and_flow_fault(tmp_path):
     assert "本地 ET₀ 目标：" in app_js
     assert "云端最长窗口：" in app_js
     assert "实际水量由 ESP32 本地 ET₀ 目标和流量脉冲决定" in app_js
+    assert "本次灌溉已完成，水阀已关闭。" in app_js
 
 
 def test_device_dashboard_marks_old_rejection_as_expired_not_current_safety(tmp_path, monkeypatch):
@@ -453,9 +510,7 @@ def test_dashboard_has_neutral_expired_copy_for_demo_mode(tmp_path):
     settings = replace(SETTINGS, database_path=tmp_path / "demo-ui.sqlite", artifact_dir=tmp_path / "artifacts")
     app_js = TestClient(create_app(settings)).get("/v1/dashboard/app.js").text
     assert "var demoModeActive = false;" in app_js
-    assert "演示分析结果已保留" in app_js
-    assert "演示模式已就绪；上一次结果仅作展示" in app_js
-    assert "safetyBox.hidden = demoExpired || !safetyReasons.length" in app_js
+    assert "等待新的云端分析结果。" in app_js
 
 
 def test_device_reboot_keeps_previous_cloud_result_as_non_executable_history(tmp_path, monkeypatch):

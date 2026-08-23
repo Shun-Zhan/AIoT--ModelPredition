@@ -326,6 +326,21 @@ class Store:
             ).fetchone()
         return json.loads(row["payload_json"]) if row else None
 
+    def latest_device_result_received_at(self, result_type: str) -> datetime | None:
+        """Return the receiver time for a latest-only device result."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT received_at FROM device_display_cache WHERE result_type=?",
+                (result_type,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            received_at = datetime.fromisoformat(str(row["received_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return received_at if received_at.tzinfo else received_at.replace(tzinfo=timezone.utc)
+
     def latest_device_results(
         self, *, display_session_started_at: datetime | None = None
     ) -> dict[str, dict | None]:
