@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +93,15 @@ def export_records(device: serial.Serial, output: Path) -> tuple[list[dict[str, 
             continue
         line = raw.decode("utf-8", errors="replace").strip()
         if line.startswith(RECORD_PREFIX):
-            records.append(_json_after_prefix(line, RECORD_PREFIX))
+            record = _json_after_prefix(line, RECORD_PREFIX)
+            recorded_at_epoch_ms = record.get("recordedAtEpochMs")
+            if isinstance(recorded_at_epoch_ms, int) and recorded_at_epoch_ms > 0:
+                record["recordedAt"] = datetime.fromtimestamp(
+                    recorded_at_epoch_ms / 1000, tz=timezone.utc
+                ).astimezone().isoformat(timespec="milliseconds")
+            elif "recordedAtEpochMs" in record:
+                record["recordedAt"] = ""
+            records.append(record)
         elif line.startswith(DUMP_END_PREFIX):
             summary = _json_after_prefix(line, DUMP_END_PREFIX)
             break
@@ -113,6 +122,9 @@ def export_records(device: serial.Serial, output: Path) -> tuple[list[dict[str, 
         "integrityOk",
         "bootSessionId",
         "uptimeMs",
+        "recordedAtEpochMs",
+        "recordedAt",
+        "timeSource",
     ]
     with output.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
@@ -121,9 +133,13 @@ def export_records(device: serial.Serial, output: Path) -> tuple[list[dict[str, 
     return records, summary
 
 
-def erase_and_restart(device: serial.Serial) -> dict[str, Any]:
+def erase_and_restart(
+    device: serial.Serial, system_time_ms: int | None = None
+) -> dict[str, Any]:
+    if system_time_ms is None:
+        system_time_ms = time.time_ns() // 1_000_000
     device.reset_input_buffer()
-    _send_line(device, "@OFFLINE_LOG_ERASE CONFIRM")
+    _send_line(device, f"@OFFLINE_LOG_ERASE CONFIRM {system_time_ms}")
     response = _json_after_prefix(
         _wait_for_prefix(device, ERASE_ACK_PREFIX), ERASE_ACK_PREFIX
     )
@@ -135,13 +151,14 @@ def erase_and_restart(device: serial.Serial) -> dict[str, Any]:
 def _print_status(status: dict[str, Any]) -> None:
     print(
         "LittleFS：{ready}；当前文件 {current} 条；轮换文件 {previous} 条；"
-        "合计 {total} 条；模式 {mode}；周期 {interval} ms".format(
+        "合计 {total} 条；模式 {mode}；周期 {interval} ms；时间来源 {time_source}".format(
             ready="可用" if status.get("ready") else "不可用",
             current=status.get("currentRecords", 0),
             previous=status.get("previousRecords", 0),
             total=status.get("totalRecords", 0),
             mode=status.get("samplingMode", "unknown"),
             interval=status.get("readIntervalMs", "unknown"),
+            time_source=status.get("timeSource", "unknown"),
         )
     )
 
@@ -209,7 +226,8 @@ def manage_offline_log(args: argparse.Namespace) -> None:
                         erase_and_restart(device)
                         print(
                             "记录已擦除或初始化，ESP32 已恢复 OFFLINE_LOGGING 模式，"
-                            "并已安排立即采集；只有完整传感器样本才会写入。"
+                            "电脑系统时间已写入，且已安排立即采集；"
+                            "只有完整传感器样本才会写入。"
                         )
                 if action != "interactive":
                     return

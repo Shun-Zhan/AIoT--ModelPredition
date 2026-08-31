@@ -9,6 +9,7 @@ from dual_forecast.config import SETTINGS
 from dual_forecast.irrigation import IrrigationService
 from dual_forecast.schemas import SensorSnapshot
 from dual_forecast.service import create_app
+from dual_forecast.storage import Store
 
 
 def payload(i=0, *, solar1=True, solar2=True):
@@ -94,6 +95,9 @@ def test_live_telemetry_refreshes_dashboard_without_storing_model_sample(tmp_pat
     assert client.post("/v1/telemetry/live", json=live_payload).status_code == 200
     latest = client.get("/v1/dashboard/latest").json()
     assert latest["snapshot"]["air"]["temperatureC"] == 26.5
+    sampling = Store(settings.database_path).sampling_config_status()
+    assert sampling["samplingMode"] == "IRRIGATION_MONITORING"
+    assert sampling["readIntervalMs"] == 5000
 
 
 def test_cloud_and_actuator_endpoints_are_safe_by_default(tmp_path):

@@ -31,6 +31,12 @@ SAMPLING_INTERVALS_MS: dict[SamplingMode, int] = {
     SamplingMode.NIGHT_ECO: 600_000,
 }
 
+# Keep the online Dashboard responsive without changing the five-minute
+# LittleFS persistence cadence. The firmware applies this configuration in
+# RAM only and returns to OFFLINE_LOGGING after a reset or power loss.
+DASHBOARD_LIVE_SAMPLING_MODE = SamplingMode.IRRIGATION_MONITORING
+DASHBOARD_LIVE_SAMPLING_INTERVAL_MS = 5_000
+
 
 @dataclass(frozen=True)
 class EventAssessment:

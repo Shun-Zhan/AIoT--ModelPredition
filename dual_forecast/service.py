@@ -12,6 +12,10 @@ from fastapi.responses import HTMLResponse, Response
 import qrcode
 
 from .config import SETTINGS, Settings
+from .edge import (
+    DASHBOARD_LIVE_SAMPLING_INTERVAL_MS,
+    DASHBOARD_LIVE_SAMPLING_MODE,
+)
 from .et0 import fao56_hourly_et0_from_net_shortwave
 from .inference import ModelBundle, build_response
 from .irrigation import IrrigationService
@@ -1235,7 +1239,7 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
     window.speechSynthesis.speak(new SpeechSynthesisUtterance(latestAnswer || el('answer').textContent));
   };
   refresh(); refreshCloud();
-  window.setInterval(refresh, 2000);
+  window.setInterval(refresh, 5000);
   window.setInterval(refreshCloud, 5000);
   window.setInterval(renderFreshness, 1000);
 }());"""
@@ -1659,7 +1663,13 @@ def create_app(settings: Settings = SETTINGS) -> FastAPI:
         store.save_live_snapshot(snapshot, received_at)
         current = snapshot_to_dashboard(snapshot, received_at)
         assessment = irrigation.assess_edge(current)
-        store.enqueue_sampling_config(assessment.recommended_sampling_mode.value, assessment.recommended_read_interval_ms)
+        # Online display cadence is independent from the five-minute LittleFS
+        # persistence interval. Keep fresh browser data at five seconds while
+        # the receiver is connected; the ESP32 applies this in RAM only.
+        store.enqueue_sampling_config(
+            DASHBOARD_LIVE_SAMPLING_MODE.value,
+            DASHBOARD_LIVE_SAMPLING_INTERVAL_MS,
+        )
         return {"status": "ok", "edge": assessment.to_dict()}
 
     @app.post("/v1/snapshots", response_model=ForecastResponse)

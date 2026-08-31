@@ -152,6 +152,26 @@ def test_config_queue_has_independent_protocol_and_ack(tmp_path):
     assert store.sampling_config_status()["status"] == "acked"
 
 
+def test_config_queue_can_force_ram_only_config_after_device_reboot(tmp_path):
+    store = Store(tmp_path / "config-reboot.sqlite")
+    original = store.enqueue_sampling_config("IRRIGATION_MONITORING", 5000)
+    serial = FakeSerial()
+    _send_pending_configs(serial, store)
+    assert _handle_config_ack_line(
+        f'@CONFIG_ACK {{"requestId":"{original["requestId"]}","accepted":true,'
+        '"samplingMode":"IRRIGATION_MONITORING","readIntervalMs":5000}}',
+        store,
+    )
+    assert store.enqueue_sampling_config("IRRIGATION_MONITORING", 5000) is None
+
+    replacement = store.enqueue_sampling_config(
+        "IRRIGATION_MONITORING", 5000, force=True
+    )
+    assert replacement is not None
+    assert replacement["requestId"] != original["requestId"]
+    assert store.sampling_config_status()["status"] == "pending"
+
+
 def test_sent_valve_command_without_ack_becomes_auditable_failure(tmp_path):
     settings = replace(
         SETTINGS, database_path=tmp_path / "ack-timeout.sqlite", artifact_dir=tmp_path / "artifacts",
@@ -192,6 +212,8 @@ def test_dashboard_keeps_long_press_and_offline_mobile_data(tmp_path):
     assert "/v1/dashboard/app.js" in html
     app_js = client.get("/v1/dashboard/app.js")
     assert app_js.status_code == 200
+    assert "window.setInterval(refresh, 5000)" in app_js.text
+    assert "window.setInterval(refresh, 2000)" not in app_js.text
     assert "setTimeout(confirmDecision, 1500)" in app_js.text
     assert "请持续按住：" in app_js.text
     assert "confirmStatus" in app_js.text

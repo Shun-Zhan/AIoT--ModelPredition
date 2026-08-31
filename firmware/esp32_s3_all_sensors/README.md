@@ -43,6 +43,8 @@ esp32-sensors.local:3333
 
 电脑端 Dashboard 通过该端点接收传感器 JSON、发送心跳、采样配置和经后端安全审核后的水阀命令。因此正常运行时可拔掉 USB 数据线；USB 只保留烧录、查看启动日志、发送 `@WIFI_RESET` 和故障排查用途。
 
+设备脱离电脑时按 5 分钟周期采样并写入 LittleFS。Dashboard 接收器建立 TCP/USB 连接后会下发 RAM-only 的 5 秒在线采样配置，使网页每 5 秒获得新传感器值；离线历史仍只每 5 分钟落盘，重启后也会安全回到 5 分钟离线周期。
+
 同时 ESP32 每 3 秒向同一局域网广播一条 UDP 3334 发现消息。电脑端以 `--esp-host auto`（启动脚本的默认值）监听该消息并连接当前 TCP 3333 地址，因此 DHCP IP 变化、热点重启或 ESP32 重连后无需手工记 IP，也不依赖手机热点是否支持 `esp32-sensors.local` / mDNS。只有网络开启“客户端隔离”并阻止设备间 TCP 和 UDP 时，才需将 ESP32 串口打印的 `IP=...` 显式传给电脑端接收器。
 
 电脑接收器连接到 ESP32 后，所有数据仍先进入本机 FastAPI、SQLite、预测模型和安全规则；手机网页只访问电脑的 Dashboard，不直接向 ESP32 或继电器发控制命令。
@@ -60,17 +62,17 @@ esp32-sensors.local:3333
 ```text
 @HEARTBEAT
 @COMMAND {JSON}
-@CONFIG {"schemaVersion":"1.0","requestId":"config-...","samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
+@CONFIG {"schemaVersion":"1.0","requestId":"config-...","samplingMode":"IRRIGATION_MONITORING","readIntervalMs":5000}
 ```
 
 设备响应：
 
 ```text
 @ACK {"requestId":"...","accepted":true,"actualState":"OPEN","reason":"started","remainingSeconds":30}
-@CONFIG_ACK {"requestId":"config-...","accepted":true,"samplingMode":"NORMAL_MONITORING","readIntervalMs":60000}
+@CONFIG_ACK {"requestId":"config-...","accepted":true,"samplingMode":"IRRIGATION_MONITORING","readIntervalMs":5000}
 ```
 
-`@CONFIG` 只调整传感器读取周期，和控制 GPIO11 的 `@COMMAND` 分开处理。固件白名单为：`DEBUG` 固定 2000 ms、`IRRIGATION_MONITORING` 为 2000–5000 ms、`NORMAL_MONITORING` 为 30000–120000 ms、`NIGHT_ECO` 为 300000–900000 ms、`OFFLINE_LOGGING` 固定 300000 ms（5 分钟）。无效模式/范围会被拒绝并 ACK 原有安全值。
+`@CONFIG` 只调整传感器读取周期，和控制 GPIO11 的 `@COMMAND` 分开处理。接受配置后会立即采一轮，再按新间隔继续；LittleFS 的五分钟落盘门限不变。固件白名单为：`DEBUG` 固定 2000 ms、`IRRIGATION_MONITORING` 为 2000–5000 ms、`NORMAL_MONITORING` 为 30000–120000 ms、`NIGHT_ECO` 为 300000–900000 ms、`OFFLINE_LOGGING` 固定 300000 ms（5 分钟）。无效模式/范围会被拒绝并 ACK 原有安全值。
 
 每 5 分钟，ESP32 还会在本地根据空气温湿度、气压、土壤湿度、净短波辐射和可用风速生成一个轻量趋势估计，并在 telemetry JSON 中增加：
 
@@ -110,17 +112,17 @@ Windows 示例：
 dual-forecast offline-log
 ```
 
-只有存在多个候选串口时才需要通过 `--serial-port /dev/cu.wchusbserial110` 或 `--serial-port COM3` 明确指定。USB 重插后 macOS 端口名可能变化，省略参数可以避免沿用旧名称。菜单可查看记录数量、读取全部记录并导出 `outputs/esp32-offline-log.csv`，或输入二次确认后擦除两个轮换文件。擦除成功会恢复 `OFFLINE_LOGGING` / 300000 ms，并立即安排一次新采集；传感器不完整时仍不会写入。也可使用 `--action status`、`--action export` 或 `--action erase` 非交互执行，其中擦除仍会要求输入 `ERASE`，除非显式传入 `--yes`。
+只有存在多个候选串口时才需要通过 `--serial-port /dev/cu.wchusbserial110` 或 `--serial-port COM3` 明确指定。USB 重插后 macOS 端口名可能变化，省略参数可以避免沿用旧名称。菜单可查看记录数量、读取全部记录并导出 `outputs/esp32-offline-log.csv`，或输入二次确认后擦除两个轮换文件。擦除成功时，电脑会把当前系统时间（Unix 毫秒）一并写入 ESP32，恢复 `OFFLINE_LOGGING` / 300000 ms，并立即安排一次新采集；之后每条记录用该时间基准加上设备实际经过时间，生成 `recordedAtEpochMs`。传感器不完整时仍不会写入。也可使用 `--action status`、`--action export` 或 `--action erase` 非交互执行，其中擦除仍会要求输入 `ERASE`，除非显式传入 `--yes`。
 
 对应的 USB 串口协议为：
 
 ```text
 @OFFLINE_LOG_STATUS
 @OFFLINE_LOG_DUMP
-@OFFLINE_LOG_ERASE CONFIRM
+@OFFLINE_LOG_ERASE CONFIRM <systemTimeMs>
 ```
 
-导出时固件逐条校验 magic 和 FNV-1a checksum，并在 CSV 的 `integrityOk` 字段标记结果。记录中的 `bootSessionId` 和 `uptimeMs` 可识别同一次启动内的相对顺序；当前硬件没有 RTC，因此历史记录不包含可信的真实日期时间。离线记录不会自动补传进 SQLite/预测历史，需要由上述命令主动导出。
+导出时固件逐条校验 magic 和 FNV-1a checksum，并在 CSV 的 `integrityOk` 字段标记结果。CSV 同时包含原始 `recordedAtEpochMs`、带时区的 `recordedAt` 和 `timeSource`。`system_time` 表示由电脑系统时间建立基准后按设备经过时间累加；由于硬件没有 RTC，断电期间的真实时长无法得知，所以设备在未重新校时的上电后，只能从上一条记录按五分钟采样周期继续，标记为 `estimated_after_reboot`。旧固件记录仍可导出，但时间标记为 `legacy_uptime_only`。若需要可信绝对时间，重新连接电脑并执行“擦除并启动新一轮采集”。离线记录不会自动补传进 SQLite/预测历史，需要由上述命令主动导出。
 
 动态配置仅存 RAM；上电或复位恢复 `OFFLINE_LOGGING` / 300000 ms。水阀已打开时，固件拒绝大于 5000 ms 的周期和 `NIGHT_ECO`（原因 `valve_open_requires_fast_sampling`）。本项目不使用 Deep Sleep，因为必须持续保留继电器最长时长保护、8 秒心跳断开关阀和 USB 命令接收能力；这是一项安全设计，并非已测得的低功耗百分比。
 

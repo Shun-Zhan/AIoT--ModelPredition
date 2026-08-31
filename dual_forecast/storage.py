@@ -590,23 +590,39 @@ class Store:
             "resolvedReason": row["resolved_reason"],
         } for row in rows]
 
-    def enqueue_sampling_config(self, sampling_mode: str, read_interval_ms: int) -> dict | None:
+    def enqueue_sampling_config(
+        self,
+        sampling_mode: str,
+        read_interval_ms: int,
+        *,
+        force: bool = False,
+    ) -> dict | None:
         """Queue a configuration only when an identical one is not current.
 
         Configuration has its own queue so it can never be confused with a
-        human-approved water-valve command.
+        human-approved water-valve command. ``force`` is used after a fresh
+        transport connection because an ACK from before an ESP32 reboot does
+        not prove that the RAM-only sampling configuration is still active.
         """
         config = {"schemaVersion": "1.0", "samplingMode": sampling_mode, "readIntervalMs": int(read_interval_ms)}
-        encoded = json.dumps(config, ensure_ascii=False, sort_keys=True)
         with self.connection() as conn:
-            existing = conn.execute(
-                "SELECT request_id,config_json,status FROM device_config_queue "
-                "WHERE status IN ('pending','sent','acked') ORDER BY queued_at DESC LIMIT 1"
-            ).fetchone()
-            if existing:
-                prior = json.loads(existing["config_json"])
-                if prior.get("samplingMode") == sampling_mode and int(prior.get("readIntervalMs", -1)) == int(read_interval_ms):
-                    return None
+            if force:
+                # A disconnected transport cannot deliver an outstanding
+                # configuration or its ACK. Retire it before placing the
+                # connection-scoped live configuration at the head of queue.
+                conn.execute(
+                    "UPDATE device_config_queue SET status='superseded' "
+                    "WHERE status IN ('pending','sent')"
+                )
+            else:
+                existing = conn.execute(
+                    "SELECT request_id,config_json,status FROM device_config_queue "
+                    "WHERE status IN ('pending','sent','acked') ORDER BY queued_at DESC LIMIT 1"
+                ).fetchone()
+                if existing:
+                    prior = json.loads(existing["config_json"])
+                    if prior.get("samplingMode") == sampling_mode and int(prior.get("readIntervalMs", -1)) == int(read_interval_ms):
+                        return None
             request_id = "config-" + uuid4().hex
             config["requestId"] = request_id
             conn.execute(

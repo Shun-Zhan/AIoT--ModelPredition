@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from dual_forecast.offline_log import erase_and_restart, export_records, read_status
@@ -76,6 +77,31 @@ def test_exports_records_to_csv_and_checks_count(tmp_path):
     assert "soilMoisturePercent" in output.read_text(encoding="utf-8-sig")
 
 
+def test_exports_absolute_time_as_local_iso_timestamp(tmp_path):
+    record = {
+        "source": "current",
+        "index": 0,
+        "integrityOk": True,
+        "bootSessionId": 42,
+        "uptimeMs": 1234,
+        "recordedAtEpochMs": 1_700_000_000_123,
+        "timeSource": "system_time",
+    }
+    device = FakeSerial([
+        _line("@OFFLINE_LOG_RECORD ", record),
+        _line(
+            "@OFFLINE_LOG_DUMP_END ",
+            {"accepted": True, "exportedRecords": 1, "corruptRecords": 0},
+        ),
+    ])
+    output = tmp_path / "offline.csv"
+
+    records, _ = export_records(device, output)
+
+    assert datetime.fromisoformat(records[0]["recordedAt"]).timestamp() == 1_700_000_000.123
+    assert "recordedAtEpochMs" in output.read_text(encoding="utf-8-sig")
+
+
 def test_erase_requires_firmware_confirmation_and_restarts_logging():
     device = FakeSerial([
         _line(
@@ -88,9 +114,9 @@ def test_erase_requires_firmware_confirmation_and_restarts_logging():
         )
     ])
 
-    response = erase_and_restart(device)
+    response = erase_and_restart(device, system_time_ms=1_700_000_000_123)
 
-    assert device.writes == [b"@OFFLINE_LOG_ERASE CONFIRM\n"]
+    assert device.writes == [b"@OFFLINE_LOG_ERASE CONFIRM 1700000000123\n"]
     assert response["samplingMode"] == "OFFLINE_LOGGING"
 
 
@@ -106,3 +132,6 @@ def test_firmware_requires_explicit_erase_confirmation_and_checks_integrity():
     assert "offlineLogRecordIsValid(record)" in firmware
     assert '\\"reason\\":\\"valve_open\\"' in firmware
     assert "nextSensorReadAtMs = 0;" in firmware
+    assert "recordedAtEpochMs" in firmware
+    assert "handleOfflineLogEraseCommand" in firmware
+    assert "writeOfflineLogTimeAnchor(systemTimeMs)" in firmware

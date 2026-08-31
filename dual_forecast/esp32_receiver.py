@@ -11,6 +11,10 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from .edge import (
+    DASHBOARD_LIVE_SAMPLING_INTERVAL_MS,
+    DASHBOARD_LIVE_SAMPLING_MODE,
+)
 from .storage import Store
 
 
@@ -372,6 +376,17 @@ def _send_pending_configs(connection: Any, store: Store) -> None:
         print(f"Sent ESP32 sampling config: mode={config.get('samplingMode')} interval={config.get('readIntervalMs')}ms")
 
 
+def _queue_dashboard_live_config(store: Store) -> dict:
+    """Force the RAM-only five-second cadence after each device connection."""
+    config = store.enqueue_sampling_config(
+        DASHBOARD_LIVE_SAMPLING_MODE.value,
+        DASHBOARD_LIVE_SAMPLING_INTERVAL_MS,
+        force=True,
+    )
+    assert config is not None
+    return config
+
+
 def _send_heartbeat(connection: Any) -> None:
     connection.write(b"@HEARTBEAT\n")
 
@@ -423,6 +438,7 @@ def receive_esp32(args: argparse.Namespace) -> None:
                     pending_text = ""
                     next_control_at = 0.0
                     print("Connected. Receiving ESP32 telemetry.")
+                    _queue_dashboard_live_config(store)
 
                     while True:
                         now = time.monotonic()
@@ -486,6 +502,7 @@ def receive_esp32_serial(args: argparse.Namespace) -> None:
             print(f"Opening ESP32 USB serial port {args.serial_port} at {args.baudrate} baud ...")
             with serial.Serial(args.serial_port, args.baudrate, timeout=1) as connection:
                 print("Connected. Receiving ESP32 USB serial telemetry.")
+                _queue_dashboard_live_config(store)
                 # Do not inject a heartbeat before every one-second read.
                 # Apart from needless traffic, frequent writes make a flaky
                 # USB-UART bridge more likely to reset.  This matches the TCP

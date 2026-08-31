@@ -346,12 +346,27 @@ struct EdgePrediction;
 // are full the oldest 14 days are discarded.  This bounded log prevents a
 // long unattended deployment from filling flash or repeatedly rewriting one
 // NVS sector.
-static const char *OFFLINE_LOG_CURRENT_PATH = "/aiot-current.bin";
-static const char *OFFLINE_LOG_PREVIOUS_PATH = "/aiot-previous.bin";
+// V1 files are kept read-only so upgrading this firmware never destroys
+// existing uptime-only history. New V2 records include an absolute timestamp.
+static const char *OFFLINE_LOG_LEGACY_CURRENT_PATH = "/aiot-current.bin";
+static const char *OFFLINE_LOG_LEGACY_PREVIOUS_PATH = "/aiot-previous.bin";
+static const char *OFFLINE_LOG_CURRENT_PATH = "/aiot-current-v2.bin";
+static const char *OFFLINE_LOG_PREVIOUS_PATH = "/aiot-previous-v2.bin";
+static const char *OFFLINE_LOG_TIME_ANCHOR_PATH = "/aiot-time-v2.bin";
 static const uint16_t OFFLINE_LOG_RECORDS_PER_FILE = 4032;  // 14 days × 24 × 12
 static const uint32_t OFFLINE_LOG_MAGIC = 0x41494F54UL;     // "AIOT"
+static const uint32_t OFFLINE_LOG_V2_MAGIC = 0x41494F55UL;  // "AIOU"
+static const uint32_t OFFLINE_TIME_ANCHOR_MAGIC = 0x4149544DUL;  // "AITM"
+static const uint64_t MIN_VALID_SYSTEM_TIME_MS = 1577836800000ULL;  // 2020-01-01
+static const uint64_t MAX_VALID_SYSTEM_TIME_MS = 4102444800000ULL;  // 2100-01-01
 
-struct __attribute__((packed)) OfflineLogRecord {
+enum OfflineLogTimeSource : uint8_t {
+  OFFLINE_TIME_UNAVAILABLE = 0,
+  OFFLINE_TIME_SYSTEM = 1,
+  OFFLINE_TIME_ESTIMATED_AFTER_REBOOT = 2,
+};
+
+struct __attribute__((packed)) LegacyOfflineLogRecord {
   uint32_t magic;
   uint32_t bootSessionId;
   uint32_t uptimeMs;
@@ -372,9 +387,42 @@ struct __attribute__((packed)) OfflineLogRecord {
   uint32_t checksum;
 };
 
+struct __attribute__((packed)) OfflineLogRecord {
+  uint32_t magic;
+  uint32_t bootSessionId;
+  uint32_t uptimeMs;
+  uint8_t windOk;
+  uint8_t airOk;
+  uint8_t soilOk;
+  uint8_t solar1Ok;
+  uint8_t solar2Ok;
+  uint16_t airPressureHpa;
+  float windVoltage;
+  float windSpeedMs;
+  float airTemperatureC;
+  float airHumidityPercent;
+  float soilTemperatureC;
+  float soilMoisturePercent;
+  uint16_t solar1Wm2;
+  uint16_t solar2Wm2;
+  uint64_t recordedAtEpochMs;
+  uint8_t timeSource;
+  uint32_t checksum;
+};
+
+struct __attribute__((packed)) OfflineLogTimeAnchor {
+  uint32_t magic;
+  uint64_t systemTimeMs;
+  uint32_t checksum;
+};
+
 bool offlineLogReady = false;
 uint32_t offlineLogBootSessionId = 0;
 uint32_t lastOfflineLogSavedMs = 0;
+uint64_t offlineLogBaseEpochMs = 0;
+uint64_t offlineLogElapsedSinceBaseMs = 0;
+uint32_t offlineLogLastClockUptimeMs = 0;
+uint8_t offlineLogTimeSource = OFFLINE_TIME_UNAVAILABLE;
 
 uint32_t offlineLogChecksum(const uint8_t *data, size_t length) {
   // FNV-1a is sufficient here to detect a torn/corrupt flash record before
@@ -397,13 +445,111 @@ bool offlineSnapshotIsComplete(const SensorSnapshot &snapshot) {
          snapshot.soilOk && snapshot.solar1Ok && snapshot.solar2Ok;
 }
 
-size_t offlineLogRecordCount(const char *path) {
+size_t offlineLogRecordCountForSize(const char *path, size_t recordSize) {
   if (!offlineLogReady || !LittleFS.exists(path)) return 0;
   File file = LittleFS.open(path, FILE_READ);
   if (!file) return 0;
-  const size_t count = file.size() / sizeof(OfflineLogRecord);
+  const size_t size = file.size();
+  const size_t count = size % recordSize == 0 ? size / recordSize : 0;
   file.close();
   return count;
+}
+
+size_t offlineLogRecordCount(const char *path) {
+  return offlineLogRecordCountForSize(path, sizeof(OfflineLogRecord));
+}
+
+size_t legacyOfflineLogRecordCount(const char *path) {
+  return offlineLogRecordCountForSize(path, sizeof(LegacyOfflineLogRecord));
+}
+
+const char *offlineLogTimeSourceText(uint8_t source) {
+  if (source == OFFLINE_TIME_SYSTEM) return "system_time";
+  if (source == OFFLINE_TIME_ESTIMATED_AFTER_REBOOT) return "estimated_after_reboot";
+  return "unavailable";
+}
+
+bool offlineLogRecordIsValid(const OfflineLogRecord &record) {
+  return record.magic == OFFLINE_LOG_V2_MAGIC &&
+         record.checksum == offlineLogChecksum(
+             reinterpret_cast<const uint8_t *>(&record),
+             offsetof(OfflineLogRecord, checksum));
+}
+
+bool legacyOfflineLogRecordIsValid(const LegacyOfflineLogRecord &record) {
+  return record.magic == OFFLINE_LOG_MAGIC &&
+         record.checksum == offlineLogChecksum(
+             reinterpret_cast<const uint8_t *>(&record),
+             offsetof(LegacyOfflineLogRecord, checksum));
+}
+
+bool readOfflineLogTimeAnchor(OfflineLogTimeAnchor &anchor) {
+  if (!LittleFS.exists(OFFLINE_LOG_TIME_ANCHOR_PATH)) return false;
+  File file = LittleFS.open(OFFLINE_LOG_TIME_ANCHOR_PATH, FILE_READ);
+  if (!file || file.size() != sizeof(anchor)) {
+    if (file) file.close();
+    return false;
+  }
+  const bool read =
+      file.read(reinterpret_cast<uint8_t *>(&anchor), sizeof(anchor)) == sizeof(anchor);
+  file.close();
+  return read && anchor.magic == OFFLINE_TIME_ANCHOR_MAGIC &&
+         anchor.systemTimeMs >= MIN_VALID_SYSTEM_TIME_MS &&
+         anchor.systemTimeMs <= MAX_VALID_SYSTEM_TIME_MS &&
+         anchor.checksum == offlineLogChecksum(
+             reinterpret_cast<const uint8_t *>(&anchor),
+             offsetof(OfflineLogTimeAnchor, checksum));
+}
+
+bool writeOfflineLogTimeAnchor(uint64_t systemTimeMs) {
+  OfflineLogTimeAnchor anchor = {};
+  anchor.magic = OFFLINE_TIME_ANCHOR_MAGIC;
+  anchor.systemTimeMs = systemTimeMs;
+  anchor.checksum = offlineLogChecksum(
+      reinterpret_cast<const uint8_t *>(&anchor),
+      offsetof(OfflineLogTimeAnchor, checksum));
+  File file = LittleFS.open(OFFLINE_LOG_TIME_ANCHOR_PATH, FILE_WRITE);
+  if (!file) return false;
+  const bool written =
+      file.write(reinterpret_cast<const uint8_t *>(&anchor), sizeof(anchor)) == sizeof(anchor);
+  file.close();
+  return written;
+}
+
+bool readNewestOfflineLogRecord(OfflineLogRecord &record) {
+  for (const char *path : {OFFLINE_LOG_CURRENT_PATH, OFFLINE_LOG_PREVIOUS_PATH}) {
+    if (!LittleFS.exists(path)) continue;
+    File file = LittleFS.open(path, FILE_READ);
+    if (!file || file.size() < sizeof(record)) {
+      if (file) file.close();
+      continue;
+    }
+    if (!file.seek(file.size() - sizeof(record)) ||
+        file.read(reinterpret_cast<uint8_t *>(&record), sizeof(record)) != sizeof(record)) {
+      file.close();
+      continue;
+    }
+    file.close();
+    if (offlineLogRecordIsValid(record)) return true;
+  }
+  return false;
+}
+
+void setOfflineLogClock(uint64_t epochMs, uint8_t source) {
+  offlineLogBaseEpochMs = epochMs;
+  offlineLogElapsedSinceBaseMs = 0;
+  offlineLogLastClockUptimeMs = millis();
+  offlineLogTimeSource = source;
+}
+
+uint64_t offlineLogTimestampForUptime(uint32_t uptimeMs) {
+  // Accumulating the unsigned delta at every saved sample remains correct
+  // across the roughly 49-day millis() rollover.
+  offlineLogElapsedSinceBaseMs +=
+      static_cast<uint32_t>(uptimeMs - offlineLogLastClockUptimeMs);
+  offlineLogLastClockUptimeMs = uptimeMs;
+  if (offlineLogTimeSource == OFFLINE_TIME_UNAVAILABLE) return 0;
+  return offlineLogBaseEpochMs + offlineLogElapsedSinceBaseMs;
 }
 
 void initOfflineLog() {
@@ -427,9 +573,47 @@ void initOfflineLog() {
       LittleFS.remove(path);
     }
   }
-  Serial.printf("[OFFLINE LOG] Ready: %u current + %u previous valid samples.\n",
-                static_cast<unsigned>(offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH)),
-                static_cast<unsigned>(offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH)));
+  // Legacy files use the original record size. They remain exportable but are
+  // never appended to or rotated by V2 firmware.
+  for (const char *path : {OFFLINE_LOG_LEGACY_CURRENT_PATH,
+                           OFFLINE_LOG_LEGACY_PREVIOUS_PATH}) {
+    if (!LittleFS.exists(path)) continue;
+    File file = LittleFS.open(path, FILE_READ);
+    const bool validLength =
+        file && file.size() % sizeof(LegacyOfflineLogRecord) == 0;
+    if (file) file.close();
+    if (!validLength) {
+      Serial.printf("[OFFLINE LOG] Legacy file %s has an invalid length; preserving it without export.\n",
+                    path);
+    }
+  }
+
+  OfflineLogRecord newest = {};
+  OfflineLogTimeAnchor anchor = {};
+  if (readNewestOfflineLogRecord(newest) && newest.recordedAtEpochMs >= MIN_VALID_SYSTEM_TIME_MS &&
+      newest.recordedAtEpochMs <= MAX_VALID_SYSTEM_TIME_MS) {
+    // With no RTC the duration while power was off is unknowable. Continue
+    // monotonically at the expected next five-minute slot and label it as an
+    // estimate until the PC explicitly restarts the log with system time.
+    setOfflineLogClock(newest.recordedAtEpochMs + OFFLINE_LOG_INTERVAL_MS,
+                       OFFLINE_TIME_ESTIMATED_AFTER_REBOOT);
+  } else if (readOfflineLogTimeAnchor(anchor)) {
+    // The system-time anchor is written immediately by the erase/restart
+    // command, so it survives even when power is lost before the first valid
+    // sensor row. The off-time remains unknowable without an RTC.
+    setOfflineLogClock(anchor.systemTimeMs + OFFLINE_LOG_INTERVAL_MS,
+                       OFFLINE_TIME_ESTIMATED_AFTER_REBOOT);
+  } else {
+    setOfflineLogClock(0, OFFLINE_TIME_UNAVAILABLE);
+  }
+
+  const size_t current = offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH) +
+                         legacyOfflineLogRecordCount(OFFLINE_LOG_LEGACY_CURRENT_PATH);
+  const size_t previous = offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH) +
+                          legacyOfflineLogRecordCount(OFFLINE_LOG_LEGACY_PREVIOUS_PATH);
+  Serial.printf("[OFFLINE LOG] Ready: %u current + %u previous valid samples; time source %s.\n",
+                static_cast<unsigned>(current), static_cast<unsigned>(previous),
+                offlineLogTimeSourceText(offlineLogTimeSource));
 }
 
 bool appendOfflineLog(const SensorSnapshot &snapshot) {
@@ -447,7 +631,7 @@ bool appendOfflineLog(const SensorSnapshot &snapshot) {
   }
 
   OfflineLogRecord record = {};
-  record.magic = OFFLINE_LOG_MAGIC;
+  record.magic = OFFLINE_LOG_V2_MAGIC;
   record.bootSessionId = offlineLogBootSessionId;
   record.uptimeMs = snapshot.uptimeMs;
   record.windOk = snapshot.wind1Ok || snapshot.wind2Ok;
@@ -469,6 +653,8 @@ bool appendOfflineLog(const SensorSnapshot &snapshot) {
   record.soilMoisturePercent = snapshot.soil.moisturePercent;
   record.solar1Wm2 = snapshot.solarRadiation1Wm2;
   record.solar2Wm2 = snapshot.solarRadiation2Wm2;
+  record.recordedAtEpochMs = offlineLogTimestampForUptime(snapshot.uptimeMs);
+  record.timeSource = offlineLogTimeSource;
   record.checksum = offlineLogChecksum(
       reinterpret_cast<const uint8_t *>(&record), offsetof(OfflineLogRecord, checksum));
 
@@ -483,24 +669,22 @@ bool appendOfflineLog(const SensorSnapshot &snapshot) {
   return written;
 }
 
-bool offlineLogRecordIsValid(const OfflineLogRecord &record) {
-  return record.magic == OFFLINE_LOG_MAGIC &&
-         record.checksum == offlineLogChecksum(
-             reinterpret_cast<const uint8_t *>(&record),
-             offsetof(OfflineLogRecord, checksum));
-}
-
 void sendOfflineLogStatus() {
-  const size_t current = offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH);
-  const size_t previous = offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH);
+  const size_t current = offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH) +
+                         legacyOfflineLogRecordCount(OFFLINE_LOG_LEGACY_CURRENT_PATH);
+  const size_t previous = offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH) +
+                          legacyOfflineLogRecordCount(OFFLINE_LOG_LEGACY_PREVIOUS_PATH);
   Serial.printf(
       "@OFFLINE_LOG_STATUS {\"ready\":%s,\"currentRecords\":%u,"
       "\"previousRecords\":%u,\"totalRecords\":%u,"
-      "\"samplingMode\":\"%s\",\"readIntervalMs\":%lu}\n",
+      "\"samplingMode\":\"%s\",\"readIntervalMs\":%lu,"
+      "\"timeSource\":\"%s\",\"systemTimeKnown\":%s}\n",
       offlineLogReady ? "true" : "false",
       static_cast<unsigned>(current), static_cast<unsigned>(previous),
       static_cast<unsigned>(current + previous), samplingMode,
-      static_cast<unsigned long>(readIntervalMs));
+      static_cast<unsigned long>(readIntervalMs),
+      offlineLogTimeSourceText(offlineLogTimeSource),
+      offlineLogTimeSource == OFFLINE_TIME_UNAVAILABLE ? "false" : "true");
 }
 
 void dumpOfflineLogFile(const char *path, const char *source,
@@ -517,9 +701,66 @@ void dumpOfflineLogFile(const char *path, const char *source,
     }
     const bool integrityOk = offlineLogRecordIsValid(record);
     if (!integrityOk) ++corrupt;
+    char timeFields[160] = {};
+    if (record.recordedAtEpochMs >= MIN_VALID_SYSTEM_TIME_MS &&
+        record.recordedAtEpochMs <= MAX_VALID_SYSTEM_TIME_MS) {
+      snprintf(timeFields, sizeof(timeFields),
+               "\"recordedAtEpochMs\":%llu,\"timeSource\":\"%s\",",
+               static_cast<unsigned long long>(record.recordedAtEpochMs),
+               offlineLogTimeSourceText(record.timeSource));
+    } else {
+      strlcpy(timeFields,
+              "\"recordedAtEpochMs\":null,\"timeSource\":\"unavailable\",",
+              sizeof(timeFields));
+    }
     Serial.printf(
         "@OFFLINE_LOG_RECORD {\"source\":\"%s\",\"index\":%u,"
         "\"integrityOk\":%s,\"bootSessionId\":%lu,\"uptimeMs\":%lu,"
+        "%s"
+        "\"windOk\":%s,\"airOk\":%s,\"soilOk\":%s,\"solar1Ok\":%s,"
+        "\"solar2Ok\":%s,\"airPressureHpa\":%u,\"windVoltage\":%.3f,"
+        "\"windSpeedMs\":%.3f,\"airTemperatureC\":%.2f,"
+        "\"airHumidityPercent\":%.2f,\"soilTemperatureC\":%.2f,"
+        "\"soilMoisturePercent\":%.2f,\"solar1Wm2\":%u,"
+        "\"solar2Wm2\":%u}\n",
+        source, static_cast<unsigned>(index), integrityOk ? "true" : "false",
+        static_cast<unsigned long>(record.bootSessionId),
+        static_cast<unsigned long>(record.uptimeMs),
+        timeFields,
+        record.windOk ? "true" : "false", record.airOk ? "true" : "false",
+        record.soilOk ? "true" : "false", record.solar1Ok ? "true" : "false",
+        record.solar2Ok ? "true" : "false", record.airPressureHpa,
+        record.windVoltage, record.windSpeedMs, record.airTemperatureC,
+        record.airHumidityPercent, record.soilTemperatureC,
+        record.soilMoisturePercent, record.solar1Wm2, record.solar2Wm2);
+    ++index;
+    ++exported;
+    // Yield to the ESP32 runtime without accepting a valve command in the
+    // middle of a potentially long serial export.
+    delay(1);
+  }
+  file.close();
+}
+
+void dumpLegacyOfflineLogFile(const char *path, const char *source,
+                              size_t &exported, size_t &corrupt) {
+  if (!offlineLogReady || !LittleFS.exists(path)) return;
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file || file.size() % sizeof(LegacyOfflineLogRecord) != 0) {
+    if (file) file.close();
+    return;
+  }
+  size_t index = 0;
+  LegacyOfflineLogRecord record = {};
+  while (file.available() >= static_cast<int>(sizeof(record))) {
+    if (file.read(reinterpret_cast<uint8_t *>(&record), sizeof(record)) !=
+        sizeof(record)) break;
+    const bool integrityOk = legacyOfflineLogRecordIsValid(record);
+    if (!integrityOk) ++corrupt;
+    Serial.printf(
+        "@OFFLINE_LOG_RECORD {\"source\":\"%s\",\"index\":%u,"
+        "\"integrityOk\":%s,\"bootSessionId\":%lu,\"uptimeMs\":%lu,"
+        "\"recordedAtEpochMs\":null,\"timeSource\":\"legacy_uptime_only\","
         "\"windOk\":%s,\"airOk\":%s,\"soilOk\":%s,\"solar1Ok\":%s,"
         "\"solar2Ok\":%s,\"airPressureHpa\":%u,\"windVoltage\":%.3f,"
         "\"windSpeedMs\":%.3f,\"airTemperatureC\":%.2f,"
@@ -537,8 +778,6 @@ void dumpOfflineLogFile(const char *path, const char *source,
         record.soilMoisturePercent, record.solar1Wm2, record.solar2Wm2);
     ++index;
     ++exported;
-    // Yield to the ESP32 runtime without accepting a valve command in the
-    // middle of a potentially long serial export.
     delay(1);
   }
   file.close();
@@ -557,13 +796,21 @@ void dumpOfflineLog() {
         "\"exportedRecords\":0,\"corruptRecords\":0}");
     return;
   }
-  const size_t expected = offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH) +
-                          offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH);
+  const size_t expected =
+      legacyOfflineLogRecordCount(OFFLINE_LOG_LEGACY_PREVIOUS_PATH) +
+      legacyOfflineLogRecordCount(OFFLINE_LOG_LEGACY_CURRENT_PATH) +
+      offlineLogRecordCount(OFFLINE_LOG_PREVIOUS_PATH) +
+      offlineLogRecordCount(OFFLINE_LOG_CURRENT_PATH);
   Serial.printf("@OFFLINE_LOG_DUMP_BEGIN {\"expectedRecords\":%u}\n",
                 static_cast<unsigned>(expected));
   size_t exported = 0;
   size_t corrupt = 0;
-  // Previous is the older rotated block; current is the newest block.
+  // Legacy V1 data predates all V2 data because V1 becomes read-only after
+  // this firmware upgrade.
+  dumpLegacyOfflineLogFile(OFFLINE_LOG_LEGACY_PREVIOUS_PATH,
+                           "legacy_previous", exported, corrupt);
+  dumpLegacyOfflineLogFile(OFFLINE_LOG_LEGACY_CURRENT_PATH,
+                           "legacy_current", exported, corrupt);
   dumpOfflineLogFile(OFFLINE_LOG_PREVIOUS_PATH, "previous", exported, corrupt);
   dumpOfflineLogFile(OFFLINE_LOG_CURRENT_PATH, "current", exported, corrupt);
   Serial.printf(
@@ -572,7 +819,7 @@ void dumpOfflineLog() {
       static_cast<unsigned>(exported), static_cast<unsigned>(corrupt));
 }
 
-void eraseOfflineLogAndRestart() {
+void eraseOfflineLogAndRestart(uint64_t systemTimeMs) {
   if (!offlineLogReady) {
     // Formatting is never automatic at boot. It is allowed only behind this
     // explicit destructive command, which is also confirmed by the PC tool.
@@ -596,7 +843,14 @@ void eraseOfflineLogAndRestart() {
   const bool previousRemoved =
       !LittleFS.exists(OFFLINE_LOG_PREVIOUS_PATH) ||
       LittleFS.remove(OFFLINE_LOG_PREVIOUS_PATH);
-  if (!currentRemoved || !previousRemoved) {
+  const bool legacyCurrentRemoved =
+      !LittleFS.exists(OFFLINE_LOG_LEGACY_CURRENT_PATH) ||
+      LittleFS.remove(OFFLINE_LOG_LEGACY_CURRENT_PATH);
+  const bool legacyPreviousRemoved =
+      !LittleFS.exists(OFFLINE_LOG_LEGACY_PREVIOUS_PATH) ||
+      LittleFS.remove(OFFLINE_LOG_LEGACY_PREVIOUS_PATH);
+  if (!currentRemoved || !previousRemoved || !legacyCurrentRemoved ||
+      !legacyPreviousRemoved) {
     Serial.println(
         "@OFFLINE_LOG_ERASE_ACK {\"accepted\":false,"
         "\"reason\":\"remove_failed\"}");
@@ -606,10 +860,42 @@ void eraseOfflineLogAndRestart() {
   readIntervalMs = OFFLINE_LOG_INTERVAL_MS;
   strlcpy(samplingMode, "OFFLINE_LOGGING", sizeof(samplingMode));
   nextSensorReadAtMs = 0;
-  Serial.println(
+  setOfflineLogClock(systemTimeMs, OFFLINE_TIME_SYSTEM);
+  if (!writeOfflineLogTimeAnchor(systemTimeMs)) {
+    Serial.println(
+        "@OFFLINE_LOG_ERASE_ACK {\"accepted\":false,"
+        "\"reason\":\"time_anchor_write_failed\"}");
+    return;
+  }
+  Serial.printf(
       "@OFFLINE_LOG_ERASE_ACK {\"accepted\":true,\"currentRecords\":0,"
       "\"previousRecords\":0,\"samplingMode\":\"OFFLINE_LOGGING\","
-      "\"readIntervalMs\":300000,\"reason\":\"erased_or_formatted_and_sampling_scheduled\"}");
+      "\"readIntervalMs\":300000,\"systemTimeMs\":%llu,"
+      "\"timeSource\":\"system_time\","
+      "\"reason\":\"erased_or_formatted_time_synced_and_sampling_scheduled\"}\n",
+      static_cast<unsigned long long>(systemTimeMs));
+}
+
+void handleOfflineLogEraseCommand(const char *line) {
+  const size_t prefixLength = strlen(USB_OFFLINE_LOG_ERASE_COMMAND);
+  const char *timeText = line + prefixLength;
+  if (*timeText != ' ') {
+    Serial.println(
+        "@OFFLINE_LOG_ERASE_ACK {\"accepted\":false,"
+        "\"reason\":\"missing_system_time\"}");
+    return;
+  }
+  ++timeText;
+  char *end = nullptr;
+  const uint64_t systemTimeMs = strtoull(timeText, &end, 10);
+  if (end == timeText || *end != '\0' || systemTimeMs < MIN_VALID_SYSTEM_TIME_MS ||
+      systemTimeMs > MAX_VALID_SYSTEM_TIME_MS) {
+    Serial.println(
+        "@OFFLINE_LOG_ERASE_ACK {\"accepted\":false,"
+        "\"reason\":\"invalid_system_time\"}");
+    return;
+  }
+  eraseOfflineLogAndRestart(systemTimeMs);
 }
 
 // This is intentionally not the PC's N-BEATS + LSTM model.  It is a small
@@ -734,6 +1020,10 @@ void handleSamplingConfig(const char *json) {
   }
   readIntervalMs = static_cast<uint32_t>(requestedIntervalMs);
   strlcpy(samplingMode, requestedMode, sizeof(samplingMode));
+  // A Dashboard connection must not wait for an already scheduled
+  // OFFLINE_LOGGING cycle. Read once immediately, then continue at the new
+  // RAM-only cadence; LittleFS writes remain gated by the five-minute check.
+  nextSensorReadAtMs = millis();
   sendConfigAck(requestId, true, "applied_ram_only_reset_returns_offline_logging");
 }
 
@@ -823,8 +1113,9 @@ void handleHostControlLine(const char *line, bool allowWifiReset) {
              strcmp(line, USB_OFFLINE_LOG_DUMP_COMMAND) == 0) {
     dumpOfflineLog();
   } else if (allowWifiReset &&
-             strcmp(line, USB_OFFLINE_LOG_ERASE_COMMAND) == 0) {
-    eraseOfflineLogAndRestart();
+             strncmp(line, USB_OFFLINE_LOG_ERASE_COMMAND,
+                     strlen(USB_OFFLINE_LOG_ERASE_COMMAND)) == 0) {
+    handleOfflineLogEraseCommand(line);
   } else if (strncmp(line, USB_COMMAND_PREFIX, strlen(USB_COMMAND_PREFIX)) == 0) {
     lastHostHeartbeatMs = millis();
     handleValveCommand(line + strlen(USB_COMMAND_PREFIX));

@@ -4,6 +4,7 @@ from pathlib import Path
 from dual_forecast.esp32_receiver import (
     _handle_ack_line,
     _handle_config_ack_line,
+    _queue_dashboard_live_config,
     _send_pending_commands,
     _send_pending_configs,
     esp32_message_to_snapshot,
@@ -290,3 +291,26 @@ def test_config_protocol_remains_separate_from_valve_commands(tmp_path):
         store,
     )
     assert store.sampling_config_status()["status"] == "rejected"
+
+
+def test_dashboard_connection_forces_five_second_ram_sampling(tmp_path):
+    store = Store(tmp_path / "dashboard-live.sqlite")
+    config = _queue_dashboard_live_config(store)
+    assert config["samplingMode"] == "IRRIGATION_MONITORING"
+    assert config["readIntervalMs"] == 5000
+
+    serial = FakeSerial()
+    _send_pending_configs(serial, store)
+    payload = json.loads(serial.data.decode().removeprefix("@CONFIG "))
+    assert payload["samplingMode"] == "IRRIGATION_MONITORING"
+    assert payload["readIntervalMs"] == 5000
+
+
+def test_firmware_applies_online_sampling_config_immediately():
+    firmware = (
+        Path(__file__).resolve().parents[1]
+        / "firmware"
+        / "esp32_s3_all_sensors"
+        / "esp32_s3_all_sensors.ino"
+    ).read_text(encoding="utf-8")
+    assert "nextSensorReadAtMs = millis();\n  sendConfigAck(" in firmware
